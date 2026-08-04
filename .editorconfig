@@ -1,0 +1,8 @@
+root = true
+
+# Biome formats the JS/TS/JSON family to 2-space (indentStyle "space" in
+# biome.jsonc). Mirror it here so editors default to spaces and don't
+# reintroduce tab indentation.
+[*.{ts,tsx,js,jsx,mjs,cjs,json,jsonc}]
+indent_style = space
+indent_size = 2

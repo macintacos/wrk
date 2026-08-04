@@ -1,0 +1,18 @@
+{
+  "name": "@macintacos/wrk-picker",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A reusable inline terminal picker component.",
+  "homepage": "https://github.com/macintacos/wrk",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/macintacos/wrk.git",
+    "directory": "packages/picker"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  }
+}

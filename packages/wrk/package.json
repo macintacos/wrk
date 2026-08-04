@@ -1,0 +1,20 @@
+{
+  "name": "@macintacos/wrk",
+  "version": "0.0.0",
+  "type": "module",
+  "description": "A CLI for git worktree, PR-stack and agent-workflow tooling.",
+  "homepage": "https://github.com/macintacos/wrk",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/macintacos/wrk.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@macintacos/wrk-picker": "workspace:*"
+  }
+}

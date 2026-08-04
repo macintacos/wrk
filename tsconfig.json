@@ -1,0 +1,26 @@
+{
+  // One type-check program spans the whole workspace: both packages are
+  // Node/Bun terminal code, so there is no second target to split a base config
+  // out for. When a differently-targeted build arrives (EXC-986), that build's
+  // config extends this one rather than duplicating it.
+  "compilerOptions": {
+    "lib": ["ESNext"],
+    "module": "ESNext",
+    "target": "ESNext",
+    "moduleResolution": "bundler",
+    "moduleDetection": "force",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "noUncheckedIndexedAccess": true,
+    "noFallthroughCasesInSwitch": true,
+    "noImplicitReturns": true,
+    "noImplicitOverride": true,
+    "types": ["bun"]
+  },
+  "include": ["packages/*/src/**/*.ts", "test/**/*.ts"],
+  "exclude": ["node_modules", "dist"]
+}

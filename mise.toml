@@ -1,0 +1,35 @@
+[settings]
+# Commit mise.lock for reproducible, checksum-pinned tool versions.
+lockfile = true
+# Route mise's npm: backend through bun (it defaults to npm and never picks bun
+# on its own), matching the package manager the workspace itself uses.
+npm.package_manager = "bun"
+
+# HK_MISE routes hk's git-hook subprocesses through `mise x`, so each hook step
+# uses the versions pinned below — even for committers who never activated mise.
+[env]
+HK_MISE = 1
+
+[tools]
+# hk evaluates hk.pkl through pkl, so both are required. pkl also powers the
+# Pkl(Format) / Pkl(Lint) steps. Keep hk in lockstep with hk.pkl's amends/import
+# version.
+hk  = "1.54"
+pkl = "0.32"
+
+# The workspace's runtime, package manager and test runner.
+bun = "1.3"
+
+# Formatters/linters that run outside the project. TypeScript itself is NOT here
+# — it is a dev dependency the project runs via `bun x tsc`.
+biome = "2.5"  # JS/TS format + lint (config in biome.jsonc)
+rumdl = "0.2"  # Markdown format + lint (config in .rumdl.toml)
+taplo = "0.10" # TOML format + lint (config in taplo.toml)
+
+# yamlfmt, shfmt and shellcheck are deliberately absent: this repo has no YAML
+# and no shell scripts yet. They arrive with the .mise/tasks/ forwarders in
+# EXC-989, alongside the files that need them.
+
+# (Re)register git hooks whenever tools are installed or updated.
+[hooks]
+postinstall = "hk install --mise"

@@ -1,0 +1,65 @@
+{
+  // Keep $schema in lockstep with the biome version mise installs (see mise.toml).
+  "$schema": "https://biomejs.dev/schemas/2.5.6/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    // Lint/format everything by default, then subtract — so a new top-level dir
+    // or a new workspace package is in scope automatically instead of being
+    // silently skipped until someone remembers to extend an allowlist.
+    "includes": ["**", "!**/node_modules", "!**/dist"]
+  },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "preset": "recommended"
+    }
+  },
+  // Import organization. Groups top-to-bottom, blank line between each: runtime
+  // built-ins (node:/bun:), third-party packages, then leftover relative paths.
+  // Bare/side-effect imports stay put (sortBareImports defaults off).
+  "assist": {
+    "actions": {
+      "source": {
+        "organizeImports": {
+          "level": "on",
+          "options": {
+            "groups": [
+              [":NODE:", ":BUN:"],
+              ":BLANK_LINE:",
+              [":PACKAGE:", ":PACKAGE_WITH_PROTOCOL:"],
+              ":BLANK_LINE:",
+              [":PATH:"]
+            ]
+          }
+        }
+      }
+    }
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double",
+      "semicolons": "always"
+    }
+  },
+  "overrides": [
+    {
+      // Test code may use non-null assertions pragmatically over fixtures.
+      "includes": ["**/*.test.ts", "test/**"],
+      "linter": {
+        "rules": {
+          "style": { "noNonNullAssertion": "off" }
+        }
+      }
+    }
+  ]
+}
