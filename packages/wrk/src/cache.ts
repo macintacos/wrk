@@ -35,7 +35,7 @@
  * @packageDocumentation
  */
 
-import { mkdir, open, rename, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, open, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
@@ -151,19 +151,71 @@ async function readEntry(path: string): Promise<CacheEntry | null> {
   }
 }
 
+/** How long a lock may be held before it is assumed to belong to a process that died. */
+const LOCK_STALE_MS = 60_000;
+
 /**
- * Stamps an entry's mtime to now, claiming the refresh window.
+ * Takes the refresh lock for an entry, or reports that someone else holds it.
  *
- * This is the whole of the debounce: an invocation that arrives while a refresh is in
- * flight reads a fresh mtime, judges the entry good, and serves the previous contents
- * instead of starting a second refresh.
+ * A bare `mkdir` — no `recursive` — is the whole mechanism. It is one syscall that either
+ * creates the directory or fails `EEXIST`, so an arbitrary number of processes arriving
+ * together agree on a single winner with nothing to coordinate and no state to clean up
+ * beyond the directory itself. It is the same move {@link writeCache} makes with `rename`:
+ * lean on one atomic call rather than assemble the guarantee in userspace.
+ *
+ * A lock also needs a bound. Without one, a process killed mid-refresh wedges the entry
+ * into serving stale contents forever — strictly worse than the duplicated refresh this
+ * exists to stop. A lock older than {@link LOCK_STALE_MS} is therefore treated as
+ * abandoned, reaped, and re-claimed once.
+ *
+ * A failure that is not `EEXIST` propagates rather than degrading to an unlocked refresh.
+ * A permanently unwritable cache directory would otherwise serve stale contents forever
+ * with no signal anywhere, which is the one outcome worse than the race. The retry after
+ * a reap is the exception: losing there means "serve stale", which is the safe direction.
+ *
+ * @param lock - Path the lock directory should occupy. Its parent must already exist,
+ * which is why {@link cached} only reaches here when the entry does.
+ * @returns `true` when this call holds the lock and must release it.
+ * @throws If the lock cannot be created for any reason other than already existing.
+ */
+// ponytail: the lock's mtime is stamped once at creation and never renewed, so a refresh
+// running longer than LOCK_STALE_MS has its lock reaped and a second one starts. Renew it
+// from inside the refresh if a slow `gh` ever makes that common.
+async function claim(lock: string): Promise<boolean> {
+  try {
+    await mkdir(lock);
+
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+
+  const held = await stat(lock).catch(() => null);
+  if (held === null || Date.now() - held.mtimeMs < LOCK_STALE_MS) return false;
+
+  await rm(lock, { recursive: true, force: true });
+
+  return await mkdir(lock).then(
+    () => true,
+    () => false,
+  );
+}
+
+/**
+ * Stamps an entry's mtime to now, so a refresh that failed is not retried immediately.
+ *
+ * The half of the debounce {@link claim} cannot cover. The lock serialises refreshes that
+ * overlap in time and is released as soon as one finishes; the stamp is what outlives a
+ * refresh that *failed*, leaving the entry reading fresh for a full TTL rather than
+ * retried by every invocation until it succeeds.
  *
  * Failures are swallowed. The cost of a missed touch is one duplicated refresh — the same
  * thing that happens on a cold start by design — which is never worth failing a cache read
  * over.
  */
-// ponytail: the claim is a stamped mtime, not a lock, so simultaneous starts can still
-// overlap. Take a real lock file if a duplicated refresh ever costs more than it saves.
+// ponytail: refreshes of an existing entry are serialised, but a cold start is not — it
+// has no entry to serve a loser, so making one wait would trade a duplicated refresh for a
+// stall. Have losers wait on the lock and re-read if a cold stampede ever costs more.
 async function touch(path: string): Promise<void> {
   const now = new Date();
 
@@ -238,11 +290,20 @@ export async function writeCache(key: CacheKey, value: string): Promise<void> {
  * list beats an error where the list should be. With no previous entry there is nothing to
  * serve, so the rejection propagates.
  *
- * Two consequences of the touch-debounce are accepted rather than engineered around:
+ * **Refreshing an existing entry is serialised**, by {@link claim}, across processes as
+ * well as within one. The mtime stamp cannot do this by itself: reading it and writing it
+ * are two calls, so a burst that starts in the same instant all reads the old value and
+ * all refreshes — precisely the stampede the debounce exists to collapse. Callers that
+ * lose the lock serve the previous contents, which is what they would have served while
+ * waiting anyway.
+ *
+ * Two consequences are accepted rather than engineered around:
  *
  * - **A cold start does not debounce.** `utimes` cannot create a file, so a missing entry
- *   has no mtime to stamp and there is nothing to claim the window with. Staking the claim
- *   by writing the entry early would fix that and cost far more: a concurrent reader would
+ *   has no mtime to stamp and there is nothing to claim the window with. The lock is not
+ *   taken there either: with no previous contents there is nothing to hand a loser, so
+ *   making one wait would trade a duplicated refresh for a stall. Staking the claim by
+ *   writing the entry early would fix that and cost far more: a concurrent reader would
  *   be handed `""` as a valid value, which is a wrong answer rather than a slow one. So
  *   both callers refresh and both rename; the later write wins, and either value is whole.
  * - **A failed refresh still spends the touch**, leaving stale contents served for a full
@@ -250,21 +311,16 @@ export async function writeCache(key: CacheKey, value: string): Promise<void> {
  *   `gh`: restoring the mtime on failure would reinstate the stampede the debounce exists
  *   to stop, on the slowest path there is.
  *
- * Reading the mtime and stamping it is not atomic, so calls that start in the same instant
- * can both get past the staleness check and both refresh. A burst spread over even a few
- * milliseconds — a shell redrawing its prompt, which is the case this exists for — does
- * not.
- *
  * @param key - The entry to read.
  * @param ttl - Milliseconds after which the entry is stale.
  * @param refresh - Produces the new contents. Called only when the entry is stale or
  * missing, and at most once per call.
  * @returns The fresh contents, or the previous contents when `refresh` fails.
  * @throws Whatever `refresh` threw, when there was no previous entry to fall back on; or
- * whatever {@link writeCache} threw. Only `refresh` gets the stale-contents fallback — a
- * cache that cannot be written is a fault worth surfacing, and discarding a good refresh
- * because it could not be stored would serve stale text the caller had already paid to
- * replace.
+ * whatever {@link writeCache} or {@link claim} threw. Only `refresh` gets the
+ * stale-contents fallback — a cache that cannot be written is a fault worth surfacing, and
+ * discarding a good refresh because it could not be stored would serve stale text the
+ * caller had already paid to replace.
  *
  * @example
  * ```ts
@@ -286,21 +342,36 @@ export async function cached(
     return entry.text;
   }
 
-  if (entry) {
-    await touch(path);
+  // Only with an entry in hand: `claim` needs the per-repo directory to already exist, and
+  // a loser needs something to be served. Both are the same condition.
+  const lock = `${path}.lock`;
+  const held = entry !== null && (await claim(lock));
+  if (entry && !held) {
+    return entry.text;
   }
 
-  let value: string;
   try {
-    value = await refresh();
-  } catch (error) {
     if (entry) {
-      return entry.text;
+      await touch(path);
     }
-    throw error;
+
+    let value: string;
+    try {
+      value = await refresh();
+    } catch (error) {
+      if (entry) {
+        return entry.text;
+      }
+      throw error;
+    }
+
+    // Outside the inner `try` on purpose: only `refresh` gets the stale-contents fallback.
+    await writeCache(key, value);
+
+    return value;
+  } finally {
+    if (held) {
+      await rm(lock, { recursive: true, force: true });
+    }
   }
-
-  await writeCache(key, value);
-
-  return value;
 }
