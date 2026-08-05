@@ -145,6 +145,8 @@ async function readEntry(path: string): Promise<CacheEntry | null> {
  * thing that happens on a cold start by design — which is never worth failing a cache read
  * over.
  */
+// ponytail: the claim is a stamped mtime, not a lock, so simultaneous starts can still
+// overlap. Take a real lock file if a duplicated refresh ever costs more than it saves.
 async function touch(path: string): Promise<void> {
   const now = new Date();
 
@@ -222,6 +224,11 @@ export async function writeCache(key: CacheKey, value: string): Promise<void> {
  *   TTL rather than retried immediately. That is the wanted behaviour against a flaky
  *   `gh`: restoring the mtime on failure would reinstate the stampede the debounce exists
  *   to stop, on the slowest path there is.
+ *
+ * The window between reading the mtime and stamping it is real but small. Measured across
+ * eight concurrent processes, a burst arriving over a few hundred milliseconds — a shell
+ * redrawing its prompt, which is the case this exists for — collapses to a single refresh;
+ * eight launched in the same instant occasionally produce two.
  *
  * @param key - The entry to read.
  * @param ttl - Milliseconds after which the entry is stale.
