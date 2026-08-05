@@ -21,6 +21,7 @@ import { execFileSync } from "node:child_process";
 import {
   existsSync,
   lstatSync,
+  mkdirSync,
   mkdtempSync,
   readdirSync,
   realpathSync,
@@ -495,9 +496,11 @@ describe("the refusal path", () => {
 });
 
 describe("a blocked verdict leaves the repository byte-identical", () => {
-  // The criterion every other case rests on: every check precedes the first mutation, so a
-  // caller told "blocked" can act on it knowing nothing moved. Asserted per reason rather
-  // than once, because each stops at a different point in the sequence.
+  // The criterion every other case rests on: every check precedes the first mutation of the
+  // repository, so a caller told "blocked" can act on it knowing the repository did not move.
+  // Asserted per reason rather than once, because each stops at a different point in the
+  // sequence. The one thing preflight does write on a blocked path is the sync lock, which
+  // lives in the container rather than in the repository and is gone before it returns.
 
   test("container-cwd", async () => {
     const { container } = makeLayout(seed);
@@ -625,17 +628,10 @@ describe("concurrent runs against one container", () => {
   }
 
   test("all of them proceed, and none is told the checkout is dirty", async () => {
-    // The regression. Preflight mutates the *shared* default-branch checkout, and every
-    // checkout in a container shares one common git dir, so two runs overlapping collide
-    // three ways: `FETCH_HEAD` is one file, which two fetches leave holding more than one
-    // merge candidate — `fatal: Cannot fast-forward to multiple branches`, exit 128, empty
-    // stdout; `index.lock` is taken by both the switch and the pull's merge and has no retry
-    // timeout, so the loser fails outright; and `git status`, which decides the
-    // `dirty-checkout` verdict, reads the old index while the pull is part-way through
-    // writing the new work tree, so a clean checkout reports as dirty.
-    //
-    // The third is the one worth asserting the *whole* envelope over: it is not a crash but a
-    // wrong answer, and a caller that branches on `.verdict` acts on it.
+    // The regression, against the collisions `preflight.ts`'s header lists. The whole
+    // envelope is asserted rather than the exit status, because the collision that matters
+    // most produces a wrong *answer* rather than a crash: a concurrent sync makes `git status`
+    // report a clean checkout as dirty, and a caller that branches on `.verdict` acts on it.
     const { container, checkout } = makeBehindLayout();
 
     const results = await Promise.all(
@@ -687,5 +683,16 @@ describe("concurrent runs against one container", () => {
     );
 
     expect(readdirSync(container).filter((entry) => entry.includes("lock"))).toEqual([]);
+  });
+
+  test("--base never waits on the sync lock", async () => {
+    // The stacked path syncs nothing, so it has no reason to queue behind a sync somebody
+    // else is running — and every stacked run in a burst would otherwise wait its turn for a
+    // critical section it never enters. Without the skip this case does not fail, it hangs
+    // until the planted lock goes stale.
+    const { container, checkout } = makeLayout(seed);
+    mkdirSync(join(container, ".wrk-sync.lock"));
+
+    expect((await preflight("EXC-1", checkout, { base: "EXC-0/parent" })).verdict).toBe("proceed");
   });
 });

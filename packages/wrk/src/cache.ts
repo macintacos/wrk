@@ -24,8 +24,9 @@
  *   cached here.
  * - **Single-flight refresh.** A burst of invocations against an existing entry — a shell
  *   that redraws its prompt three times in a second, or three shells doing it at once —
- *   starts one refresh, not one each. A lock directory serialises them across processes;
- *   the entry's mtime is stamped so a *failed* refresh is not retried for a full TTL.
+ *   starts one refresh, not one each. A lock directory serialises them across processes —
+ *   the mutex itself lives in [`./lock`](./lock) — and the entry's mtime is stamped so a
+ *   *failed* refresh is not retried for a full TTL.
  *
  * The root is XDG's, resolved by hand. `conf` and `env-paths` both answer
  * `~/Library/Caches` on macOS, which would quietly move the cache off the path the rest of

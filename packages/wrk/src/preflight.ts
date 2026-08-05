@@ -116,7 +116,9 @@ const CONVERSION_REFERENCE = "repo-setup";
  * happen to agree about that variable, which is not a mutex.
  *
  * Beside `.bare` rather than inside it: `git` owns the contents of its own directory, and
- * this is not git's lock.
+ * this is not git's lock. The container is safe to write into precisely because it is not a
+ * work tree — {@link isBareLayout} has already answered `true` before the sync is reached —
+ * so the directory can never surface as an untracked file in some checkout's `git status`.
  */
 const SYNC_LOCK = ".wrk-sync.lock";
 
@@ -342,15 +344,17 @@ export async function preflight(
 
   let current = branch;
   if (options.base === undefined) {
-    // Everything that reads or writes the shared checkout is one critical section, held
-    // against every other `wrk` process on this repository — see this module's header for the
-    // four collisions, the last of which is a wrong verdict rather than a failure and is why
-    // the dirty check is in here rather than in front. `--base` reaches none of it, having
-    // nothing to sync.
+    // The index and the work tree are one critical section, held against every other
+    // preflight on this repository — see this module's header for the collisions, the last of
+    // which is a wrong verdict rather than a failure and is why the dirty check is in here
+    // rather than in front of it. The checks above stay outside deliberately: they read refs
+    // and config only, never the index, and a sync running underneath them only moves refs
+    // forward. `--base` reaches none of this, having nothing to sync.
     //
-    // A blocking verdict returns out of the closure rather than out of `preflight`, so the
-    // lock is released by the one `finally` that owns it.
-    const blocked = await withLock(join(where.container, SYNC_LOCK), async () => {
+    // The closure answers with the branch now checked out, or with the blocking verdict
+    // itself — rather than assigning `current` from in here, which a later early return would
+    // silently skip. Returning it makes the compiler ask for both cases.
+    const synced = await withLock(join(where.container, SYNC_LOCK), async () => {
       // 6. Is the checkout clean enough to switch and pull? Untracked files are excluded: they
       //    block neither, and scratch files are normal in a working checkout.
       if ((await statusPorcelain(cwd, { untracked: false })).length > 0) {
@@ -375,15 +379,14 @@ export async function preflight(
       // verbatim: a switch can remove the subdirectory `cwd` names, and the `@{upstream}` read
       // after it would then run from a path that no longer exists.
       await syncDefaultBranch(where.root, defaultBranch, branch);
-      // Known rather than re-read: the sync above either switched to this branch or was already
-      // on it, and a fast-forward pull does not rename it. One spawn saved to learn what the
-      // call that just returned established. Assigned in here, where the guard above has
-      // already established that the branch is not `null`.
-      current = defaultBranch;
 
-      return null;
+      // Known rather than re-read: the sync above either switched to this branch or was
+      // already on it, and a fast-forward pull does not rename it. One spawn saved to learn
+      // what the call that just returned established.
+      return defaultBranch;
     });
-    if (blocked !== null) return blocked;
+    if (typeof synced !== "string") return synced;
+    current = synced;
   }
 
   return report({
