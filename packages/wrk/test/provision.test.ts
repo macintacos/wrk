@@ -27,6 +27,7 @@ import { execFileSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -37,7 +38,7 @@ import {
 } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { provision } from "../src/provision";
 
@@ -177,10 +178,22 @@ function makeSource(): string {
   return dir;
 }
 
-/** An empty destination, standing in for the worktree git has just created. */
-function makeWorktree(options: { mise?: boolean } = {}): string {
+/**
+ * An empty destination, standing in for the worktree git has just created.
+ *
+ * @param options.mise - Write the plain `mise.toml`, the common marker.
+ * @param options.configAt - Write the marker at this path instead, creating parents. The
+ *   mise-config table is hand-transcribed, so each entry needs a case that would fail on a
+ *   transposed name.
+ */
+function makeWorktree(options: { mise?: boolean; configAt?: string } = {}): string {
   const dir = tempDir();
   if (options.mise === true) writeFileSync(join(dir, "mise.toml"), "[tools]\n");
+  if (options.configAt !== undefined) {
+    const path = join(dir, options.configAt);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, "[tools]\n");
+  }
   return dir;
 }
 
@@ -293,6 +306,45 @@ describe("provision", () => {
     expect(recorded(bin).filter((line) => line.includes("mise"))).toEqual([]);
   });
 
+  // Every path mise reads as project config, one case each. The list in `provision.ts` is
+  // hand-transcribed from mise's own documentation, and the four nested spellings are exactly
+  // the ones a transposition ships silently — `.mise/config.toml` for `mise/config.toml` reads
+  // right and detects nothing. `.tool-versions` is here because mise honours it out of the box
+  // for asdf compatibility, unlike the idiomatic version files that are deliberately excluded.
+  test.each([
+    "mise.toml",
+    "mise.local.toml",
+    ".mise.toml",
+    ".mise.local.toml",
+    "mise/config.toml",
+    ".mise/config.toml",
+    ".config/mise.toml",
+    ".config/mise/config.toml",
+    ".tool-versions",
+    ".config/mise/conf.d/tools.toml",
+  ])("treats a worktree carrying %s as a mise project", async (configAt) => {
+    const bin = makeBin();
+    process.env.PATH = bin;
+    const worktree = makeWorktree({ configAt });
+
+    await provision(makeSource(), worktree);
+
+    expect(recorded(bin)).toContain(`${worktree}\tmise trust --quiet`);
+  });
+
+  test("ignores a conf.d drop-in that is not a .toml", async () => {
+    // The drop-in branch is a directory read rather than a name match, so it needs the
+    // negative case too — otherwise `readdir(...).some(…)` passing on any file at all would go
+    // unnoticed.
+    const bin = makeBin();
+    process.env.PATH = bin;
+    const worktree = makeWorktree({ configAt: ".config/mise/conf.d/README.md" });
+
+    await provision(makeSource(), worktree);
+
+    expect(recorded(bin).filter((line) => line.includes("mise"))).toEqual([]);
+  });
+
   test("falls back to `mise install` when the project defines no setup task", async () => {
     const bin = makeBin({ tasksExit: 1 });
     process.env.PATH = bin;
@@ -366,6 +418,41 @@ describe("provision", () => {
     expect(stderrText()).not.toContain("failed");
     expect(existsSync(join(worktree, ".codegraph", "index.db"))).toBe(true);
     expect(existsSync(join(worktree, ".codegraph", "daemon.sock"))).toBe(false);
+  });
+
+  test("copies past a FIFO in the index too, which fails the same way a socket does", async () => {
+    // The socket is the one seen in the wild, but `cp` refuses a FIFO with its own error and
+    // aborts identically — so excluding only sockets would leave the same door open one step
+    // to the left.
+    const bin = makeBin();
+    process.env.PATH = bin;
+    const source = makeSource();
+    const worktree = makeWorktree();
+    execFileSync("mkfifo", [join(source, ".codegraph", "events.pipe")]);
+
+    await provision(source, worktree);
+
+    expect(stderrText()).not.toContain("failed");
+    expect(existsSync(join(worktree, ".codegraph", "index.db"))).toBe(true);
+    expect(existsSync(join(worktree, ".codegraph", "events.pipe"))).toBe(false);
+  });
+
+  test("seeds .env by value, so a symlinked source arrives as a real file", async () => {
+    // `source` is the *parent worktree* when a layer is stacked, and `wrk` tears those down —
+    // so a link copied as a link dangles the moment the parent goes. Copying the bytes is also
+    // the only result that is the same under Bun and under the Node the artifact targets.
+    const bin = makeBin();
+    process.env.PATH = bin;
+    const source = makeSource();
+    const worktree = makeWorktree();
+    rmSync(join(source, ".env"));
+    writeFileSync(join(source, ".env.local"), "LINKED=1\n");
+    symlinkSync(".env.local", join(source, ".env"));
+
+    await provision(source, worktree);
+
+    expect(lstatSync(join(worktree, ".env")).isSymbolicLink()).toBe(false);
+    expect(readFileSync(join(worktree, ".env"), "utf8")).toBe("LINKED=1\n");
   });
 
   test("warns on a failed step and still runs the steps after it", async () => {

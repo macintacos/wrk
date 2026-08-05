@@ -21,9 +21,10 @@
  * machine with a problem.
  *
  * The presence gate is the spawn itself rather than a `PATH` scan. [`./proc`](./proc)'s `run`
- * rejects when the child could not be started at all, which is exactly what a missing binary
- * is, so {@link tool} turns that rejection into `null` and no `which` has to be reimplemented
- * — and no window opens between a probe answering and the spawn running.
+ * rejects when the child could not be started at all, so {@link tool} turns that rejection
+ * into `null` and no `which` has to be reimplemented — and no window opens between a probe
+ * answering and the spawn running. See {@link tool} for the one thing that reading is not
+ * allowed to assume.
  *
  * **Progress and warnings go to stderr**, through [`./output`](./output)'s {@link note},
  * leaving stdout to the single JSON document `emit` writes. This module never touches stdout.
@@ -31,11 +32,19 @@
  * Two deliberate divergences from `agent_exec_worktree.py`'s `provision`, which this
  * reproduces. Child output is **buffered and then forwarded** rather than streamed live,
  * because `proc.ts` has no `stdio: "inherit"` mode and widening a shared module for one caller
- * is not worth it; the channel and the content are unchanged, only the timing. And the mise
- * progress line prints *after* `mise trust` rather than before it, since that call is what
- * establishes the tool is installed at all. One divergence is a fix rather than a difference:
- * the Python's recursive copy dies on `.codegraph/daemon.sock` — a unix socket no copy can
- * carry — and warns on every single worktree creation. {@link copyContext} filters it out.
+ * is not worth it. That is not free, and the cost is not merely timing: the Python passed an
+ * inherited fd, so its caps were deadlines on the *process*, while `run` settles when the
+ * output pipes close — see the `ponytail:` note in {@link installMiseTooling} — and a child
+ * handed a pipe rather than a terminal drops whatever colour and progress rendering it
+ * reserves for a TTY. The channel is unchanged; the enforceability of the caps and the
+ * decoration are not. The second divergence is that the mise progress line prints *after*
+ * `mise trust` rather than before it, since that call is what establishes the tool is
+ * installed at all.
+ *
+ * One further divergence is a fix rather than a difference: the Python's recursive copy dies
+ * on `.codegraph/daemon.sock` — a unix socket no copy can carry — and warns on every single
+ * worktree creation. {@link copyContext} filters it out, along with the two neighbouring
+ * shapes that would abort a copy the same way.
  *
  * @packageDocumentation
  */
@@ -73,8 +82,11 @@ const SETUP_TIMEOUT_MS = 60_000;
  * [mise's configuration docs](https://mise.jdx.dev/configuration.html).
  *
  * Global and system-level paths are deliberately absent — they say nothing about *this*
- * checkout — and so are the `.env`-style files mise can read but does not treat as project
- * config, which are off by default and would falsely flag every pyenv or nvm project.
+ * checkout. So are the idiomatic version files (`.python-version`, `.nvmrc`, …): mise can read
+ * them but does not treat them as project config by default, so honouring them would falsely
+ * flag every pyenv and nvm project. `.tool-versions` is **not** one of those — mise reads it
+ * as project config out of the box, for asdf compatibility, and a repository pinning its
+ * toolchain that way is precisely one where nothing else will install it.
  */
 const MISE_CONFIG_FILES = [
   "mise.toml",
@@ -85,6 +97,7 @@ const MISE_CONFIG_FILES = [
   ".mise/config.toml",
   ".config/mise.toml",
   ".config/mise/config.toml",
+  ".tool-versions",
 ] as const;
 
 /** The drop-in directory whose `*.toml` files count as project config too. */
@@ -99,8 +112,16 @@ function statOf(path: string): Promise<Stats | null> {
  * Runs one provisioning tool, answering `null` when it is not installed.
  *
  * This is the presence gate every step shares. `run` rejects only when the child could not be
- * spawned at all, so an `ENOENT` is precisely "that binary is not on `PATH`" and is mapped to
- * a value; anything else is a real failure and is left to propagate up to {@link bestEffort}.
+ * spawned at all, and an `ENOENT` there is mapped to a value; anything else is a real failure
+ * and is left to propagate up to {@link bestEffort}.
+ *
+ * **An `ENOENT` is not proof the binary is missing.** `spawn` reports a `cwd` that does not
+ * exist with a byte-identical error — same `code`, same `syscall`, same `path` — so nothing
+ * here can tell the two apart, and reading it as "not installed" would swallow a bad `cwd` in
+ * the silence this module reserves for an absent tool. What makes the reading safe is that
+ * every caller below reaches this only after stat-ing a path *inside* `cwd`: `codegraph` stats
+ * the index, and `installMiseTooling` clears `isMiseProject` first. A step added without such
+ * a gate must not use this helper.
  *
  * @param cmd - Executable to run.
  * @param args - Arguments after it, one array element per argv entry.
@@ -120,7 +141,13 @@ function tool(
   });
 }
 
-/** Forwards whatever a child wrote to the human channel, saying nothing when it said nothing. */
+/**
+ * Forwards whatever a child wrote to the human channel, saying nothing when it said nothing.
+ *
+ * The two streams are concatenated rather than interleaved — `run` captures them separately,
+ * where the Python merged them into one fd — so a tool that alternates between them comes out
+ * regrouped rather than in the order it wrote.
+ */
 function echo({ stdout, stderr }: RunResult): void {
   const output = `${stdout}${stderr}`.trimEnd();
   if (output !== "") note(output);
@@ -145,28 +172,41 @@ async function codegraph(checkout: string, ...args: string[]): Promise<void> {
 /**
  * Seeds a new worktree with the untracked context git does not carry over.
  *
- * `force: false` is what makes "never clobber what is already there" a property of the copy
- * rather than of a guard at each path, and `verbatimSymlinks` keeps a relative link pointing
- * where it pointed instead of being rewritten back at the source.
+ * `force: false` is what makes "never clobber what is already there" a property of both copies
+ * rather than of a guard at each path.
  *
- * **The tracked-file exclusion is not redundant with that**, and it is the subtle half. Git
- * checks a *tracked* `.codegraph/.gitignore` out into every worktree, so `force: false`
- * already skips it — but a file tracked on the source's branch and absent from the new
+ * **`.env` is copied by value.** `dereference` makes a symlinked `.env` arrive as the file it
+ * pointed at, which is what the Python's `shutil.copy` did and is the only answer that holds
+ * up here: `source` is the *parent worktree* when a layer is stacked, so a link would outlive
+ * the directory it names. It also settles a difference between the two runtimes this package
+ * straddles, which resolve a copied symlink's target differently.
+ *
+ * The index is copied structurally instead — `verbatimSymlinks` keeps a relative link pointing
+ * where it pointed rather than being rewritten back at the source — because it is a directory
+ * of a tool's own making, not a value this module is responsible for the meaning of.
+ *
+ * **The tracked-file exclusion is not redundant with `force: false`**, and it is the subtle
+ * half. Git checks a *tracked* `.codegraph/.gitignore` out into every worktree, so `force:
+ * false` already skips it — but a file tracked on the source's branch and absent from the new
  * worktree's branch would be copied in as an **untracked** file, and the next rebase onto a
  * branch that adds it fails before it starts rather than overwriting it. So the decision is
  * per file, not per directory: a directory-level "already there?" guard reads the whole index
- * as seeded and copies nothing.
- *
- * Sockets are excluded because no recursive copy can carry one, and one aborts the copy
- * outright — `.codegraph` holds a live `daemon.sock` whenever the indexer is running.
+ * as seeded and copies nothing. Being per file also means an index only *partly* present in
+ * the worktree is filled in rather than skipped whole, which is the Python's one behaviour
+ * this deliberately does not reproduce.
  *
  * @param source - Checkout to copy from.
  * @param worktree - Freshly-created worktree to seed.
- * @throws If a copy failed for any reason other than the source not being there.
+ * @throws If a copy failed — in practice a destination that is there but is the wrong shape,
+ *   such as a plain file where the index directory belongs. A missing source is not a failure
+ *   and is guarded above rather than caught.
  */
 async function copyContext(source: string, worktree: string): Promise<void> {
   if ((await statOf(join(source, ENV_FILE)))?.isFile() === true) {
-    await cp(join(source, ENV_FILE), join(worktree, ENV_FILE), { force: false });
+    await cp(join(source, ENV_FILE), join(worktree, ENV_FILE), {
+      force: false,
+      dereference: true,
+    });
   }
 
   const index = join(source, CODEGRAPH_DIR);
@@ -181,7 +221,16 @@ async function copyContext(source: string, worktree: string): Promise<void> {
     recursive: true,
     force: false,
     verbatimSymlinks: true,
-    filter: async (from) => !tracked.has(relative(source, from)) && !(await lstat(from)).isSocket(),
+    filter: async (from) => {
+      if (tracked.has(relative(source, from))) return false;
+
+      // Three shapes abort the whole copy rather than being skipped, and the live indexer
+      // produces all three: it holds a `daemon.sock`, and its journal files appear and vanish
+      // between the parent's `readdir` and this `lstat`. `cp` refuses a socket and a FIFO
+      // outright, and a `null` here is an entry that no longer exists to copy.
+      const entry = await lstat(from).catch(() => null);
+      return entry !== null && !entry.isSocket() && !entry.isFIFO();
+    },
   });
 }
 
@@ -236,6 +285,11 @@ async function installMiseTooling(worktree: string): Promise<void> {
   });
   const argv = probe.code === 0 ? ["run", "setup"] : ["install"];
 
+  // ponytail: `run` settles when the output pipes close, so this is a cap on `mise` and not on
+  // the `bun install` grandchild that inherited the pipe — and the whole install log is
+  // buffered before any of it is forwarded. This is the first caller of `run` to spawn a build
+  // rather than a `git` query, so it is the first place either ceiling can be reached. Give
+  // `proc.ts` an inherit-stdio mode if a wedged install or an unbounded log ever shows up.
   const installed = await run("mise", argv, { cwd: worktree, timeout: SETUP_TIMEOUT_MS });
   echo(installed);
   const outcome = installed.code === 0 ? "ready" : `failed (exit ${installed.code})`;
@@ -274,8 +328,9 @@ async function bestEffort(label: string, step: () => Promise<void>): Promise<voi
  *
  * @example
  * ```ts
- * await addWorktree(path, from, { branch });
- * await provision(from, path); // stderr only; the worktree exists either way
+ * // Nothing to catch and nothing to read: the worktree exists either way, and everything
+ * // this has to say went to stderr while it ran.
+ * await provision(from, path);
  * ```
  */
 export async function provision(source: string, worktree: string): Promise<void> {

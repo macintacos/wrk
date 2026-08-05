@@ -91,6 +91,9 @@ function fixtureGit(args: string[], cwd?: string): string {
   return execFileSync("git", args, { cwd, env: FIXTURE_ENV, encoding: "utf8" }).trim();
 }
 
+/** The real `git`, so a `PATH` holding nothing else still lets `wrk` run at all. */
+const REAL_GIT = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+
 /** Temp roots to delete once the suite finishes. */
 const roots: string[] = [];
 
@@ -419,9 +422,6 @@ describe("wrk agent create", () => {
     expect(result.stderr).toMatch(/required option/);
   });
 });
-
-/** The real `git`, so a `PATH` holding nothing else still lets `wrk` run at all. */
-const REAL_GIT = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
 
 /**
  * A `PATH` holding only a real `git` and stub `codegraph` / `mise` executables.

@@ -63,10 +63,11 @@
  */
 
 /**
- * What every human-facing line `wrk` writes is prefixed with.
+ * What every human-facing line `wrk` **composes itself** is prefixed with.
  *
  * The tool's name, so a message stays attributable once it is one line among many in an
- * agent's transcript or a shell's scrollback.
+ * agent's transcript or a shell's scrollback. Output forwarded verbatim from a child process
+ * is not one of `wrk`'s lines and keeps whatever the tool that wrote it chose.
  *
  * Exported for the modules that write their own progress and warnings through {@link note}
  * rather than raising for {@link reportFailure} to render — provisioning a worktree is the
