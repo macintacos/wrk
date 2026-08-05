@@ -12,11 +12,9 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { realpathSync } from "node:fs";
 
 import { run } from "../src/proc";
-
-/** A name no binary on `PATH` will ever have, used to force a spawn failure. */
-const MISSING_BINARY = "wrk-definitely-not-a-real-binary-xyz";
 
 describe("run", () => {
   test("resolves with the exit code instead of throwing when the command fails", async () => {
@@ -55,7 +53,10 @@ describe("run", () => {
       cwd: import.meta.dir,
     });
 
-    expect(result.stdout).toBe(import.meta.dir);
+    // Both sides go through realpath: the child's `process.cwd()` has resolved symlinks
+    // and `import.meta.dir` has not, so a checkout under a symlinked prefix — `/tmp` on
+    // macOS — would fail a literal comparison for no good reason.
+    expect(realpathSync(result.stdout)).toBe(realpathSync(import.meta.dir));
   });
 
   test("overlays env onto the inherited environment rather than replacing it", async () => {
@@ -73,6 +74,19 @@ describe("run", () => {
     expect(JSON.parse(result.stdout)).toEqual(["overlaid", true]);
   });
 
+  test("unsets an inherited variable given an undefined overlay value", async () => {
+    // The other half of an honest overlay: shedding an inherited `GIT_DIR` needs removal,
+    // not just addition. `PATH` stands in for it here — the child is spawned by absolute
+    // path, so dropping `PATH` costs the test nothing.
+    const result = await run(
+      process.execPath,
+      ["-e", "process.stdout.write(String(process.env.PATH))"],
+      { env: { PATH: undefined } },
+    );
+
+    expect(result.stdout).toBe("undefined");
+  });
+
   test("kills a child that outlives its timeout and still resolves", async () => {
     const result = await run(process.execPath, ["-e", "setTimeout(() => {}, 10_000)"], {
       timeout: 300,
@@ -82,9 +96,27 @@ describe("run", () => {
     expect(result.code).toBe(143);
   });
 
+  test("captures large multibyte output written right up to exit", async () => {
+    // Pins `setEncoding("utf8")`: output large enough to span chunks puts a multibyte
+    // character on a boundary, which per-chunk `toString()` would mojibake. Every other
+    // test in this file writes a few bytes and stays green through that regression.
+    //
+    // It does not pin `close`-rather-than-`exit`; swapping those still passes, because the
+    // parent has already buffered this much by the time `exit` fires. Catching that needs a
+    // deliberate race, which is a flaky test, so the reasoning lives in `proc.ts` instead.
+    const expected = "é😀".repeat(60_000);
+    const result = await run(process.execPath, [
+      "-e",
+      'process.stdout.write("é😀".repeat(60_000)); process.exit(7)',
+    ]);
+
+    expect(result.stdout).toBe(expected);
+    expect(result.code).toBe(7);
+  });
+
   test("rejects when the command cannot be spawned at all", async () => {
     // The boundary between information and error: an exit code means the command ran and
     // had something to say, whereas a missing binary leaves the caller nothing to act on.
-    await expect(run(MISSING_BINARY, [])).rejects.toThrow();
+    await expect(run("wrk-definitely-not-a-real-binary-xyz", [])).rejects.toThrow();
   });
 });

@@ -14,18 +14,28 @@
 import { spawn } from "node:child_process";
 import { constants } from "node:os";
 
-/** Options for {@link run}. Every field is optional; the defaults inherit from this process. */
+/** Options for {@link run}. */
 export interface RunOptions {
   /** Working directory for the child. Defaults to this process's cwd. */
   cwd?: string;
 
   /**
    * Variables layered *on top of* `process.env`, not a replacement for it — `git` and `gh`
-   * both need the inherited `PATH` and `HOME` to function at all.
+   * both need the inherited `PATH` and `HOME` to function at all. An `undefined` value
+   * unsets an inherited variable, which is how a caller sheds a `GIT_DIR` or
+   * `GIT_WORK_TREE` that would otherwise silently override {@link RunOptions.cwd}.
    */
-  env?: Record<string, string>;
+  env?: Record<string, string | undefined>;
 
-  /** Milliseconds to wait before killing the child with `SIGTERM`. Unlimited when unset. */
+  /**
+   * Milliseconds after which the child is sent `SIGTERM`. Unlimited when unset.
+   *
+   * Best-effort rather than a deadline: there is no `SIGKILL` escalation, and the promise
+   * settles when the output pipes close rather than when the child exits — so a child that
+   * traps `SIGTERM`, or any descendant still holding the inherited stdout pipe, outlives
+   * it.
+   */
+  // ponytail: one SIGTERM, no escalation. Add a SIGKILL grace timer if a real hang shows up.
   timeout?: number;
 }
 
@@ -80,7 +90,7 @@ export function run(
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, {
       cwd: options.cwd,
-      env: options.env ? { ...process.env, ...options.env } : process.env,
+      env: { ...process.env, ...options.env },
       timeout: options.timeout,
       stdio: ["ignore", "pipe", "pipe"],
     });
@@ -88,20 +98,26 @@ export function run(
     let stdout = "";
     let stderr = "";
 
-    child.stdout?.setEncoding("utf8");
-    child.stderr?.setEncoding("utf8");
-    child.stdout?.on("data", (chunk: string) => {
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => {
       stdout += chunk;
     });
-    child.stderr?.on("data", (chunk: string) => {
+    child.stderr.on("data", (chunk: string) => {
       stderr += chunk;
     });
 
-    // A promise settles once, so the ordering of these two is not load-bearing. It matters
-    // anyway: Bun emits `error` *and then* `close` for a failed spawn, where Node emits
-    // only `error`. `error` arrives first on both, so the rejection wins either way and
-    // the trailing `close` is a no-op.
+    // `error` on the child covers the spawn and the kill, never the pipes. An unhandled
+    // `error` on either stream would take the whole CLI down instead of rejecting here.
+    child.stdout.on("error", reject);
+    child.stderr.on("error", reject);
+
+    // A failed spawn emits `error` and then `close` with code -2, on both Node and Bun.
+    // `error` arrives first, so the rejection wins and the trailing `close` is a no-op — a
+    // promise settles once.
     child.on("error", reject);
+
+    // `close` rather than `exit`: `exit` can fire while output is still in flight.
     child.on("close", (code, signal) => {
       resolve({ stdout, stderr, code: toExitStatus(code, signal) });
     });
@@ -113,11 +129,10 @@ export function run(
  *
  * `code` is `null` exactly when the child was killed by a signal, which is what a timeout
  * produces. Mapping that to `128 + signum` keeps the shell convention and, more usefully,
- * keeps a plain `code !== 0` check correct at every call site.
+ * keeps a plain `code !== 0` check correct at every call site. The `SIGTERM` fallback is
+ * unreachable — `close` never reports both as `null` — and exists only to keep the lookup
+ * total; it names the signal a timeout would have sent rather than inventing a code.
  */
 function toExitStatus(code: number | null, signal: NodeJS.Signals | null): number {
-  if (code !== null) return code;
-
-  const signals: Partial<Record<NodeJS.Signals, number>> = constants.signals;
-  return 128 + (signal === null ? 0 : (signals[signal] ?? 0));
+  return code ?? 128 + constants.signals[signal ?? "SIGTERM"];
 }
