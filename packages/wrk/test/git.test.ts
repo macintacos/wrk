@@ -17,12 +17,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import {
+  addWorktree,
   currentBranch,
   forEachRef,
   git,
   gitCommonDir,
   isInsideWorkTree,
+  listWorktrees,
+  pruneWorktrees,
   refExists,
+  removeWorktree,
   showToplevel,
   statusPorcelain,
   symbolicRef,
@@ -70,6 +74,22 @@ function makeRepo(): string {
 function makeBare(): string {
   const dir = tempDir();
   execFileSync("git", ["init", "-q", "--bare", dir]);
+  return dir;
+}
+
+/**
+ * A bare-repo container in the layout `wrk` itself uses: a `.bare` repository, a `.git`
+ * file pointing at it, and each checkout a sibling directory.
+ *
+ * Reproduced rather than approximated because it is the only layout whose
+ * `worktree list --porcelain` output contains a `bare` record at all — the entry the parser
+ * has to drop, and one a plain repository never produces.
+ */
+function makeContainer(): string {
+  const dir = tempDir();
+  execFileSync("git", ["clone", "-q", "--bare", makeRepo(), join(dir, ".bare")]);
+  writeFileSync(join(dir, ".git"), "gitdir: ./.bare\n");
+  execFileSync("git", ["worktree", "add", "-q", join(dir, "main"), "main"], { cwd: dir });
   return dir;
 }
 
@@ -217,5 +237,126 @@ describe("refExists", () => {
   test("distinguishes a ref that exists from one that does not", async () => {
     expect(await refExists("refs/heads/main", repo)).toBe(true);
     expect(await refExists("refs/heads/no-such-ref", repo)).toBe(false);
+  });
+});
+
+describe("listWorktrees", () => {
+  test("captures prunable on the same record as the branch it belongs to", async () => {
+    // The trap the issue names, and the reason records are parsed whole. Git emits
+    // `prunable` *after* `branch`, so a parser that emits a worktree the moment it sees a
+    // branch line never sees the reason — and a stale worktree reads as live, which is how
+    // `wrk` ends up handing a dead path to something that acts on it.
+    const container = makeContainer();
+    const gone = join(container, "gone");
+    execFileSync("git", ["worktree", "add", "-q", gone, "-b", "gone"], { cwd: container });
+    rmSync(gone, { recursive: true, force: true });
+
+    const entry = (await listWorktrees(container)).find((wt) => wt.path === gone);
+
+    expect(entry?.branch).toBe("refs/heads/gone");
+    expect(entry?.prunable).not.toBeNull();
+  });
+
+  test("skips the bare entry and keeps the real checkouts", async () => {
+    const container = makeContainer();
+
+    const paths = (await listWorktrees(container)).map((wt) => wt.path);
+
+    expect(paths).not.toContain(join(container, ".bare"));
+    expect(paths).toEqual([join(container, "main")]);
+  });
+
+  test("reports path, head and branch for a live worktree", async () => {
+    const container = makeContainer();
+
+    const [entry] = await listWorktrees(container);
+
+    expect(entry?.path).toBe(join(container, "main"));
+    expect(entry?.branch).toBe("refs/heads/main");
+    expect(entry?.head).toMatch(/^[0-9a-f]{40}$/);
+    expect(entry?.prunable).toBeNull();
+  });
+
+  test("reports a detached worktree with a null branch", async () => {
+    const container = makeContainer();
+    const detached = join(container, "detached");
+    execFileSync("git", ["worktree", "add", "-q", "--detach", detached], { cwd: container });
+
+    const entry = (await listWorktrees(container)).find((wt) => wt.path === detached);
+
+    expect(entry).toBeDefined();
+    expect(entry?.branch).toBeNull();
+  });
+});
+
+describe("addWorktree", () => {
+  test("creates a worktree holding a new branch", async () => {
+    const container = makeContainer();
+    const added = join(container, "feature");
+
+    await addWorktree(added, { branch: "feature" }, container);
+
+    const entry = (await listWorktrees(container)).find((wt) => wt.path === added);
+    expect(entry?.branch).toBe("refs/heads/feature");
+  });
+
+  test("starts the new branch at the given start point", async () => {
+    const container = makeContainer();
+    const added = join(container, "from-main");
+
+    await addWorktree(added, { branch: "from-main", startPoint: "main" }, container);
+
+    const list = await listWorktrees(container);
+    expect(list.find((wt) => wt.path === added)?.head).toBe(
+      list.find((wt) => wt.path === join(container, "main"))?.head,
+    );
+  });
+
+  test("rejects with git's own message when git refuses", async () => {
+    const container = makeContainer();
+
+    // The main checkout already exists, so git declines — and the caller needs to be told
+    // why, not handed a silent no-op.
+    await expect(
+      addWorktree(join(container, "main"), { branch: "dup" }, container),
+    ).rejects.toThrow(/git worktree add/);
+  });
+});
+
+describe("removeWorktree", () => {
+  test("removes a clean worktree", async () => {
+    const container = makeContainer();
+    const added = join(container, "throwaway");
+    await addWorktree(added, { branch: "throwaway" }, container);
+
+    await removeWorktree(added, undefined, container);
+
+    expect((await listWorktrees(container)).map((wt) => wt.path)).not.toContain(added);
+  });
+
+  test("refuses a dirty worktree unless forced", async () => {
+    const container = makeContainer();
+    const added = join(container, "dirty");
+    await addWorktree(added, { branch: "dirty" }, container);
+    writeFileSync(join(added, "untracked.txt"), "x");
+
+    await expect(removeWorktree(added, undefined, container)).rejects.toThrow();
+
+    await removeWorktree(added, { force: true }, container);
+
+    expect((await listWorktrees(container)).map((wt) => wt.path)).not.toContain(added);
+  });
+});
+
+describe("pruneWorktrees", () => {
+  test("drops the administrative entry for a worktree whose directory is gone", async () => {
+    const container = makeContainer();
+    const gone = join(container, "gone");
+    await addWorktree(gone, { branch: "gone" }, container);
+    rmSync(gone, { recursive: true, force: true });
+
+    await pruneWorktrees(container);
+
+    expect((await listWorktrees(container)).map((wt) => wt.path)).not.toContain(gone);
   });
 });

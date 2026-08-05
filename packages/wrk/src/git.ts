@@ -180,3 +180,154 @@ export async function symbolicRef(name: string, cwd?: string): Promise<string | 
 export async function refExists(ref: string, cwd?: string): Promise<boolean> {
   return (await git(["show-ref", "--verify", "--quiet", ref], cwd)).code === 0;
 }
+
+/** One entry from {@link listWorktrees}. The repository's bare entry is not one of these. */
+export interface Worktree {
+  /** Absolute path of the worktree's directory. */
+  path: string;
+
+  /** Commit the worktree has checked out, or `null` on an unborn branch. */
+  head: string | null;
+
+  /**
+   * Fully qualified branch ref, or `null` when the worktree is detached.
+   *
+   * There is no separate `detached` flag because this is it: bare entries are dropped
+   * during parsing, and every remaining entry either holds a branch or is detached.
+   */
+  branch: string | null;
+
+  /**
+   * Git's reason the worktree can be pruned, or `null` when it cannot be.
+   *
+   * Test `!== null` rather than truthiness — the reason is what git chose to say, and this
+   * field's presence, not its content, is the answer.
+   */
+  prunable: string | null;
+}
+
+/**
+ * Parses one `worktree list --porcelain` record, or `null` for the repository's bare entry.
+ *
+ * Whole records rather than lines, which is the entire point: git emits `prunable` *after*
+ * `branch`, so anything that decides a worktree is complete on seeing its branch reads a
+ * stale worktree as live.
+ */
+// ponytail: `locked` is parsed past rather than captured — nothing consumes it, and git
+// emits a bare `locked` with no reason when locked without one, so an honest field needs
+// either two properties or a ""-versus-null trap. Add it when a caller needs it.
+function parseWorktree(record: string): Worktree | null {
+  let path = "";
+  let head: string | null = null;
+  let branch: string | null = null;
+  let prunable: string | null = null;
+
+  for (const attribute of record.split("\0")) {
+    const boundary = attribute.indexOf(" ");
+    const key = boundary === -1 ? attribute : attribute.slice(0, boundary);
+    const value = boundary === -1 ? "" : attribute.slice(boundary + 1);
+
+    switch (key) {
+      case "bare":
+        return null;
+      case "worktree":
+        path = value;
+        break;
+      case "HEAD":
+        head = value;
+        break;
+      case "branch":
+        branch = value;
+        break;
+      case "prunable":
+        prunable = value;
+        break;
+      default:
+        break;
+    }
+  }
+
+  return { path, head, branch, prunable };
+}
+
+/**
+ * Every worktree of the repository, in the order git reports them, without the bare entry.
+ *
+ * NUL-delimited rather than newline-delimited (`-z`), because a newline inside a worktree's
+ * path splits one record into two under the newline form — and this list is what
+ * {@link removeWorktree} acts on, so a record read off the wrong path deletes the wrong
+ * directory.
+ *
+ * @throws If git failed. A repository always has at least one worktree, so an empty array
+ *   would have no honest meaning and would only launder a real failure into a plausible
+ *   answer.
+ */
+export async function listWorktrees(cwd?: string): Promise<Worktree[]> {
+  const stdout = await gitOk(["worktree", "list", "--porcelain", "-z"], cwd);
+  return stdout
+    .split("\0\0")
+    .filter((record) => record !== "")
+    .map(parseWorktree)
+    .filter((worktree) => worktree !== null);
+}
+
+/** Options for {@link addWorktree}. */
+export interface WorktreeAddOptions {
+  /** Create this branch at `startPoint`. Omit to check out `startPoint` as it is. */
+  branch?: string;
+
+  /** Commit-ish the worktree starts at. Defaults to the current `HEAD`. */
+  startPoint?: string;
+}
+
+/**
+ * Creates a worktree at `path`.
+ *
+ * @throws If git refused — the path is taken, the branch already exists, or the branch is
+ *   checked out somewhere else. The message carries git's own stderr.
+ */
+export async function addWorktree(
+  path: string,
+  options: WorktreeAddOptions = {},
+  cwd?: string,
+): Promise<void> {
+  const args = ["worktree", "add"];
+  if (options.branch !== undefined) args.push("-b", options.branch);
+  args.push(path);
+  if (options.startPoint !== undefined) args.push(options.startPoint);
+  await gitOk(args, cwd);
+}
+
+/** Options for {@link removeWorktree}. */
+export interface WorktreeRemoveOptions {
+  /** Remove the worktree even with uncommitted changes or untracked files in it. */
+  force?: boolean;
+}
+
+/**
+ * Removes the worktree at `path`, deleting its directory. The branch it held is untouched.
+ *
+ * @throws If git refused — most often because the worktree is dirty and `force` was not set.
+ */
+export async function removeWorktree(
+  path: string,
+  options: WorktreeRemoveOptions = {},
+  cwd?: string,
+): Promise<void> {
+  const args = ["worktree", "remove"];
+  if (options.force === true) args.push("--force");
+  args.push(path);
+  await gitOk(args, cwd);
+}
+
+/**
+ * Discards the administrative records of worktrees whose directories are gone.
+ *
+ * These are the entries {@link Worktree.prunable} marks; until pruned they keep holding
+ * their branch, so git refuses to check that branch out anywhere else.
+ *
+ * @throws If git failed.
+ */
+export async function pruneWorktrees(cwd?: string): Promise<void> {
+  await gitOk(["worktree", "prune"], cwd);
+}
