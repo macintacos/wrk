@@ -154,6 +154,13 @@ describe("cacheSlug", () => {
   test("keeps dots that are not the entire key", () => {
     expect(cacheSlug("v1.2.3")).toBe("v1.2.3");
   });
+
+  test("does not give two containers differing only by separator the same slug", () => {
+    // The fold sends `/` and a literal `_` to the same character, so on the folded form
+    // alone these two repositories share one cache entry and each is served the other's
+    // data — with no error anywhere, because both agree on the key.
+    expect(cacheSlug("/Users/me/GitLocal/thing")).not.toBe(cacheSlug("/Users/me/GitLocal_thing"));
+  });
 });
 
 describe("mintBranch", () => {

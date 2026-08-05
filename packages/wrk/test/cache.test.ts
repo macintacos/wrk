@@ -378,6 +378,64 @@ describe("cached", () => {
     });
   });
 
+  test("starts one refresh per burst when whole processes find the same stale entry", async () => {
+    // Real processes, because that is the only shape the defect has: within one process
+    // the calls share an event loop, so the first `touch` lands before the second reads
+    // the mtime and the debounce appears to work. Each worker records its refresh by
+    // name in that burst's marker directory, so the count is the number of refreshes.
+    //
+    // Three bursts rather than one, and the whole sequence is the assertion. A single
+    // burst is not a guard: this machine has more logical cores than performance cores,
+    // so a worker scheduled onto a slow one wakes late enough to read a stamped mtime
+    // honestly, and roughly one unfixed burst in six looks correct by luck. Three
+    // independent bursts put that below a percent while a locked implementation stays
+    // exactly `[1, 1, 1]`.
+    await withRoot(async (root) => {
+      const refreshes: number[] = [];
+
+      for (let burst = 0; burst < 3; burst++) {
+        const key = { name: "pr-graph", container: CONTAINER, root: join(root, `burst-${burst}`) };
+        await writeCache(key, "stale");
+        await age(cachePath(key), 90_000);
+
+        const markers = join(root, `markers-${burst}`);
+        await mkdir(markers, { recursive: true });
+
+        const workers = Array.from({ length: 8 }, () =>
+          Bun.spawn(["bun", join(import.meta.dir, "fixtures", "cached-worker.ts")], {
+            env: {
+              ...process.env,
+              WRK_CACHE_ROOT: key.root,
+              WRK_CONTAINER: key.container,
+              WRK_ENTRY: key.name,
+              WRK_TTL: "60000",
+              WRK_DEADLINE: String(Date.now() + 750),
+              WRK_MARKERS: markers,
+            },
+            stdout: "pipe",
+            stderr: "pipe",
+          }),
+        );
+
+        const outcomes = await Promise.all(
+          workers.map(async (child) => ({
+            code: await child.exited,
+            err: await new Response(child.stderr).text(),
+          })),
+        );
+
+        // Reported as stderr rather than as exit codes so a worker that died carries its
+        // own stack trace into the failure message.
+        const died = outcomes.filter((outcome) => outcome.code !== 0);
+        expect(died.map((outcome) => outcome.err)).toEqual([]);
+
+        refreshes.push((await readdir(markers)).length);
+      }
+
+      expect(refreshes).toEqual([1, 1, 1]);
+    });
+  }, 30_000);
+
   test("publishes nothing until the first refresh completes", async () => {
     // What a cold start must not do. `utimes` cannot create the entry, so there is no mtime
     // to stamp and no way to debounce the first burst; the tempting fix — staking a claim by
