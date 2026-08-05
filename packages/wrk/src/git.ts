@@ -87,9 +87,17 @@ const LOCAL_REPO_ENV: Record<string, undefined> = Object.fromEntries(
  *
  * @param args - Arguments after `git`, one array element per argv entry.
  * @param cwd - Directory to run in. Defaults to this process's cwd.
+ * @param env - Variables layered *over* {@link LOCAL_REPO_ENV} for this call alone, for the
+ *   settings git reads from the environment and nowhere else — `GIT_TERMINAL_PROMPT` being the
+ *   one this exists for. It is layered on top rather than merged in by the caller so no call
+ *   site can drop the shedding while adding to it, which is the whole point of doing it here.
  */
-export function git(args: string[], cwd?: string): Promise<RunResult> {
-  return run("git", args, { cwd, env: LOCAL_REPO_ENV });
+export function git(
+  args: string[],
+  cwd?: string,
+  env?: Record<string, string | undefined>,
+): Promise<RunResult> {
+  return run("git", args, { cwd, env: { ...LOCAL_REPO_ENV, ...env } });
 }
 
 /**
@@ -106,9 +114,17 @@ export function git(args: string[], cwd?: string): Promise<RunResult> {
  * Exported as {@link git}'s throwing twin, for a mutation whose single caller does not earn a
  * wrapper of its own — a `fetch`, a `switch`, a `pull`. A command that gains a second caller
  * earns its wrapper then, and moves in here.
+ *
+ * @param args - Arguments after `git`, one array element per argv entry.
+ * @param cwd - Directory to run in. Defaults to this process's cwd.
+ * @param env - Per-call environment, exactly as {@link git} takes it.
  */
-export async function gitOk(args: string[], cwd?: string): Promise<string> {
-  const { stdout, stderr, code } = await git(args, cwd);
+export async function gitOk(
+  args: string[],
+  cwd?: string,
+  env?: Record<string, string | undefined>,
+): Promise<string> {
+  const { stdout, stderr, code } = await git(args, cwd, env);
   if (code !== 0) {
     throw new CommandFailed(["git", ...args], code, stderr);
   }

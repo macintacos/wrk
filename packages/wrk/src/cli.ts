@@ -31,6 +31,7 @@ import { renderConversion, resolveConversion } from "./convert";
 import { Refusal } from "./errors";
 import { emit, emitLine, note, reportFailure } from "./output";
 import { preflight } from "./preflight";
+import { repoSetup } from "./setup";
 import { createWorktree } from "./worktree";
 
 /**
@@ -96,6 +97,14 @@ export function buildProgram(): Command {
   const agent = program
     .command("agent")
     .description("Deterministic git mechanics for an agent's Setup Worktree phase.");
+
+  agent
+    .command("repo-setup")
+    .description("Clone a repository into a bare-repo container in the current directory")
+    .argument("<url>", "What to clone, in any form `git clone` accepts")
+    .action(async (url: string) => {
+      emit(await repoSetup(process.cwd(), url));
+    });
 
   agent
     .command("preflight")

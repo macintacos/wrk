@@ -104,6 +104,28 @@ printed a partial answer before failing would be read as a success outright.
 
 ## Agent commands
 
+`wrk agent repo-setup` is what runs when the repository is not on disk at all. It clones
+straight into the bare-repo layout — `.bare`, the `.git` pointer, and the default-branch
+checkout — and emits `{container, checkout_path, default_branch}`.
+
+```bash
+mkdir ~/GitLocal/project && cd ~/GitLocal/project
+wrk agent repo-setup git@github.com:owner/project.git
+```
+
+**The cwd is the container**; there is no destination argument, so the caller places the
+repository by choosing where to run. Two refusals, in this order: already inside a
+repository — convert it instead — and then a cwd that is not empty. An existing checkout
+trips both, and the first is the one whose advice applies.
+
+**On any failure the cwd is emptied before the error is reported.** That is not tidiness:
+`.bare` plus the `.git` pointer *is* a repository, so wreckage left behind would trip the
+inside-a-repository refusal on the next attempt and send you off to convert a container
+with no checkout in it.
+
+The checkout directory folds `/` to `+` exactly as a run worktree's does, so a default
+branch named `release/2.0` lands in `release+2.0` while the branch keeps its slashes.
+
 `wrk agent preflight` is what an agent runs before it creates a worktree. It answers
 whether to proceed, and says stop — without touching the repository — when it cannot.
 
