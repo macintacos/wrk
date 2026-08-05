@@ -1,0 +1,163 @@
+amends "package://github.com/jdx/hk/releases/download/v1.54.0/hk@1.54.0#/Config.pkl"
+
+import "package://github.com/jdx/hk/releases/download/v1.54.0/hk@1.54.0#/Builtins.pkl"
+
+// Keep the amends/import version in lockstep with the `hk` version in mise.toml,
+// and only pin a version mise can actually install (`mise ls-remote hk`).
+//
+// wrk is a Bun + TypeScript workspace. Biome formats and lints the JS/TS/JSON;
+// tsc owns types; rumdl owns Markdown; taplo owns TOML; pkl owns this file.
+//
+// Four lanes, plus the two git hooks that enforce them:
+//   hk fix              -> the `fix` hook       -> formatters, write mode
+//   hk check            -> the `check` hook     -> formatters + linters, read-only
+//   hk run typecheck    -> the `typecheck` hook -> tsc alone
+//   hk run test         -> the `test` hook      -> bun test alone
+//   pre-commit          -> formatters + linters, fix mode
+//   pre-push            -> the test step
+//
+// `check` runs the formatters in read-only mode alongside the linters, so an
+// unformatted file fails the gate instead of being silently reflowed at commit
+// time. The tsc and bun-test steps are declared once below and referenced from
+// every hook that needs them.
+//
+// Two costs of spelling `typecheck` and `test` as hooks rather than folding them
+// into `check`, both accepted deliberately:
+//
+//   1. `hk install --mise` registers a git-config entry per hook key, so
+//      `hook.hk-typecheck.event` and `hook.hk-test.event` land in the shared
+//      git config naming events git never fires. They are inert, not wrong.
+//   2. `hk test` is already an hk subcommand — it runs step fixtures, NOT this
+//      lane. The lane is `hk run test`; likewise `hk run typecheck`, since
+//      `hk typecheck` is not a subcommand at all.
+//
+// Both disappear if EXC-989's `.mise/tasks/` forwarders end up calling
+// `bun x tsc --noEmit` and `bun test` directly; revisit then.
+
+// tsc is a dev dependency rather than a mise tool, so it runs through bun. It is
+// a whole-program check: no `{{ files }}` argument, so a matching staged file
+// just triggers the full check once.
+local tscStep = new Step {
+  glob = List("**/*.ts", "**/*.tsx")
+  check = "bun x tsc --noEmit -p tsconfig.json"
+}
+
+// Likewise whole-suite: bun discovers its own test files.
+local testStep = new Step {
+  glob = List("**/*.ts", "**/*.tsx")
+  check = "bun test"
+}
+
+// Formatters — rewrite files into canonical form.
+local formatters = new Mapping<String, Step> {
+  // `biome check` (not `biome format`) so this step also applies the
+  // organizeImports assist action configured in biome.jsonc — import grouping is
+  // a formatting concern and rides with the formatter. `--linter-enabled=false`
+  // keeps lint rules and their autofixes out of the format pass; the read-only
+  // Web(Lint) step below owns those. `--no-errors-on-unmatched` so a staged file
+  // outside biome's scope no-ops rather than failing the hook.
+  ["Web(Format)       [[biome]]"] = new Step {
+    glob = List("**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.json", "**/*.jsonc")
+    check = "biome check --linter-enabled=false --no-errors-on-unmatched {{ files }}"
+    fix = "biome check --write --linter-enabled=false --no-errors-on-unmatched {{ files }}"
+  }
+
+  // rumdl owns Markdown — one binary for both roles. `rumdl fmt` applies fixes
+  // with formatter-style exit codes, so it won't fail on leftover lint; the
+  // Markdown(Lint) step below enforces read-only `rumdl check`.
+  //
+  // Three overrides, each load-bearing. `check` must be set because the builtin
+  // defines none: it would otherwise fall back to `check_diff`, which runs a
+  // *lint*, duplicating Markdown(Lint) in the check lane. `check_diff` is nulled
+  // because hk prefers it over `fix` and tries to `git apply` its output —
+  // rumdl's diff header (`+++ file (fixed)`) is not an applyable path, so every
+  // markdown fix would warn twice before falling back. `tests` is cleared because
+  // the builtin's fixtures assert its own `rumdl check --fix` behaviour, which
+  // this step no longer runs — leaving them makes `hk test` red on a fresh clone.
+  ["Markdown(Format)  [[builtins.rumdl]]"] = (Builtins.rumdl) {
+    check = "rumdl fmt --check {{ files }}"
+    check_diff = null
+    tests = new Mapping<String, StepTest> {}
+    fix = "rumdl fmt {{ files }}"
+  }
+
+  ["TOML(Format)      [[builtins.taplo_format]]"] = Builtins.taplo_format
+
+  ["Pkl(Format)       [[builtins.pkl_format]]"] = Builtins.pkl_format
+}
+
+// Linters — read-only checks that never rewrite.
+local linters = new Mapping<String, Step> {
+  // --error-on-warnings makes warn-level rules fail the gate instead of printing
+  // and exiting 0. `fix` omits it so autofix still runs and never aborts on a
+  // warning it can't rewrite.
+  ["Web(Lint)         [[biome]]"] = new Step {
+    glob = List("**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.mjs")
+    check = "biome lint --error-on-warnings --no-errors-on-unmatched {{ files }}"
+    fix = "biome lint --write --no-errors-on-unmatched {{ files }}"
+  }
+
+  ["TypeScript(Check) [[tsc]]"] = tscStep
+
+  // Same rumdl binary, read-only: `rumdl check` reports violations (exit 1). In
+  // pre-commit (fix = true) the inherited `rumdl check --fix` auto-resolves
+  // fixable lint after the formatter's `rumdl fmt`, so a commit converges in one pass.
+  ["Markdown(Lint)    [[builtins.rumdl]]"] = (Builtins.rumdl) {
+    check = "rumdl check {{ files }}"
+  }
+
+  ["TOML(Lint)        [[builtins.taplo]]"] = Builtins.taplo
+
+  // pkl lints by evaluating the file, which resolves the remote amends/import
+  // package (cached after the first run).
+  ["Pkl(Lint)         [[builtins.pkl]]"] = Builtins.pkl
+}
+
+hooks {
+  ["pre-commit"] {
+    fix = true
+    stash = "git"
+    steps = new Mapping<String, Step> {
+      ...formatters
+      ...linters
+    }
+  }
+
+  // Tests are too slow for pre-commit; they gate the push instead.
+  ["pre-push"] {
+    steps = new Mapping<String, Step> {
+      ["Test(Bun)         [[bun]]"] = testStep
+    }
+  }
+
+  // The format lane — formatters only, in write mode.
+  ["fix"] {
+    fix = true
+    steps = formatters
+  }
+
+  // The lint lane — formatters + linters, read-only. The hook sets no `fix`, so
+  // each formatter runs its `check` command alongside the rule and type checks.
+  // This makes `check` agree with `fix` on formatting: an unformatted file fails
+  // the gate here instead of being silently reflowed by the pre-commit fix.
+  ["check"] {
+    steps = new Mapping<String, Step> {
+      ...formatters
+      ...linters
+    }
+  }
+
+  // The typecheck lane, run on its own: `hk run typecheck` (never `hk typecheck`).
+  ["typecheck"] {
+    steps = new Mapping<String, Step> {
+      ["TypeScript(Check) [[tsc]]"] = tscStep
+    }
+  }
+
+  // The test lane, run on its own: `hk run test` — `hk test` is the fixture runner.
+  ["test"] {
+    steps = new Mapping<String, Step> {
+      ["Test(Bun)         [[bun]]"] = testStep
+    }
+  }
+}
