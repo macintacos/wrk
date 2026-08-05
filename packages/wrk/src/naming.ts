@@ -12,10 +12,14 @@
  * the filesystem — {@link mintBranch} is handed the set of branches to avoid rather than
  * discovering it. That is what makes the rules cheap enough to pin exhaustively in tests,
  * which is precisely what the previous implementations lacked while they drifted. The
- * layers that own git state supply the inputs.
+ * layers that own git state supply the inputs. Its one import, `node:crypto` for
+ * {@link cacheSlug}'s digest, performs no I/O and reads nothing from the environment, so
+ * the claim survives it.
  *
  * @packageDocumentation
  */
+
+import { createHash } from "node:crypto";
 
 /**
  * The project-key-and-number shape, written once and anchored differently below.
@@ -129,16 +133,22 @@ export function branchBelongsToIssue(branch: string, issue: string): boolean {
 }
 
 /**
- * Reduces an arbitrary key to one inert path segment.
+ * Reduces an arbitrary key to one inert path segment, without losing its identity.
  *
  * The alphabet is `[A-Za-z0-9._-]` and everything outside it becomes `_`, which covers
  * every `/` — so a container path flattens to a single segment rather than a nested one.
+ * That fold is many-to-one on its own: `/GitLocal/thing` and `/GitLocal_thing` reach the
+ * same characters, and two repositories sharing one cache entry never error — each is
+ * simply served the other's data. A digest of the untouched key restores the distinction
+ * the fold destroys, so the readable prefix stays readable while the segment as a whole
+ * stays unique. Thirty-two bits of it: this keys a local cache, not a content store.
  *
- * A key of only dots is then rewritten, because `.` and `..` survive that alphabet intact
- * and callers join this result onto a cache root. Folding the slashes caps the exposure at
- * one level, but a caller is entitled to treat the output as a name rather than a
- * traversal. The rewrite is per-character so `.` and `..` do not collapse onto the same
- * key; two distinct keys sharing a cache entry is the bug this function exists to avoid.
+ * The suffix is appended unconditionally rather than only when the fold was lossy. That is
+ * the smaller function: a suffix always present means `.` and `..` can no longer be
+ * emitted at all, so the traversal this function exists to prevent can no longer be
+ * expressed. A conditional suffix would have to keep a guard against it — `..` is
+ * unchanged by the fold and would take no suffix — and would still leave a folded key
+ * colliding with a literal key that happens to end in `-<8 hex>`.
  *
  * The `u` flag is load-bearing here, unlike the run-collapsing patterns in
  * {@link slugify}: without it the class matches UTF-16 code units, so an astral character
@@ -150,8 +160,9 @@ export function branchBelongsToIssue(branch: string, issue: string): boolean {
  * @returns A single path segment safe to join onto a cache root.
  */
 export function cacheSlug(key: string): string {
-  const slug = key.replace(/[^A-Za-z0-9._-]/gu, "_");
-  return /^\.+$/u.test(slug) ? slug.replaceAll(".", "_") : slug;
+  const digest = createHash("sha256").update(key).digest("hex").slice(0, 8);
+
+  return `${key.replace(/[^A-Za-z0-9._-]/gu, "_")}-${digest}`;
 }
 
 /**
