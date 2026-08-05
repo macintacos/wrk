@@ -9,6 +9,11 @@
  *
  * The staleness and debounce cases manipulate mtimes directly rather than sleeping: a test
  * that waits out a real TTL is either slow or flaky, and usually both.
+ *
+ * One case goes further and spawns real `bun` processes, because the refresh lock is a
+ * property *between* processes: calls made within one share an event loop, which hides the
+ * race the lock exists to close. It is by far the slowest case here and the reason this
+ * suite takes seconds rather than milliseconds.
  */
 
 import { describe, expect, test } from "bun:test";
@@ -332,6 +337,35 @@ describe("cached", () => {
     // unwritable cache directory makes a successful refresh indistinguishable from a failed
     // one, and the caller is handed stale text it had already paid the round-trip to
     // replace.
+    //
+    // The directory is made unwritable from *inside* `refresh`, which is what makes this a
+    // guard rather than a formality: doing it beforehand fails at the lock instead, so
+    // `refresh` never runs, nothing is ever written, and moving `writeCache` back inside
+    // the inner `try` would not be noticed.
+    await withRoot(async (root) => {
+      const key = { name: ENTRY, container: CONTAINER, root };
+      await writeCache(key, "previous");
+      await age(cachePath(key), 90_000);
+      const dir = join(root, CONTAINER_SLUG);
+
+      try {
+        await expect(
+          cached(key, 60_000, async () => {
+            await chmod(dir, 0o555);
+            return "fresh";
+          }),
+        ).rejects.toThrow();
+      } finally {
+        // withRoot cannot remove the tree through a directory it may not write.
+        await chmod(dir, 0o755);
+      }
+    });
+  });
+
+  test("surfaces a lock it cannot create rather than refreshing unlocked", async () => {
+    // The other half of the rule: `claim` rethrows anything that is not "someone else has
+    // it" or "the directory is gone". Degrading to an unlocked refresh would let a
+    // permanently unwritable cache serve stale contents forever with no signal anywhere.
     await withRoot(async (root) => {
       const key = { name: ENTRY, container: CONTAINER, root };
       await writeCache(key, "previous");
@@ -339,12 +373,74 @@ describe("cached", () => {
       const dir = join(root, CONTAINER_SLUG);
       await chmod(dir, 0o555);
 
+      let calls = 0;
       try {
-        await expect(cached(key, 60_000, async () => "fresh")).rejects.toThrow();
+        await expect(
+          cached(key, 60_000, async () => {
+            calls++;
+            return "fresh";
+          }),
+        ).rejects.toThrow();
+        expect(calls).toBe(0);
       } finally {
-        // withRoot cannot remove the tree through a directory it may not write.
         await chmod(dir, 0o755);
       }
+    });
+  });
+
+  test("serves stale contents while another process holds a fresh lock", async () => {
+    await withRoot(async (root) => {
+      const key = { name: ENTRY, container: CONTAINER, root };
+      await writeCache(key, "previous");
+      await age(cachePath(key), 90_000);
+      await mkdir(`${cachePath(key)}.lock`);
+
+      let calls = 0;
+      const value = await cached(key, 60_000, async () => {
+        calls++;
+        return "refreshed";
+      });
+
+      expect(value).toBe("previous");
+      expect(calls).toBe(0);
+    });
+  });
+
+  test("refreshes past a lock left behind by a process that died", async () => {
+    // Without a bound on how long a lock may be held, a process killed mid-refresh wedges
+    // the entry into serving stale contents forever — strictly worse than the duplicated
+    // refresh the lock exists to stop.
+    await withRoot(async (root) => {
+      const key = { name: ENTRY, container: CONTAINER, root };
+      await writeCache(key, "stale");
+      await age(cachePath(key), 90_000);
+      const lock = `${cachePath(key)}.lock`;
+      await mkdir(lock);
+      await age(lock, 120_000);
+
+      let calls = 0;
+      const value = await cached(key, 60_000, async () => {
+        calls++;
+        return "refreshed";
+      });
+
+      expect(value).toBe("refreshed");
+      expect(calls).toBe(1);
+      // Cleared on the way out, so the next caller locks normally rather than finding the
+      // same abandoned lock and refreshing again.
+      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual([ENTRY_SLUG]);
+    });
+  });
+
+  test("leaves no lock behind once a refresh completes", async () => {
+    await withRoot(async (root) => {
+      const key = { name: ENTRY, container: CONTAINER, root };
+      await writeCache(key, "stale");
+      await age(cachePath(key), 90_000);
+
+      await cached(key, 60_000, async () => "refreshed");
+
+      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual([ENTRY_SLUG]);
     });
   });
 
@@ -426,16 +522,23 @@ describe("cached", () => {
               WRK_DEADLINE: String(Date.now() + 750),
               WRK_MARKERS: markers,
             },
-            stdout: "pipe",
+            stdout: "ignore",
             stderr: "pipe",
           }),
         );
 
+        // Drained concurrently with the wait, as `test/tasks.test.ts` does: awaiting
+        // `exited` first deadlocks any child that fills the pipe buffer, because nothing
+        // is reading the other end while it blocks on the write.
         const outcomes = await Promise.all(
-          workers.map(async (child) => ({
-            code: await child.exited,
-            err: await new Response(child.stderr).text(),
-          })),
+          workers.map(async (child) => {
+            const [code, err] = await Promise.all([
+              child.exited,
+              new Response(child.stderr).text(),
+            ]);
+
+            return { code, err };
+          }),
         );
 
         // Reported as stderr rather than as exit codes so a worker that died carries its

@@ -22,8 +22,10 @@
  * - **Failure keeps the old answer.** A refresh that throws leaves the entry exactly as it
  *   was and its previous contents are returned. Stale data beats no data for everything
  *   cached here.
- * - **Touch-debounce.** A burst of invocations — a shell that redraws its prompt three
- *   times in a second — starts one refresh, not one each.
+ * - **Single-flight refresh.** A burst of invocations against an existing entry — a shell
+ *   that redraws its prompt three times in a second, or three shells doing it at once —
+ *   starts one refresh, not one each. A lock directory serialises them across processes;
+ *   the entry's mtime is stamped so a *failed* refresh is not retried for a full TTL.
  *
  * The root is XDG's, resolved by hand. `conf` and `env-paths` both answer
  * `~/Library/Caches` on macOS, which would quietly move the cache off the path the rest of
@@ -155,50 +157,65 @@ async function readEntry(path: string): Promise<CacheEntry | null> {
 const LOCK_STALE_MS = 60_000;
 
 /**
- * Takes the refresh lock for an entry, or reports that someone else holds it.
+ * What {@link claim} found.
+ *
+ * `held` and `abandoned` both mean "refresh, and clear the lock afterwards"; they are
+ * distinguished only because the second is the accepted ceiling and reads as one at the
+ * call site. `lost` means someone else is already refreshing.
+ */
+type Claim = "held" | "lost" | "abandoned";
+
+/**
+ * Takes the refresh lock for an entry, or reports who else has a claim on it.
  *
  * A bare `mkdir` — no `recursive` — is the whole mechanism. It is one syscall that either
  * creates the directory or fails `EEXIST`, so an arbitrary number of processes arriving
- * together agree on a single winner with nothing to coordinate and no state to clean up
- * beyond the directory itself. It is the same move {@link writeCache} makes with `rename`:
- * lean on one atomic call rather than assemble the guarantee in userspace.
+ * together agree on a single winner with nothing to coordinate. It is the same move
+ * {@link writeCache} makes with `rename`: lean on one atomic call rather than assemble the
+ * guarantee in userspace.
  *
- * A lock also needs a bound. Without one, a process killed mid-refresh wedges the entry
- * into serving stale contents forever — strictly worse than the duplicated refresh this
- * exists to stop. A lock older than {@link LOCK_STALE_MS} is therefore treated as
- * abandoned, reaped, and re-claimed once.
+ * A lock needs a bound, or a process killed mid-refresh wedges the entry into serving
+ * stale contents forever — strictly worse than the duplicated refresh this exists to stop.
+ * One older than {@link LOCK_STALE_MS} is therefore treated as `abandoned`: **ignored, not
+ * broken.** Breaking it would need a protocol of its own, because deleting it and
+ * re-creating it is a check-then-act split across two syscalls — two callers can both
+ * delete, both create, both believe they won, and then each remove the other's lock on the
+ * way out. Ignoring needs no protocol, and degrades to something this module already
+ * accepts and documents: for one burst, an entry with an abandoned lock behaves like a
+ * cold start. Every caller in that burst clears the lock as it leaves, so the next one
+ * locks normally.
  *
- * A failure that is not `EEXIST` propagates rather than degrading to an unlocked refresh.
- * A permanently unwritable cache directory would otherwise serve stale contents forever
- * with no signal anywhere, which is the one outcome worse than the race. The retry after
- * a reap is the exception: losing there means "serve stale", which is the safe direction.
+ * `ENOENT` — the per-repo directory vanished under us, a cache clear or a stray `rm -rf` —
+ * is `abandoned` rather than a fault: there is nothing to lock, and {@link writeCache}
+ * re-creates the tree. Any other failure propagates rather than degrading to an unlocked
+ * refresh, because a permanently unwritable cache directory would otherwise serve stale
+ * contents forever with no signal anywhere, which is the one outcome worse than the race.
  *
- * @param lock - Path the lock directory should occupy. Its parent must already exist,
- * which is why {@link cached} only reaches here when the entry does.
- * @returns `true` when this call holds the lock and must release it.
- * @throws If the lock cannot be created for any reason other than already existing.
+ * @param lock - Path the lock directory should occupy.
+ * @returns Whether this call may refresh, and whether it owns the lock's removal.
+ * @throws If the lock cannot be created for a reason other than already existing or its
+ * parent having gone away.
  */
-// ponytail: the lock's mtime is stamped once at creation and never renewed, so a refresh
-// running longer than LOCK_STALE_MS has its lock reaped and a second one starts. Renew it
-// from inside the refresh if a slow `gh` ever makes that common.
-async function claim(lock: string): Promise<boolean> {
+// ponytail: an abandoned lock is ignored rather than broken, so a burst arriving on one
+// refreshes in full before the next burst locks again. Give the lock a real
+// break-and-take protocol only if abandoned locks stop being rare.
+async function claim(lock: string): Promise<Claim> {
   try {
     await mkdir(lock);
 
-    return true;
+    return "held";
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    const { code } = error as NodeJS.ErrnoException;
+    if (code === "ENOENT") return "abandoned";
+    if (code !== "EEXIST") throw error;
   }
 
-  const held = await stat(lock).catch(() => null);
-  if (held === null || Date.now() - held.mtimeMs < LOCK_STALE_MS) return false;
+  // A lock that vanished between those two calls counts as someone else's: `lost` costs a
+  // stale read, and racing to re-create it is the check-then-act above in miniature.
+  const existing = await stat(lock).catch(() => null);
+  if (existing === null || Date.now() - existing.mtimeMs < LOCK_STALE_MS) return "lost";
 
-  await rm(lock, { recursive: true, force: true });
-
-  return await mkdir(lock).then(
-    () => true,
-    () => false,
-  );
+  return "abandoned";
 }
 
 /**
@@ -213,9 +230,6 @@ async function claim(lock: string): Promise<boolean> {
  * thing that happens on a cold start by design — which is never worth failing a cache read
  * over.
  */
-// ponytail: refreshes of an existing entry are serialised, but a cold start is not — it
-// has no entry to serve a loser, so making one wait would trade a duplicated refresh for a
-// stall. Have losers wait on the lock and re-read if a cold stampede ever costs more.
 async function touch(path: string): Promise<void> {
   const now = new Date();
 
@@ -310,6 +324,9 @@ export async function writeCache(key: CacheKey, value: string): Promise<void> {
  *   TTL rather than retried immediately. That is the wanted behaviour against a flaky
  *   `gh`: restoring the mtime on failure would reinstate the stampede the debounce exists
  *   to stop, on the slowest path there is.
+ * - **An abandoned lock is ignored rather than broken**, so the one burst that finds it
+ *   refreshes in full. See {@link claim} for why taking a lock away from its holder is a
+ *   larger problem than it looks.
  *
  * @param key - The entry to read.
  * @param ttl - Milliseconds after which the entry is stale.
@@ -320,7 +337,8 @@ export async function writeCache(key: CacheKey, value: string): Promise<void> {
  * whatever {@link writeCache} or {@link claim} threw. Only `refresh` gets the
  * stale-contents fallback — a cache that cannot be written is a fault worth surfacing, and
  * discarding a good refresh because it could not be stored would serve stale text the
- * caller had already paid to replace.
+ * caller had already paid to replace. Releasing the lock is the one step that cannot
+ * throw: it runs after the value is already on disk.
  *
  * @example
  * ```ts
@@ -342,11 +360,12 @@ export async function cached(
     return entry.text;
   }
 
-  // Only with an entry in hand: `claim` needs the per-repo directory to already exist, and
-  // a loser needs something to be served. Both are the same condition.
+  // Only with an entry in hand: a loser needs previous contents to be served, and with
+  // nothing to serve there is no one to lock on behalf of. `null` therefore means "cold
+  // start, no lock taken" throughout the rest of this function.
   const lock = `${path}.lock`;
-  const held = entry !== null && (await claim(lock));
-  if (entry && !held) {
+  const claimed = entry === null ? null : await claim(lock);
+  if (entry && claimed === "lost") {
     return entry.text;
   }
 
@@ -370,8 +389,11 @@ export async function cached(
 
     return value;
   } finally {
-    if (held) {
-      await rm(lock, { recursive: true, force: true });
+    // Swallowed for the reason `touch`'s failures are, and one more: a throw from a
+    // `finally` replaces whatever the block was returning, so a cleanup that failed would
+    // discard a refresh that had already succeeded and reached disk.
+    if (claimed !== null) {
+      await rm(lock, { recursive: true, force: true }).catch(() => undefined);
     }
   }
 }

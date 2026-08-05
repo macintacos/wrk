@@ -150,10 +150,11 @@ describe("cacheSlug", () => {
     // `.` and `..` survive the allowed alphabet intact, so a key joined onto a cache root
     // would resolve to the parent directory. Slashes fold, so one level is the whole
     // exposure — but this function's callers are entitled to treat its output as inert.
-    // The suffix is what rules both out, and the same suffix keeps them apart.
-    expect(cacheSlug("..")).not.toBe("..");
-    expect(cacheSlug(".")).not.toBe(".");
-    expect(cacheSlug("..")).not.toBe(cacheSlug("."));
+    // The suffix is what rules both out, and the same suffix keeps them apart. Anchored,
+    // like every other case here: `not.toBe("..")` would be satisfied by `../x-deadbeef`,
+    // which is the traversal itself.
+    expect(cacheSlug("..")).toMatch(/^\.\.-[0-9a-f]{8}$/);
+    expect(cacheSlug(".")).toMatch(/^\.-[0-9a-f]{8}$/);
   });
 
   test("keeps dots that are not the entire key", () => {

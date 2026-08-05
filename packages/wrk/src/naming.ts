@@ -143,15 +143,10 @@ export function branchBelongsToIssue(branch: string, issue: string): boolean {
  * the fold destroys, so the readable prefix stays readable while the segment as a whole
  * stays unique. Thirty-two bits of it: this keys a local cache, not a content store.
  *
- * {@link mintBranch} disambiguates a generated name too, and does it the other way —
- * probing the set of names already taken. That is not available here, because this
- * function is pure and is handed no such set, so the disambiguator has to be derived from
- * the input rather than discovered from the environment.
- *
- * The suffix is appended unconditionally rather than only when the fold was lossy. That
- * is the smaller function: a suffix always present means `.` and `..` can no longer be
- * emitted at all, so the traversal callers rely on this function to prevent has nothing
- * left to prevent it with. A conditional suffix would have to keep that guard — `..` is
+ * The suffix is appended unconditionally rather than only when the fold was lossy. That is
+ * the smaller function: a suffix always present means `.` and `..` can no longer be
+ * emitted at all, so the traversal this function exists to prevent can no longer be
+ * expressed. A conditional suffix would have to keep a guard against it — `..` is
  * unchanged by the fold and would take no suffix — and would still leave a folded key
  * colliding with a literal key that happens to end in `-<8 hex>`.
  *
