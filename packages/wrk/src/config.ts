@@ -20,16 +20,22 @@
  *
  * **The parsing is bought; the layering is not.** `smol-toml` reads the global document —
  * hand-rolling TOML means disagreeing with the spec somewhere inside a file a human edits
- * by hand, and it carries no dependencies of its own. The layering stayed here after
- * weighing two config libraries against it. `cosmiconfig` exists to *discover* config
- * across a dozen conventional locations, which this module deliberately does not want:
- * there are exactly two layers at two known paths, and a stray `wrk.config.js` two
- * directories up silently becoming configuration would be a misfeature. It also has no TOML
- * loader, so it would sit on top of this dependency rather than replace it. `c12` does
- * layer natively and does read TOML, but it is in beta for a module a shell prompt calls on
- * every redraw, it pulls a substantial dependency graph into a package that otherwise has
- * three, and it merges *whole layers* — the wrong granularity for the per-field degradation
- * below, which would have had to stay hand-written underneath it anyway.
+ * by hand. It won over the other parsers on maintenance and surface: `@iarna/toml` and
+ * `toml` both predate TOML 1.0 and have been dormant for years, and `@ltd/j-toml` carries a
+ * far larger API for a module that wants `parse(text)` and nothing else.
+ *
+ * The layering stayed here after weighing two config libraries against it. `cosmiconfig`
+ * exists to *discover* config across a dozen conventional locations, which this module
+ * deliberately does not want: there are exactly two layers at two known paths, and a stray
+ * `wrk.config.js` two directories up silently becoming configuration would be a misfeature.
+ * It also has no TOML loader, so it would sit on top of this dependency rather than replace
+ * it. `c12` does layer natively and does read TOML, but it is in beta for a module a shell
+ * prompt calls on every redraw, it pulls a substantial dependency graph into a package that
+ * otherwise has three, and it merges *whole layers* — the wrong granularity for the
+ * per-field degradation below, which would have had to stay hand-written underneath it
+ * anyway. In fairness to that last argument, `zod` is now the largest thing in this
+ * package's own graph; what it buys is the per-field degradation itself, which is the part
+ * `c12` would not have replaced.
  *
  * **Validation is per field, not per layer.** Every field is parsed through its own schema
  * on its own {@link take}, so one malformed value falls through to the layer beneath it
@@ -154,13 +160,27 @@ const TTLS = z
  * Everything `wrk` lets a user override, as a schema.
  *
  * The schema is the definition and {@link WrkConfig} is derived from it, so there is no
- * second declaration to keep in sync by hand. It also parses {@link DEFAULTS}, which is
- * what makes a default violating an invariant the type system cannot express — an empty
- * glyph, a relative root — fail at import rather than ship.
+ * second declaration to keep in sync by hand. The cost of deriving rather than declaring is
+ * that the per-field prose lives here and on the leaf schemas above rather than on the
+ * exported type, where an editor would surface it on hover — accepted, because a type kept
+ * in sync by hand is the failure this is meant to prevent.
  *
- * `search.roots` and `search.depth` are one decision spelled as two fields: a root whose
- * containers sit at a different nesting than `~/GitLocal`'s is unusable with the depth
- * frozen at 2. The colours stay opaque strings, because turning a name into an escape
+ * **This schema types the config and checks the defaults; it does not read the layers.**
+ * {@link loadConfig} folds the files by name, field by field, so a field added here is
+ * typed, documented and validated in {@link DEFAULTS} while being silently ignored in both
+ * config files until it gets its own `take` line in that fold.
+ *
+ * Parsing {@link DEFAULTS} through it is what makes a default violating an invariant the
+ * type system cannot express — an empty glyph, a wholly relative `roots` — fail at import
+ * rather than ship. Not every invariant, though: {@link TTLS} and {@link ROOTS} *drop* bad
+ * entries rather than rejecting, so a default with a negative TTL parses to an empty `ttls`
+ * instead of throwing. `config.test.ts`'s defaults-parity case is what catches those.
+ *
+ * `search.roots` and `search.depth` are one decision spelled as two fields — together they
+ * replace the `find ~/GitLocal -mindepth 2 -maxdepth 2` the fish implementation hardcodes,
+ * and a root whose containers sit at a different nesting is unusable with the depth frozen
+ * at 2. `glyphs` and `colours` are the marker and the colour the stack annotator draws per
+ * stack position. The colours stay opaque strings, because turning a name into an escape
  * sequence is the business of whatever draws the picker, and a config layer that validated
  * the name would have to track that renderer's palette to do it.
  */
@@ -214,6 +234,10 @@ export interface ConfigSources {
  * `roots` is written the way a user would write it and comes back expanded, so every
  * consumer sees absolute paths whichever layer an answer came from.
  *
+ * Deep-frozen, because {@link CONFIG} ends in `.readonly()`. {@link loadConfig}'s answer is
+ * deliberately *not* frozen — it is built by hand and handed to a caller who may do what it
+ * likes with it — so the two differ, and only this one is safe to alias.
+ *
  * The glyphs are spelled as code points rather than as literal characters. They are Nerd
  * Font private-use points, so a literal renders as a blank box in any editor lacking that
  * font — unreviewable in a diff, and silently destroyed by anything that re-encodes the
@@ -245,16 +269,20 @@ const LAYER = z.record(z.string(), z.unknown());
 type Layer = z.infer<typeof LAYER>;
 
 /**
- * One field's value as `schema` reads it, or `undefined` when this layer offers nothing
- * usable for it.
+ * One field's value as `schema` reads it, or `null` when this layer offers nothing usable
+ * for it.
  *
  * Every field goes through its own call, which is what makes degradation per field rather
  * than per layer: a schema that rejects cannot take its neighbours down with it.
+ *
+ * `null` rather than `undefined` for "nothing here", matching `cache.ts`, `git.ts` and
+ * `repo.ts` — and unambiguous only because no schema in this module answers `null`. One
+ * that did would need its own way to say it found nothing.
  */
-function take<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> | undefined {
+function take<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> | null {
   const result = schema.safeParse(value);
 
-  return result.success ? result.data : undefined;
+  return result.success ? result.data : null;
 }
 
 /**
@@ -314,17 +342,17 @@ async function readDocument(path: string, parse: (text: string) => unknown): Pro
 }
 
 /** Reads the machine-wide TOML document. */
-async function readGlobalLayer(path: string): Promise<Layer | undefined> {
+async function readGlobalLayer(path: string): Promise<Layer | null> {
   return take(LAYER, await readDocument(path, parseToml));
 }
 
 /** Reads the `wrk` namespace out of a container's `.project-meta.json`. */
-async function readProjectLayer(container: string): Promise<Layer | undefined> {
+async function readProjectLayer(container: string): Promise<Layer | null> {
   return take(PROJECT_NAMESPACE, await readDocument(join(container, PROJECT_META), JSON.parse));
 }
 
-/** One named section of a layer, or `undefined` when it is absent or is not a table. */
-function section(layer: Layer, name: keyof WrkConfig): Layer | undefined {
+/** One named section of a layer, or `null` when it is absent or is not a table. */
+function section(layer: Layer, name: keyof WrkConfig): Layer | null {
   return take(LAYER, layer[name]);
 }
 
@@ -360,7 +388,9 @@ function takeByPosition(
  * Reads and merges every configuration layer.
  *
  * Nothing here throws or warns. A caller gets a complete {@link WrkConfig} whatever state
- * the files are in, which is what lets a shell prompt call it without a guard.
+ * the files are in, which is what lets a shell prompt call it without a guard. The module's
+ * one throw site is {@link DEFAULTS}' own parse, which fires at import and only for a
+ * default this repository shipped wrong.
  *
  * Two merge rules, and the difference between them is the point. `search.roots` is
  * **replaced wholesale** by the highest layer offering a usable value — it is one decision
@@ -385,12 +415,13 @@ export async function loadConfig(sources: ConfigSources = {}): Promise<WrkConfig
 
   const [globalLayer, projectLayer] = await Promise.all([
     readGlobalLayer(globalPath),
-    container ? readProjectLayer(container) : undefined,
+    container ? readProjectLayer(container) : null,
   ]);
 
   // Every fold below applies the layers in this order, so a later one wins. A third layer
-  // is added to the end of this array and needs no other change.
-  const layers = [globalLayer, projectLayer].filter((layer) => layer !== undefined);
+  // is added to the end of this array and needs no other change — but a new *field* needs
+  // its own `take` line below, since nothing walks {@link CONFIG} to find them.
+  const layers = [globalLayer, projectLayer].filter((layer) => layer !== null);
 
   const ttls: Record<string, number> = { ...DEFAULTS.cache.ttls };
   let roots: readonly string[] = DEFAULTS.search.roots;
@@ -400,7 +431,8 @@ export async function loadConfig(sources: ConfigSources = {}): Promise<WrkConfig
     const search = section(layer, "search");
     roots = take(ROOTS, search?.roots) ?? roots;
     depth = take(DEPTH, search?.depth) ?? depth;
-    Object.assign(ttls, take(TTLS, section(layer, "cache")?.ttls) ?? {});
+    // `Object.assign` skips a `null` source, so `take`'s "nothing here" needs no guard.
+    Object.assign(ttls, take(TTLS, section(layer, "cache")?.ttls));
   }
 
   return {

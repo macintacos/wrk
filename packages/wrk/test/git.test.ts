@@ -24,6 +24,7 @@ import {
   gitCommonDir,
   isInsideWorkTree,
   listWorktrees,
+  parseWorktree,
   pruneWorktrees,
   refExists,
   removeWorktree,
@@ -291,6 +292,49 @@ describe("the throwing half of the contract", () => {
     await expect(listWorktrees(notARepo)).rejects.toThrow(/worktree list/);
     await expect(statusPorcelain(notARepo)).rejects.toThrow(/status/);
     await expect(forEachRef(["refs/heads"], notARepo)).rejects.toThrow(/for-each-ref/);
+  });
+});
+
+describe("parseWorktree", () => {
+  // Driven with hand-built bytes rather than through `listWorktrees`, because the records
+  // that matter here are ones real git does not emit — which is the whole reason the parser
+  // has to decide what to do with them. Everything git *does* emit is covered by the
+  // `listWorktrees` cases below, against a real repository.
+  const record = (...attributes: string[]): string => attributes.join("\0");
+
+  test("rejects a record with no worktree attribute", () => {
+    // `removeWorktree` deletes the directory it is handed, so an entry with no path must
+    // not be constructible — a caller iterating the list would delete the process cwd.
+    expect(() => parseWorktree(record("HEAD 0123456789abcdef", "branch refs/heads/x"))).toThrow(
+      /unreadable record/,
+    );
+  });
+
+  test("rejects a record whose worktree attribute carries no path", () => {
+    expect(() => parseWorktree(record("worktree", "branch refs/heads/x"))).toThrow(
+      /unreadable record/,
+    );
+  });
+
+  test("carries the offending record in the message rather than a schema dump", () => {
+    // Git's stderr says nothing about a record git printed successfully, so the record is
+    // the only thing that locates the failure.
+    expect(() => parseWorktree(record("branch refs/heads/x"))).toThrow(/branch refs\/heads\/x/);
+  });
+
+  test("answers null for the bare entry", () => {
+    expect(parseWorktree(record("worktree /repo/.bare", "bare"))).toBeNull();
+  });
+
+  test("drops attributes it does not model", () => {
+    // `locked` and `detached` are real attributes this module has no field for. They must
+    // be ignored rather than rejected, or a locked worktree takes the whole list down.
+    expect(parseWorktree(record("worktree /repo/wt", "detached", "locked being moved"))).toEqual({
+      path: "/repo/wt",
+      head: null,
+      branch: null,
+      prunable: null,
+    });
   });
 });
 
