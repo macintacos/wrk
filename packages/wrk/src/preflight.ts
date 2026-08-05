@@ -41,24 +41,29 @@
  * `CommandFailed`) and a default branch that cannot be resolved on the syncing path (a
  * {@link Refusal}).
  *
- * Three deliberate divergences from the Python implementation this reproduces
- * (`agent_exec_worktree.py`), all in fields no caller reads, recorded here so the
- * conformance suite meets them as decisions:
+ * Four deliberate divergences from the Python implementation this reproduces
+ * (`agent_exec_worktree.py`), recorded here so the conformance suite meets them as decisions.
+ * Each is pinned by a case in `test/conformance.test.ts` marked `DIVERGENCE`:
  *
  * - `current_branch` is `null` rather than `""` on `container-cwd`. The empty string was a
  *   consequence of a non-optional dataclass field, not a meaning.
  * - `current_branch` is `null` rather than `"HEAD"` on a detached HEAD, following
  *   {@link currentBranch}'s existing contract — `"HEAD"` is not a branch a caller can act on.
+ *   Only observable on the `--base` path: the sync switches off a detached HEAD before the
+ *   report is built, so the syncing path names the default branch instead.
+ * - `base` uses `??` where the Python used `or`, so an explicitly empty `--base` is reported
+ *   back rather than silently replaced by the default — a caller that passed one has a bug this
+ *   should not hide. This is an **envelope** difference, not an internal one.
  * - A default branch that resolves to nothing on the syncing path is a {@link Refusal}, where
  *   the Python reached `git switch HEAD` and died with git's status. There is genuinely
  *   nothing to sync to, and no verdict describes it.
  *
  * Every other difference from that implementation is internal and produces the same envelope:
  * the post-sync branch and the switch decision are both known from values already in hand
- * rather than re-read from git, saving two spawns. The one place to watch is `??` on the
- * `base` field, which is exact where the Python's `or` was convenient — an explicitly empty
- * `--base` is reported back rather than silently replaced by the default, because a caller
- * that passed one has a bug this should not hide.
+ * rather than re-read from git, saving two spawns. Both are behaviour-preserving because the
+ * sync ends on `defaultBranch` either way and a fast-forward pull cannot rename a branch — but
+ * an envelope built from an assigned value cannot witness that on its own, so the conformance
+ * cases that cover them re-read `git branch --show-current` independently.
  *
  * @packageDocumentation
  */

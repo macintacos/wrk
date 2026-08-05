@@ -1,21 +1,19 @@
 /**
  * The repository shapes `wrk`'s contracts are asserted against, built once and shared.
  *
- * Six test files grew their own `FIXTURE_ENV`, `fixtureGit`, `tempDir` and `makeRepo` while the
- * epic was in flight, and they had already drifted apart in four of six by the time the last
- * command landed. This module is the shared builder EXC-1003's third acceptance criterion asks
- * for: one place that knows how to produce a container, a default-branch checkout, a run
- * worktree, an unconverted clone and a dirty tree.
+ * One place that knows how to produce a container, a default-branch checkout, a run worktree, an
+ * unconverted clone and a dirty tree — the five shapes `wrk`'s contracts are asserted against.
  *
- * **The existing six files are deliberately not migrated onto it.** That is a mechanical rewrite
- * of some 2,900 lines of passing tests for no behavioural change, it cannot be mutation-tested
- * cheaply, and it would put seven landed PRs' assertions at risk to tidy an internal seam. The
- * builder lands here, the conformance suite uses it, and the retrofit is a follow-up.
+ * **Six other test files carry their own copies of these helpers and are deliberately not
+ * migrated onto this module.** The rewrite is large, cannot be mutation-tested cheaply, and would
+ * put seven landed PRs' assertions at risk to tidy an internal seam. It is also not as mechanical
+ * as it looks: those files need three shapes this module does not yet have — a checkout of an
+ * existing branch, a container carrying a fetch refspec and `origin/HEAD` (the only shape in
+ * which the default-branch sync runs in full), and a way to add commits to the seed. Any retrofit
+ * adds those first.
  *
  * Everything here builds *real* repositories with the real `git`. Nothing is stubbed: a
  * conformance suite that asserted against a mocked git would certify the mock.
- *
- * @packageDocumentation
  */
 
 import { execFileSync } from "node:child_process";
@@ -86,7 +84,13 @@ export function tempDir(): string {
   return dir;
 }
 
-/** Removes every directory {@link tempDir} handed out. Call from the suite's `afterAll`. */
+/**
+ * Removes every directory {@link tempDir} handed out. Call from the suite's `afterAll`.
+ *
+ * The list is module-global, so the first suite whose `afterAll` runs removes every root handed
+ * out so far — safe only because bun runs test files one at a time. A second importer arriving
+ * alongside a parallel runner would need per-suite lists instead.
+ */
 export function cleanupFixtures(): void {
   for (const root of roots.splice(0)) {
     rmSync(root, { recursive: true, force: true });
@@ -106,7 +110,7 @@ function commit(repo: string, message: string): void {
  * @param branch - The branch to initialise on.
  * @returns The repository's absolute path.
  */
-export function makeSeed(branch = "main"): string {
+function makeSeed(branch = "main"): string {
   const dir = tempDir();
   fixtureGit(["init", "-q", "-b", branch, dir]);
   commit(dir, "init");
@@ -120,9 +124,6 @@ export interface Container {
 
   /** The default-branch checkout inside it. */
   checkout: string;
-
-  /** The branch that checkout holds, which also named its directory. */
-  defaultBranch: string;
 }
 
 /**
@@ -131,15 +132,20 @@ export interface Container {
  * One per test rather than one for the suite: each case creates worktrees and branches in it, and
  * a shared container would make every later case depend on which ones ran first.
  *
+ * The checkout's directory name is folded, for the reason {@link addRunWorktree} folds: a checkout
+ * is a flat sibling of `.bare`, so a default branch carrying a `/` would otherwise be built as a
+ * nested directory that is not the layout at all. `setup.ts` folds here too.
+ *
  * @param branch - The default branch to build on.
- * @returns The container, its default-branch checkout, and that branch — see {@link Container}.
+ * @returns The container and its default-branch checkout — see {@link Container}.
  */
 export function makeContainer(branch = "main"): Container {
   const container = tempDir();
+  const checkout = join(container, worktreeDirName(branch));
   fixtureGit(["clone", "-q", "--bare", makeSeed(branch), join(container, ".bare")]);
   writeFileSync(join(container, ".git"), "gitdir: ./.bare\n");
-  fixtureGit(["worktree", "add", "-q", join(container, branch), branch], container);
-  return { container, checkout: join(container, branch), defaultBranch: branch };
+  fixtureGit(["worktree", "add", "-q", checkout, branch], container);
+  return { container, checkout };
 }
 
 /**

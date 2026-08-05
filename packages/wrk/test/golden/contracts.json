@@ -11,10 +11,12 @@
     "",
     "Tokens are substituted before parsing: <container>, <checkout>, <worktree>, <clone>.",
     "",
-    "Four values below deliberately DIVERGE from what the Python prints. Each is marked with a",
-    "DIVERGENCE note in conformance.test.ts and is expected, not a defect. Do not 'fix' them.",
+    "Three values below deliberately DIVERGE from what the Python prints. Each is marked with a",
+    "DIVERGENCE note in conformance.test.ts and is expected, not a defect. Do not 'fix' them. A",
+    "fourth divergence — `repo convert` naming 'the preflight that refused' rather than the Python",
+    "script — is not an envelope value, so it is pinned in the test file rather than here.",
     "",
-    "Keys starting with an underscore are notes and are skipped by the loader."
+    "Keys starting with an underscore are notes on the entry below them; nothing looks them up."
   ],
 
   "preflight.proceed": {
@@ -115,7 +117,20 @@
     "conversion_reference": null
   },
 
-  "_preflight.proceed-detached": "DIVERGENCE 2: Python reports current_branch \"HEAD\" on a detached HEAD; wrk reports null, since \"HEAD\" is not a branch a caller can act on. Post-sync the switch has landed, so this case reports the default branch — which is what pins EXC-997's 'assigned rather than re-read' difference as behaviour-preserving.",
+  "_preflight.proceed-base-detached": "DIVERGENCE 2: Python reports current_branch \"HEAD\" on a detached HEAD; wrk reports null, since \"HEAD\" is not a branch a caller can act on. --base skips the sync, which is what leaves the detached HEAD standing to be reported — on the syncing path the switch lands first and the envelope names the default branch instead.",
+  "preflight.proceed-base-detached": {
+    "verdict": "proceed",
+    "reason": null,
+    "repo_root": "<checkout>",
+    "default_branch": "main",
+    "base": "EXC-0/parent",
+    "current_branch": null,
+    "worktree_root": "<container>",
+    "current_worktree": null,
+    "conversion_reference": null
+  },
+
+  "_preflight.proceed-detached": "Not a divergence: the syncing path switches off the detached HEAD before the envelope is built, so this reports the default branch. It pins EXC-997's 'post-sync branch assigned rather than re-read' difference, together with the independent git re-read in the case that uses it.",
   "preflight.proceed-detached": {
     "verdict": "proceed",
     "reason": null,
