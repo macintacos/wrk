@@ -29,6 +29,15 @@
  * **Progress and warnings go to stderr**, through [`./output`](./output)'s {@link note},
  * leaving stdout to the single JSON document `emit` writes. This module never touches stdout.
  *
+ * **No lock is taken, deliberately.** [`./lock`](./lock)'s `withLock` serialises `preflight`'s
+ * default-branch sync because that sync mutates one shared checkout through a single
+ * `FETCH_HEAD`. The only thing here that touches shared state is the refresh, which re-indexes
+ * the *source* checkout — and `codegraph` arbitrates that itself through the daemon whose
+ * socket {@link copyContext} has to skip. Everything after the refresh writes only inside the
+ * new worktree, which no other run can be provisioning. Holding a lock across this instead
+ * would serialise the install, the slowest step in the whole command, across every concurrent
+ * creation — a real cost against a race nothing has been observed to lose.
+ *
  * Two deliberate divergences from `agent_exec_worktree.py`'s `provision`, which this
  * reproduces. Child output is **buffered and then forwarded** rather than streamed live,
  * because `proc.ts` has no `stdio: "inherit"` mode and widening a shared module for one caller
