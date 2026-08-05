@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#MISE description="Install the toolchain and dependencies"
+#MISE raw_args=true
+set -euo pipefail
+
+# shellcheck source=scripts/bootstrap.sh
+source "${MISE_PROJECT_ROOT}/scripts/bootstrap.sh" || exit 1
+
+exec bun scripts/tasks/cli.ts setup "$@"

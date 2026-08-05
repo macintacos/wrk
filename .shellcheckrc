@@ -1,0 +1,10 @@
+# Follow `source`d files instead of skipping them (SC1091). The .mise/tasks/
+# forwarders all source scripts/bootstrap.sh, so without this the one file every
+# task depends on is the one file shellcheck never reads in context.
+external-sources=true
+
+# The forwarders source through ${MISE_PROJECT_ROOT}, which shellcheck cannot
+# expand. Their `# shellcheck source=` directives name the path relative to the
+# repo root, and this is what makes "the repo root" resolvable from a task file
+# two directories down.
+source-path=SCRIPTDIR/../..

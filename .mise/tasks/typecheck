@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+#MISE description="Type-check the whole workspace"
+#MISE raw_args=true
+set -euo pipefail
+
+# shellcheck source=scripts/bootstrap.sh
+source "${MISE_PROJECT_ROOT}/scripts/bootstrap.sh" || exit 1
+
+exec bun scripts/tasks/cli.ts typecheck "$@"
