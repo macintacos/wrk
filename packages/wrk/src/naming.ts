@@ -39,19 +39,17 @@ const ISSUE_KEY_PATTERN = String.raw`[A-Z][A-Z0-9]*-\d+`;
  * Matches a working branch carrying an `<ISSUE-ID>/` prefix.
  *
  * The trailing separator is part of the pattern: without it, the bare key `EXC-1` would
- * read as a working branch. The leading `^` is load-bearing in a way it is not in the
- * Python original — `re.match` anchors at the start implicitly, whereas
- * {@link RegExp.test} scans the whole string, so dropping it would accept
- * `feature/EXC-1/x`.
+ * read as a working branch. The leading `^` is equally load-bearing — `RegExp.test` scans
+ * the whole string rather than anchoring, so dropping it would accept `feature/EXC-1/x`.
  *
  * Carries no `g` flag, so it holds no `lastIndex` and is safe to share at module scope.
  */
-export const ISSUE_BRANCH_RE: RegExp = new RegExp(`^${ISSUE_KEY_PATTERN}/`);
+export const ISSUE_BRANCH_RE = new RegExp(`^${ISSUE_KEY_PATTERN}/`);
 
 /** Matches a bare issue identifier, with no separator and nothing trailing. */
 const ISSUE_KEY_RE = new RegExp(`^${ISSUE_KEY_PATTERN}$`);
 
-/** Longest descriptive slug {@link mintBranch} will produce, in characters. */
+/** Longest descriptive slug, in characters, before a collision suffix is appended. */
 const MAX_SLUG_LENGTH = 40;
 
 /** Slug used when a title survives slugification with nothing left. */
@@ -131,21 +129,29 @@ export function branchBelongsToIssue(branch: string, issue: string): boolean {
 }
 
 /**
- * Reduces an arbitrary key to one filesystem-safe path segment.
+ * Reduces an arbitrary key to one inert path segment.
  *
- * Unifies four previously divergent sanitizers onto a single alphabet. This subsumes the
- * `/`-to-`_` form rather than contradicting it: on a container path every slash still
- * folds, and the characters that form left alone are made safe too.
+ * The alphabet is `[A-Za-z0-9._-]` and everything outside it becomes `_`, which covers
+ * every `/` — so a container path flattens to a single segment rather than a nested one.
  *
- * The `u` flag is load-bearing. Without it the class matches UTF-16 code units, so an
- * astral character such as an emoji would yield one `_` per surrogate half. Two callers
- * disagreeing about a cache key do not error — they silently stop sharing the cache.
+ * A key of only dots is then rewritten, because `.` and `..` survive that alphabet intact
+ * and callers join this result onto a cache root. Folding the slashes caps the exposure at
+ * one level, but a caller is entitled to treat the output as a name rather than a
+ * traversal. The rewrite is per-character so `.` and `..` do not collapse onto the same
+ * key; two distinct keys sharing a cache entry is the bug this function exists to avoid.
+ *
+ * The `u` flag is load-bearing here, unlike the run-collapsing patterns in
+ * {@link slugify}: without it the class matches UTF-16 code units, so an astral character
+ * such as an emoji yields one `_` per surrogate half instead of one for the character.
+ * Callers that disagree about a cache key do not error — they silently stop sharing the
+ * cache.
  *
  * @param key - Any string used to key a cache — an issue identifier, a container path.
- * @returns The key with every character outside `[A-Za-z0-9._-]` replaced by `_`.
+ * @returns A single path segment safe to join onto a cache root.
  */
 export function cacheSlug(key: string): string {
-  return key.replace(/[^A-Za-z0-9._-]/gu, "_");
+  const slug = key.replace(/[^A-Za-z0-9._-]/gu, "_");
+  return /^\.+$/u.test(slug) ? slug.replaceAll(".", "_") : slug;
 }
 
 /**
@@ -154,13 +160,16 @@ export function cacheSlug(key: string): string {
  * Non-alphanumerics collapse in runs rather than one-for-one, so `Fix: the (broken) login`
  * yields `fix-the-broken-login` instead of a string of empty segments. Non-ASCII letters
  * are replaced rather than transliterated — a branch name is not the place to be clever
- * about Unicode, and a title that reduces to nothing is caught by the caller.
+ * about Unicode, and a title that reduces to nothing is caught by {@link mintBranch}.
  */
+// ponytail: ASCII-only, so a wholly non-Latin title slugifies to empty and mints
+// `<KEY>/work`. Transliterate, or pass non-ASCII letters through — git refs allow them —
+// if that ever bites.
 function slugify(title: string): string {
   return title
     .toLowerCase()
-    .replace(/[^a-z0-9]+/gu, "-")
-    .replace(/^-+|-+$/gu, "");
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
 }
 
 /**
@@ -171,12 +180,11 @@ function slugify(title: string): string {
  * added *after* the cap, so a disambiguated branch may run slightly longer — the cap
  * exists to keep names readable, not to satisfy a hard limit.
  *
- * `issue` is validated rather than trusted. Minting from a malformed or lowercased
- * identifier used to produce a branch that {@link isIssueBranch} then rejected, so the
- * worktree it created was never recognised as a run worktree — a failure that surfaced far
- * from its cause. A title that slugifies to nothing falls back to
- * {@link FALLBACK_SLUG} for the same reason: `EXC-1/` is not a valid git ref, and it would
- * fold to the directory `EXC-1+`.
+ * `issue` is validated rather than trusted: an unvalidated or lowercased identifier mints
+ * a branch {@link isIssueBranch} rejects, so the worktree created from it is never
+ * recognised as a run worktree — a failure that surfaces far from its cause. A title that
+ * slugifies to nothing falls back to {@link FALLBACK_SLUG} for the same reason: `EXC-1/`
+ * is not a valid git ref, and it would fold to the directory `EXC-1+`.
  *
  * @param issue - Issue identifier, e.g. `EXC-992`. Must be a bare key with no separator.
  * @param title - The issue's title, in any shape.
@@ -198,7 +206,7 @@ export function mintBranch(issue: string, title: string, existing: Iterable<stri
     throw new Error(`Not a well-formed issue identifier: ${issue}`);
   }
 
-  const slug = slugify(title).slice(0, MAX_SLUG_LENGTH).replace(/-+$/u, "") || FALLBACK_SLUG;
+  const slug = slugify(title).slice(0, MAX_SLUG_LENGTH).replace(/-+$/, "") || FALLBACK_SLUG;
   const base = `${issue}/${slug}`;
 
   const taken = new Set(existing);

@@ -39,16 +39,6 @@ describe("worktreeDirName", () => {
   test("folds the branch into a single flat directory name", () => {
     expect(worktreeDirName("EXC-1/add-thing")).toBe("EXC-1+add-thing");
   });
-
-  test("does not mutate the branch it was given", () => {
-    // The branch reaches `git worktree add -b` verbatim; only the directory folds. A
-    // folded branch would create a literal `EXC-1+add-thing` ref.
-    const branch = "EXC-1/add-thing";
-
-    worktreeDirName(branch);
-
-    expect(branch).toBe("EXC-1/add-thing");
-  });
 });
 
 describe("isIssueBranch", () => {
@@ -146,11 +136,23 @@ describe("cacheSlug", () => {
     expect(cacheSlug("wrk-1.2_beta")).toBe("wrk-1.2_beta");
   });
 
-  test("replaces a multibyte character once, not once per byte", () => {
-    // The shell `tr -c` variant sanitized per byte, so this yielded three underscores.
-    // Two implementations disagreeing on a cache key means they silently stop sharing
-    // the cache.
+  test("replaces a multibyte character once, not once per code unit", () => {
+    // U+1F600 is four UTF-8 bytes and two UTF-16 code units, so a byte-wise sanitizer
+    // yields four underscores and a `u`-less regex yields two. Callers that disagree on a
+    // cache key do not error — they silently stop sharing the cache.
     expect(cacheSlug("a😀b")).toBe("a_b");
+  });
+
+  test("does not emit a key that would climb out of the cache directory", () => {
+    // `.` and `..` survive the allowed alphabet intact, so a key joined onto a cache root
+    // would resolve to the parent directory. Slashes fold, so one level is the whole
+    // exposure — but this function's callers are entitled to treat its output as inert.
+    expect(cacheSlug("..")).toBe("__");
+    expect(cacheSlug(".")).toBe("_");
+  });
+
+  test("keeps dots that are not the entire key", () => {
+    expect(cacheSlug("v1.2.3")).toBe("v1.2.3");
   });
 });
 
@@ -176,12 +178,17 @@ describe("mintBranch", () => {
     expect(branchBelongsToIssue(branch, "EXC-1")).toBe(true);
   });
 
-  test("caps the descriptive portion and leaves no trailing separator", () => {
-    const branch = mintBranch("EXC-1", `${"a".repeat(20)} ${"b".repeat(40)}`);
-    const slug = branch.slice("EXC-1/".length);
+  test("caps the descriptive portion at 40 characters", () => {
+    expect(mintBranch("EXC-1", "z".repeat(60))).toBe(`EXC-1/${"z".repeat(40)}`);
+  });
 
-    expect(slug.length).toBeLessThanOrEqual(40);
-    expect(slug.endsWith("-")).toBe(false);
+  test("re-strips the separator that the cap cut exposed", () => {
+    // The slug is 39 `a`s, a separator, then `b`s — so the cut at 40 lands exactly on the
+    // separator. Without the re-strip this mints the branch `EXC-1/aaa…a-`, and a title
+    // whose 41st character happens to be a space is not a rare shape.
+    expect(mintBranch("EXC-1", `${"a".repeat(39)} ${"b".repeat(10)}`)).toBe(
+      `EXC-1/${"a".repeat(39)}`,
+    );
   });
 
   test("falls back to a usable slug when the title survives slugification empty", () => {
@@ -207,8 +214,8 @@ describe("mintBranch", () => {
   });
 
   test("rejects an issue key that would not survive its own predicates", () => {
-    // Minting from a lowercase key silently produced a branch nothing recognised — the
-    // comparison downstream is case-sensitive and never validated its input.
+    // The downstream comparison is case-sensitive and does not normalise, so a lowercase
+    // key would mint a branch nothing recognises.
     expect(() => mintBranch("exc-1", "Add thing")).toThrow();
   });
 
