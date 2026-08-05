@@ -70,13 +70,17 @@ owns TOML.
 `wrk` runs with no configuration at all. Two optional files override its defaults, the
 later winning over the earlier:
 
-1. **Machine-wide** — `$XDG_CONFIG_HOME/wrk/config.json`, or `~/.config/wrk/config.json`
+1. **Machine-wide** — `$XDG_CONFIG_HOME/wrk/config.toml`, or `~/.config/wrk/config.toml`
    when that variable is unset, empty, or relative. Its sections sit at the root of the
    document, since the path already says the file is `wrk`'s.
 2. **Per repository** — the `wrk` key of `.project-meta.json` in the repository's
    **container** (beside `.bare`), not in a checkout. That file is shared with other
    tools, so everything `wrk` reads there hangs off `wrk` — `wrk.search`, never a
    neighbouring top-level `search`.
+
+The formats differ on purpose. The machine-wide file is `wrk`'s alone, so it is TOML;
+`.project-meta.json` belongs to every tool that reads it, so it stays JSON under the name
+those tools already know.
 
 | Setting        | Default                        | What it does                                          |
 | -------------- | ------------------------------ | ----------------------------------------------------- |
@@ -86,13 +90,17 @@ later winning over the earlier:
 | `glyphs`       | `U+F062` / `U+F063` / `U+F00C` | Marker per stack position: `top`, `bottom`, `merged`. |
 | `colours`      | `green` / `yellow` / `brblack` | Colour per stack position.                            |
 
-```jsonc
-// ~/.config/wrk/config.json
-{
-  "search": { "roots": ["~/GitLocal", "/srv/repos"], "depth": 2 },
-  "cache": { "ttls": { "pr-graph": 300000 } },
-  "colours": { "merged": "brblue" }
-}
+```toml
+# ~/.config/wrk/config.toml
+[search]
+roots = ["~/GitLocal", "/srv/repos"]
+depth = 2
+
+[cache.ttls]
+pr-graph = 300000
+
+[colours]
+merged = "brblue"
 ```
 
 ```jsonc
@@ -111,8 +119,10 @@ others alone. A leading `~` in a root is expanded; a root that is still relative
 afterwards is dropped, because it would otherwise be scanned from wherever you happened to
 be standing.
 
-**Nothing reports a bad config.** A file that is missing, unreadable, not valid JSON, or
+**Nothing reports a bad config.** A file that is missing, unreadable, unparseable, or
 carries none of these keys leaves the layer below it standing, and a single malformed
 value falls through on its own while its well-formed neighbours still apply. So a typo
 costs you the setting silently — if an override seems to do nothing, check the spelling
-and the nesting first.
+and the nesting first. A whole layer is lost only when the document itself will not parse:
+in TOML that is an unterminated `[table]` header, a key defined twice, or an integer too
+large to represent exactly; in JSON, anything that is not an object at the root.
