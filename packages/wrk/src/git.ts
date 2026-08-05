@@ -31,6 +31,8 @@
  * @packageDocumentation
  */
 
+import { z } from "zod";
+
 import { type RunResult, run } from "./proc";
 
 /**
@@ -263,50 +265,63 @@ export interface Worktree {
 }
 
 /**
+ * The attributes of one `worktree list --porcelain` record, as a {@link Worktree}.
+ *
+ * This is the parse boundary in the literal sense — text git wrote becoming a value the
+ * rest of `wrk` acts on — so it is a schema rather than a hand-rolled fold, and the
+ * transform's return annotation ties it to {@link Worktree} so the two cannot drift.
+ *
+ * `worktree` is required, which is the point of writing it this way: it is what makes
+ * `Worktree.path` a path rather than possibly the empty string. Git has always emitted it
+ * first, so this is the schema stating a precondition rather than a case expected to fire —
+ * but {@link removeWorktree} deletes the directory it is handed, and an empty path is not
+ * something that should be able to reach it if a future git ever reshapes this format.
+ *
+ * Attributes with no value (`bare`, `detached`, a reasonless `locked`) arrive as the empty
+ * string, and every attribute not named here is dropped by the schema.
+ */
+// ponytail: `locked` is dropped rather than captured — nothing consumes it, and git emits
+// a bare `locked` with no reason when locked without one, so an honest field needs either
+// two properties or a ""-versus-null trap. Add it when a caller needs it.
+const WORKTREE = z
+  .object({
+    worktree: z.string(),
+    HEAD: z.string().optional(),
+    branch: z.string().optional(),
+    prunable: z.string().optional(),
+  })
+  .transform(
+    ({ worktree, HEAD, branch, prunable }): Worktree => ({
+      path: worktree,
+      // Git writes the all-zeros object id for a branch with no commit yet, which is not a
+      // commit-ish any caller can hand back to it. Matched by shape rather than by length
+      // so SHA-256 repositories, where it is 64 characters, are covered too.
+      head: HEAD === undefined || /^0+$/.test(HEAD) ? null : HEAD,
+      branch: branch ?? null,
+      prunable: prunable ?? null,
+    }),
+  );
+
+/**
  * Parses one `worktree list --porcelain` record, or `null` for the repository's bare entry.
  *
  * Whole records rather than lines, which is the entire point: git emits `prunable` *after*
  * `branch`, so anything that decides a worktree is complete on seeing its branch reads a
  * stale worktree as live.
+ *
+ * @throws If the record is not one {@link WORKTREE} accepts.
  */
-// ponytail: `locked` is parsed past rather than captured — nothing consumes it, and git
-// emits a bare `locked` with no reason when locked without one, so an honest field needs
-// either two properties or a ""-versus-null trap. Add it when a caller needs it.
 function parseWorktree(record: string): Worktree | null {
-  let path = "";
-  let head: string | null = null;
-  let branch: string | null = null;
-  let prunable: string | null = null;
+  const attributes = Object.fromEntries(
+    record.split("\0").map((attribute) => {
+      const boundary = attribute.indexOf(" ");
+      return boundary === -1
+        ? [attribute, ""]
+        : [attribute.slice(0, boundary), attribute.slice(boundary + 1)];
+    }),
+  );
 
-  for (const attribute of record.split("\0")) {
-    const boundary = attribute.indexOf(" ");
-    const key = boundary === -1 ? attribute : attribute.slice(0, boundary);
-    const value = boundary === -1 ? "" : attribute.slice(boundary + 1);
-
-    switch (key) {
-      case "bare":
-        return null;
-      case "worktree":
-        path = value;
-        break;
-      case "HEAD":
-        // Git writes the all-zeros object id for a branch with no commit yet, which is not
-        // a commit-ish any caller can hand back to it. Matched by shape rather than by
-        // length so SHA-256 repositories, where it is 64 characters, are covered too.
-        head = /^0+$/.test(value) ? null : value;
-        break;
-      case "branch":
-        branch = value;
-        break;
-      case "prunable":
-        prunable = value;
-        break;
-      default:
-        break;
-    }
-  }
-
-  return { path, head, branch, prunable };
+  return "bare" in attributes ? null : WORKTREE.parse(attributes);
 }
 
 /**
@@ -317,9 +332,10 @@ function parseWorktree(record: string): Worktree | null {
  * {@link removeWorktree} acts on, so a record read off the wrong path deletes the wrong
  * directory.
  *
- * @throws If git failed. A repository always has at least one worktree, so an empty array
- *   would have no honest meaning and would only launder a real failure into a plausible
- *   answer.
+ * @throws If git failed, or if it emitted a record {@link WORKTREE} does not accept. A
+ *   repository always has at least one worktree, so an empty array would have no honest
+ *   meaning and would only launder a real failure into a plausible answer — and a record
+ *   this module cannot read is the same kind of failure, one directory-deleting call away.
  */
 export async function listWorktrees(cwd?: string): Promise<Worktree[]> {
   const stdout = await gitOk(["worktree", "list", "--porcelain", "-z"], cwd);
