@@ -26,7 +26,17 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
@@ -43,8 +53,11 @@ const CLI = join(import.meta.dir, "../src/cli.ts");
  * `process.execPath` is the runtime already running this suite, so no toolchain lookup is
  * involved and the child is the same binary a user's `wrk` would be.
  */
-function agentCreate(cwd: string, args: string[]): Promise<RunResult> {
-  return run(process.execPath, [CLI, "agent", "create", ...args], { cwd });
+function agentCreate(cwd: string, args: string[], path?: string): Promise<RunResult> {
+  return run(process.execPath, [CLI, "agent", "create", ...args], {
+    cwd,
+    env: path === undefined ? undefined : { PATH: path },
+  });
 }
 
 /**
@@ -404,5 +417,82 @@ describe("wrk agent create", () => {
     expect(result.stdout).toBe("");
     expect(result.code).not.toBe(0);
     expect(result.stderr).toMatch(/required option/);
+  });
+});
+
+/** The real `git`, so a `PATH` holding nothing else still lets `wrk` run at all. */
+const REAL_GIT = execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+
+/**
+ * A `PATH` holding only a real `git` and stub `codegraph` / `mise` executables.
+ *
+ * The stubs exist so provisioning takes its real path without a real toolchain run — what
+ * these cases assert is `wrk`'s side of it: which channel each line lands on, and that the
+ * envelope survives whatever the tools do. `provision.test.ts` is where the pipeline's own
+ * ordering and gating are pinned, against fakes that record rather than merely exit.
+ */
+function makeStubBin(miseExit = 0): string {
+  const bin = tempDir();
+  for (const [name, code] of [
+    ["codegraph", 0],
+    ["mise", miseExit],
+  ] as const) {
+    writeFileSync(join(bin, name), `#!/bin/sh\nexit ${code}\n`);
+    chmodSync(join(bin, name), 0o755);
+  }
+  symlinkSync(REAL_GIT, join(bin, "git"));
+  return bin;
+}
+
+/**
+ * A container whose default-branch checkout carries everything provisioning has to move: a
+ * committed `mise.toml` (so the *worktree* is a mise project), an untracked `.codegraph`, and
+ * an untracked `.env`.
+ */
+function makeProvisionable(): { container: string; checkout: string } {
+  const source = makeRepo("main");
+  writeFileSync(join(source, "mise.toml"), "[tools]\n");
+  fixtureGit(["add", "mise.toml"], source);
+  commit(source, "mise");
+
+  const container = makeContainer(source);
+  const checkout = addCheckout(container, "main", "main");
+  mkdirSync(join(checkout, ".codegraph"));
+  writeFileSync(join(checkout, ".codegraph", "index.db"), "source index");
+  writeFileSync(join(checkout, ".env"), "SECRET=1\n");
+  return { container, checkout };
+}
+
+describe("wrk agent create, provisioning", () => {
+  test("seeds the new worktree and keeps every line of it off stdout", async () => {
+    const { container, checkout } = makeProvisionable();
+
+    const result = await agentCreate(checkout, ["--branch", "EXC-24/seeded"], makeStubBin());
+
+    const worktree = join(container, "EXC-24+seeded");
+    expect(result.code).toBe(0);
+    // The whole reason the two channels are split: provisioning is chatty, and a single one of
+    // its lines on stdout turns the answer into a `jq` syntax error.
+    expect(JSON.parse(result.stdout)).toEqual({ worktree_path: worktree, branch: "EXC-24/seeded" });
+    expect(result.stderr).toContain("provisioning mise tooling");
+    expect(readFileSync(join(worktree, ".env"), "utf8")).toBe("SECRET=1\n");
+    expect(existsSync(join(worktree, ".codegraph", "index.db"))).toBe(true);
+  });
+
+  test("a failed provisioning step does not turn a created worktree into an error", async () => {
+    // The acceptance criterion, at the only place both channels are real streams. git has
+    // already made the worktree; a toolchain that cannot install is not a reason to tell the
+    // caller it does not exist.
+    const { container, checkout } = makeProvisionable();
+
+    const result = await agentCreate(checkout, ["--branch", "EXC-25/degraded"], makeStubBin(3));
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain("failed (exit 3)");
+    expect(JSON.parse(result.stdout)).toEqual({
+      worktree_path: join(container, "EXC-25+degraded"),
+      branch: "EXC-25/degraded",
+    });
+    expect(existsSync(join(container, "EXC-25+degraded", ".codegraph", "index.db"))).toBe(true);
   });
 });

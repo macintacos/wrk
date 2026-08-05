@@ -9,9 +9,11 @@
  * `naming.ts`; this module is the composition of the two plus the single `git worktree add`
  * that follows from them.
  *
- * **Provisioning is not here.** Copying a codegraph index, seeding `.env`, running `mise
- * install` — everything that makes a fresh worktree usable rather than merely present — is
- * EXC-1000's, and lands on top of the path this returns.
+ * **Provisioning is part of it**, and lives in [`./provision`](./provision): copying a
+ * codegraph index, seeding `.env`, running `mise install` — everything that makes a fresh
+ * worktree usable rather than merely present. It runs here rather than in the command above it
+ * because this function has already resolved the checkout to provision *from*, and because a
+ * caller asking for a worktree wants a workable one; see {@link createWorktree}.
  *
  * @packageDocumentation
  */
@@ -22,6 +24,7 @@ import { addWorktree } from "./git";
 import { worktreeDirName } from "./naming";
 import type { CommandFailed } from "./output";
 import { Refusal } from "./output";
+import { provision } from "./provision";
 import { checkoutFor, containerFor, isBareLayout, resolveDefaultBranch } from "./repo";
 
 /**
@@ -91,6 +94,15 @@ export interface CreateOptions {
  * branches from is a decision `wrk` has already made by this point, and it is not one the
  * caller's current checkout gets a vote in.
  *
+ * **The new worktree is then provisioned**, through {@link provision} — the codegraph index,
+ * the untracked `.env`, and the mise toolchain. `from` is what it copies from, which is the
+ * default-branch checkout on a fresh run and the parent worktree when stacking a layer: the
+ * right answer in both cases, and already in hand here, where composing the two calls a level
+ * up would spend two or three git spawns rediscovering it. Provisioning is best-effort and
+ * writes only to stderr, so it can neither reject nor alter the value returned below —
+ * `git worktree add` has already succeeded by then, and a missing `.env` is not a reason to
+ * report a worktree that exists as one that does not.
+ *
  * @param cwd - Anywhere in the repository: a checkout, a run worktree, the container, or
  *   `<container>/.bare`.
  * @param options - The branch to create, and optionally what to base it on.
@@ -135,6 +147,8 @@ export async function createWorktree(cwd: string, options: CreateOptions): Promi
     branch,
     startPoint: base ?? (await resolveDefaultBranch(from)) ?? undefined,
   });
+
+  await provision(from, path);
 
   return { worktree_path: path, branch };
 }
