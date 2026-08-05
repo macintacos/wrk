@@ -2,11 +2,10 @@
  * The program root: that `--json` is genuinely global, and that a failure reaching the top
  * becomes the right exit status.
  *
- * No command is registered on the real tree yet — each is added by the issue that builds
- * it — so both properties are exercised through a probe command this file registers on the
- * real `buildProgram()` output. That is the point rather than a workaround: a flag
- * declared on the root has to be readable from a *subcommand's* action, which is the one
- * thing testing the root's own options would not prove.
+ * Both properties are exercised through a probe command this file registers on the real
+ * `buildProgram()` output. That is the point rather than a workaround: a flag declared on
+ * the root has to be readable from a *subcommand's* action, which is the one thing testing
+ * the root's own options would not prove.
  *
  * The exit-status cases run in a child process. `main` assigns `process.exitCode`, so
  * asserting it in process would leave the test runner itself exiting nonzero, and the
