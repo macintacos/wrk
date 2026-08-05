@@ -50,11 +50,11 @@ import { createWorktree } from "./worktree";
  * [`./preflight`](./preflight)'s header for the contract, including why a blocking verdict
  * still exits `0`.
  *
- * `agent create` never consults it either, for the same reason, and is additionally the
- * reason `emitLine` exists. `--hook` is not a human-output mode returning through the back
- * door: it is a *second machine* shape, for the editor's `WorktreeCreate` hook, whose
- * consumer is a `cd` rather than a parser. Which of the two it writes is the only thing
- * that flag decides.
+ * `agent create` never consults {@link wantsJson} either, for the same reason, and is
+ * additionally the reason `emitLine` exists. `--hook` is not a human-output mode returning
+ * through the back door: it is a *second machine* shape, for the editor's `WorktreeCreate`
+ * hook, whose consumer is a `cd` rather than a parser. Which of the two it writes is the
+ * only thing that flag decides.
  *
  * `--branch` is a `requiredOption` rather than validated in the action, which puts its
  * absence on the route this module's own `main` documents as already correct: commander

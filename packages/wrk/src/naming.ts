@@ -246,7 +246,7 @@ function slugify(title: string): string {
  */
 export function mintBranch(issue: string, title: string, existing: Iterable<string> = []): string {
   if (!ISSUE_KEY_RE.test(issue)) {
-    throw new Refusal(`Not a well-formed issue identifier: ${issue} — expected a key like EXC-123`);
+    throw new Refusal(`not a well-formed issue identifier: ${issue}; expected a key like EXC-123`);
   }
 
   const slug = slugify(title).slice(0, MAX_SLUG_LENGTH).replace(/-+$/, "") || FALLBACK_SLUG;

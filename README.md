@@ -140,8 +140,8 @@ wrk agent create --branch EXC-999/some-slug [--base EXC-996/parent-slug] [--hook
 
 Only the **directory** folds `/` to `+` — the branch reaches `git worktree add -b`
 verbatim, so `EXC-999/some-slug` lives in `EXC-999+some-slug`. `--base` is the stacked
-path again, and defaults to the repository's default branch. `--hook` selects the bare-path
-stdout shape described above.
+path again, and defaults to the repository's default branch. `--hook` selects the
+bare-path stdout shape described above.
 
 Unlike preflight, `create` has no blocked verdict to return: its contract is that the
 worktree now exists, so an unconverted repository is a **refusal** — exit `1`, nothing on

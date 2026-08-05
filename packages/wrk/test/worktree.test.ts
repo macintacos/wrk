@@ -286,13 +286,38 @@ describe("createWorktree", () => {
     expect((failure as Refusal).message).toMatch(/repo-setup skill/);
   });
 
-  test("refuses a directory in no repository at all", async () => {
+  test("refuses a directory in no repository at all, and does not tell it to convert", async () => {
+    // The two refusals carry different remedies on purpose. Advising a user standing in an
+    // empty directory to "convert it first" names a repository that is not there; the only
+    // useful thing to say is that there is none.
     const failure: unknown = await createWorktree(notARepo, { branch: "EXC-11/x" }).catch(
       (error: unknown) => error,
     );
 
     expect(failure).toBeInstanceOf(Refusal);
-    expect((failure as Refusal).message).toMatch(/repo-setup skill/);
+    expect((failure as Refusal).message).toMatch(/not a git repository/);
+    expect((failure as Refusal).message).not.toMatch(/convert/);
+  });
+
+  test("reads a HEAD-relative base from the checkout, not from the bare repository", async () => {
+    // The one case that pins `checkoutFor` on the first line, and it needs to be this
+    // specific: plain ref names, tags and shas resolve identically from `.bare` and from a
+    // checkout, because refs are shared. Only `HEAD` differs — so without that resolution
+    // this reads the bare repository's HEAD, and every other test in this file still passes.
+    const container = makeConverted();
+    fixtureGit(["symbolic-ref", "HEAD", "refs/heads/release"], join(container, ".bare"));
+
+    const created = await createWorktree(join(container, ".bare"), {
+      branch: "EXC-12/head-relative",
+      base: "HEAD",
+    });
+
+    expect(fixtureGit(["rev-parse", "HEAD"], created.worktree_path)).toBe(
+      fixtureGit(["rev-parse", "main"], container),
+    );
+    expect(fixtureGit(["rev-parse", "HEAD"], created.worktree_path)).not.toBe(
+      fixtureGit(["rev-parse", "release"], container),
+    );
   });
 
   test("lets git's own failure through, carrying its exit status, when the branch exists", async () => {
@@ -364,7 +389,12 @@ describe("wrk agent create", () => {
     const result = await agentCreate(container, ["--branch", "release"]);
 
     expect(result.stdout).toBe("");
+    // Not a literal: git picks this status and does not pick it consistently — 255 for a
+    // branch that already exists, 128 for a taken path or an unresolvable base, on the same
+    // git. What the exit rule promises is that the child's status is *inherited* rather than
+    // flattened, so the assertion is that it is neither success nor the refusal code.
     expect(result.code).not.toBe(0);
+    expect(result.code).not.toBe(1);
     expect(result.stderr).toMatch(/^wrk: git worktree add/);
   });
 
@@ -373,5 +403,6 @@ describe("wrk agent create", () => {
 
     expect(result.stdout).toBe("");
     expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/required option/);
   });
 });

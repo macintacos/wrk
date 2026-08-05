@@ -2,14 +2,8 @@
  * The `create` engine: places a run worktree beside its siblings in the repository's
  * bare-repo container.
  *
- * One exported function, taking a cwd and the branch to create, returning the path it built.
- * **Nothing here knows a CLI exists** — it neither parses arguments, nor writes to a stream,
- * nor decides an exit status. That is not tidiness for its own sake: `create` is invoked from
- * the editor's `WorktreeCreate` hook and from agent skills that pipe stdout through `jq -er
- * .worktree_path`, so the answer has to be a value the command layer renders through
- * `output.ts`'s envelope rather than text this module prints. Keeping the split at the
- * function boundary is also what lets the whole contract below be pinned by tests that call
- * it directly, with no subprocess and no argv in the way.
+ * One exported function, returning the path it built rather than printing it — the two stdout
+ * shapes its callers need are `output.ts`'s to choose between, not this module's.
  *
  * The repository rules it works from all live in `repo.ts`, and the naming rules in
  * `naming.ts`; this module is the composition of the two plus the single `git worktree add`
@@ -26,6 +20,7 @@ import { join } from "node:path";
 
 import { addWorktree } from "./git";
 import { worktreeDirName } from "./naming";
+import type { CommandFailed } from "./output";
 import { Refusal } from "./output";
 import { checkoutFor, containerFor, isBareLayout, resolveDefaultBranch } from "./repo";
 
@@ -74,37 +69,35 @@ export interface CreateOptions {
  * Creates a run worktree for `branch`, as a sibling inside `cwd`'s container.
  *
  * **`cwd` is resolved to a checkout first**, through {@link checkoutFor}, because callers
- * routinely have none. The editor's `WorktreeCreate` hook runs with `<container>/.bare` as
- * its cwd, and the container itself keeps the path the repository had before conversion, so
- * stale bookmarks and plain habit both land there — neither is a work tree, and `git worktree
- * add` run from a bare repository resolves a bare `base` name against a different HEAD than
- * the user is looking at. Resolving to the default-branch checkout first makes every one of
- * those cwds behave like the ordinary case.
+ * routinely have none: the editor's `WorktreeCreate` hook runs with `<container>/.bare` as
+ * its cwd, and the container keeps the path the repository had before conversion, so stale
+ * bookmarks and plain habit both land there. What that resolution buys is the meaning of a
+ * `HEAD`-relative `base` and of the omitted-start-point case below — both are read from
+ * whichever repository `from` names, and the user means the checkout's HEAD, not the bare
+ * repository's. Plain ref names, tags and shas resolve identically either way, refs being
+ * shared, so this is narrower than it looks and is pinned by exactly one test.
  *
- * When no worktree holds the default branch, `cwd` is used as it was found. That is
- * deliberate parity with the Python implementation this replaces: git is left to report the
- * missing work tree in its own words rather than having a second refusal invented here for a
- * state the layer below already describes precisely.
+ * When no worktree holds the default branch, `cwd` is used as it was found — the same
+ * degradation the Python implementation this replaces documents. Nothing below needs a work
+ * tree: the container lookup, the layout check and `git worktree add` all answer perfectly
+ * well from a bare repository, so there is no failure here to pre-empt.
  *
- * **An unconverted repository is a refusal, not a verdict.** Commands that *survey* a
- * repository answer with a verdict and exit 0, because their contract is "here is what I
- * found" and "blocked" is a finding. This command's contract is "the worktree now exists", so
- * a repository with nowhere to put one leaves nothing to report — there is no partial
- * success, and a `Refusal` exits 1 with the one line that says how to fix it.
+ * **An unconverted repository is a {@link Refusal}, not a verdict**, because this command's
+ * contract is that the worktree now exists — leaving nothing partial to report.
  *
- * **The start point is passed explicitly rather than left to git.** With neither `-b` nor a
- * commit-ish, `git worktree add`'s convenience DWIM names the branch after the directory's
- * basename — which under this layout is the *folded* name, minting `EXC-1+add-thing` — or,
- * where `worktree.guessRemote` is set, silently tracks a same-named remote branch instead. A
- * run's branch and base are decisions `wrk` has already made by this point; neither is
- * something a directory name or a config setting gets a vote in.
+ * **The start point is passed explicitly rather than left to git.** With `-b` and no
+ * commit-ish, `git worktree add` starts the branch at `from`'s own HEAD — which from a run
+ * worktree parked on `release` is `release`, not the repository's default branch. What a run
+ * branches from is a decision `wrk` has already made by this point, and it is not one the
+ * caller's current checkout gets a vote in.
  *
  * @param cwd - Anywhere in the repository: a checkout, a run worktree, the container, or
  *   `<container>/.bare`.
  * @param options - The branch to create, and optionally what to base it on.
  * @returns The absolute path of the new worktree and the branch in it — see {@link Created}.
- * @throws {@link Refusal} if `cwd`'s repository is not a bare-repo container, including when
- *   it is no repository at all.
+ * @throws {@link Refusal} if `cwd` is in no repository at all, or is in one that is not a
+ *   bare-repo container. The two carry different messages: only the second has something to
+ *   convert.
  * @throws {@link CommandFailed} if git refused — the branch already exists, the path is
  *   taken, the base does not resolve. It carries git's own exit status, which is what `wrk`
  *   exits with, so nothing here needs to map it.
@@ -119,19 +112,25 @@ export async function createWorktree(cwd: string, options: CreateOptions): Promi
   const { branch, base } = options;
   const from = (await checkoutFor(cwd)) ?? cwd;
 
-  // Concurrent because neither answer depends on the other and both are process spawns —
-  // the precedent `locate` sets for the same pair of probes.
-  const [container, bare] = await Promise.all([containerFor(from), isBareLayout(from)]);
-  if (container === null || !bare) {
+  // Sequential, not concurrent: `isBareLayout` opens by calling `containerFor` itself, so
+  // overlapping the two would race a probe against its own duplicate — and would spend the
+  // second spawn precisely where `repo.ts` documents `isBareLayout` as short-circuiting to
+  // avoid it, outside a repository.
+  const container = await containerFor(from);
+  if (container === null) {
+    throw new Refusal("not a git repository; run this from inside the repository to add to");
+  }
+
+  if (!(await isBareLayout(from))) {
     throw new Refusal(
       "not a bare-repo container, so there is nowhere to place a sibling worktree; convert it first with the repo-setup skill",
     );
   }
 
   const path = join(container, worktreeDirName(branch));
-  // `undefined` omits the start point rather than substituting one, leaving git to use the
-  // repository's HEAD — the only honest answer when no default branch resolves, and one that
-  // needs no extra branch here to express.
+  // `undefined` omits the start point rather than substituting one, leaving git to start the
+  // branch at `from`'s own HEAD — the only honest answer when no default branch resolves, and
+  // one that needs no extra branch here to express.
   await addWorktree(path, from, {
     branch,
     startPoint: base ?? (await resolveDefaultBranch(from)) ?? undefined,

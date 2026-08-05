@@ -129,16 +129,9 @@ export function emit(payload: object): void {
  * would not be a stricter answer, it would be a directory that cannot be entered.
  *
  * **A command uses this or {@link emit}, never both.** Both write to the one stdout, so a
- * run that called each would emit a document with a stray line glued to it, unparseable to
- * the `jq` caller and a nonexistent path to the hook — the single stream broken for both
+ * run that called each would emit a document with a stray line glued to it — unparseable to
+ * the `jq` caller and a nonexistent path to the hook, the single stream broken for both
  * consumers at once.
- *
- * Nothing is written on the failing path, and that is the property the hook's contract
- * actually rests on rather than a happy accident: a command builds its answer before it
- * prints, so a throw reaches `main`'s handler with stdout still untouched, and the caller
- * sees an empty stdout with a nonzero status. That matters because the `jq -er` filters on
- * the other side of this contract exit `0` on empty input — a run that failed while still
- * printing something would be read as a success.
  *
  * @param line - The text, without a trailing newline.
  */
