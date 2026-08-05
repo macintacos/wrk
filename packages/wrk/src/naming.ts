@@ -56,6 +56,15 @@ const ISSUE_KEY_RE = new RegExp(`^${ISSUE_KEY_PATTERN}$`);
 /** Longest descriptive slug, in characters, before a collision suffix is appended. */
 const MAX_SLUG_LENGTH = 40;
 
+/** Longest single path segment the filesystems this runs on accept. */
+const NAME_MAX = 255;
+
+/** Hex characters of sha256 kept as a cache slug's identity. */
+const CACHE_DIGEST_LENGTH = 8;
+
+/** Longest folded prefix that still leaves room for `-<digest>` within {@link NAME_MAX}. */
+const MAX_FOLDED_LENGTH = NAME_MAX - CACHE_DIGEST_LENGTH - 1;
+
 /** Slug used when a title survives slugification with nothing left. */
 const FALLBACK_SLUG = "work";
 
@@ -156,13 +165,27 @@ export function branchBelongsToIssue(branch: string, issue: string): boolean {
  * Callers that disagree about a cache key do not error — they silently stop sharing the
  * cache.
  *
+ * The folded prefix is capped at {@link MAX_FOLDED_LENGTH}, derived from
+ * {@link NAME_MAX} rather than written as a literal so that widening the digest cannot
+ * silently push the segment past what the filesystem accepts. Without the cap, a container
+ * path past roughly 246 characters produces a segment over `NAME_MAX` and every cache read
+ * and write for that repository fails `ENAMETOOLONG` with nothing degrading. The cut is
+ * taken from the *tail*, unlike {@link mintBranch}'s: this function's dominant input is a
+ * container path, whose front is `_Users_me_GitLocal` boilerplate and whose identifying
+ * component is last. A character-count `.slice` is byte-exact here even though `NAME_MAX`
+ * counts bytes, because the fold runs first and its output alphabet is single-byte ASCII.
+ *
+ * The digest is taken from the untouched `key`, never from the cut prefix — computing it
+ * after the cut would hand back exactly the collision the digest exists to prevent.
+ *
  * @param key - Any string used to key a cache — an issue identifier, a container path.
  * @returns A single path segment safe to join onto a cache root.
  */
 export function cacheSlug(key: string): string {
-  const digest = createHash("sha256").update(key).digest("hex").slice(0, 8);
+  const digest = createHash("sha256").update(key).digest("hex").slice(0, CACHE_DIGEST_LENGTH);
+  const folded = key.replace(/[^A-Za-z0-9._-]/gu, "_");
 
-  return `${key.replace(/[^A-Za-z0-9._-]/gu, "_")}-${digest}`;
+  return `${folded.slice(-MAX_FOLDED_LENGTH)}-${digest}`;
 }
 
 /**

@@ -174,6 +174,28 @@ describe("cacheSlug", () => {
     // give each process its own private cache.
     expect(cacheSlug("/Users/me/GitLocal/thing")).toBe(cacheSlug("/Users/me/GitLocal/thing"));
   });
+
+  test("caps the segment at NAME_MAX, digest intact", () => {
+    // A container path this deep produced a segment past 255 and made every read and
+    // write for that repository fail ENAMETOOLONG, with nothing degrading.
+    const deep = `/Users/me/${"nested/".repeat(50)}repo`;
+
+    expect(cacheSlug(deep)).toHaveLength(255);
+    expect(cacheSlug(deep)).toMatch(/-[0-9a-f]{8}$/);
+  });
+
+  test("separates two containers whose folded prefixes truncate to the same thing", () => {
+    // The head of the folded prefix is what gets cut, so these two survive truncation
+    // identical and collide on everything but the digest — which is exactly the collision
+    // EXC-1026 closed, reintroduced the moment the digest is computed from the cut prefix
+    // rather than from the untouched key. Switching the cut to the head means flipping
+    // these two paths to differ in their tails.
+    const a = `/one/${"x".repeat(300)}`;
+    const b = `/two/${"x".repeat(300)}`;
+
+    expect(cacheSlug(a).slice(0, -9)).toBe(cacheSlug(b).slice(0, -9));
+    expect(cacheSlug(a)).not.toBe(cacheSlug(b));
+  });
 });
 
 describe("mintBranch", () => {
