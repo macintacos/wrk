@@ -23,8 +23,9 @@ exclude = [
 siblings-only = true
 
 [MD013]
-# Reflow holds prose to the line length, but code blocks and tables can't be
-# wrapped to fit — exempt them so they don't fail an otherwise-clean file.
+# Reflow holds prose to the line length, but code can't be wrapped to fit —
+# exempt it so it doesn't fail an otherwise-clean file. (Tables are already
+# exempt by rumdl's own default.)
 line-length = 90
 reflow      = true
 reflow-mode = "normalize"

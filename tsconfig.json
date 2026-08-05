@@ -9,9 +9,7 @@
     "target": "ESNext",
     "moduleResolution": "bundler",
     "moduleDetection": "force",
-    "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
-    "resolveJsonModule": true,
     "noEmit": true,
     "strict": true,
     "skipLibCheck": true,
@@ -21,6 +19,19 @@
     "noImplicitOverride": true,
     "types": ["bun"]
   },
-  "include": ["packages/*/src/**/*.ts", "test/**/*.ts"],
-  "exclude": ["node_modules", "dist"]
+  // `.tsx` is in scope from the start even though no component exists yet: the
+  // picker is built on Ink, whose components are `.tsx`, and a file the type
+  // checker silently skips is a worse failure than one it loudly rejects. No
+  // `jsx` option until a package actually pulls in React — its absence is that
+  // loud rejection.
+  // Listed extension by extension: TypeScript's include globs support `*`, `?`
+  // and `**/`, but not brace expansion — `*.{ts,tsx}` matches nothing at all.
+  "include": [
+    "packages/*/src/**/*.ts",
+    "packages/*/src/**/*.tsx",
+    "packages/*/test/**/*.ts",
+    "packages/*/test/**/*.tsx",
+    "test/**/*.ts"
+  ],
+  "exclude": ["**/node_modules", "dist"]
 }

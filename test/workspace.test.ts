@@ -54,8 +54,9 @@ describe("workspace layout", () => {
 
 describe("typescript configuration", () => {
   test("the effective compiler options are strict", () => {
-    // `--showConfig` resolves `extends` chains and defaults, so this asserts what
-    // the compiler actually runs with rather than what one file happens to say.
+    // tsconfig.json carries comments, which `Bun.file().json()` rejects outright.
+    // `tsc --showConfig` is the parser that already understands the format, and it
+    // resolves any `extends` chain a later build config introduces.
     const shown = spawnSync(join(repoRoot, "node_modules", ".bin", "tsc"), [
       "--showConfig",
       "-p",

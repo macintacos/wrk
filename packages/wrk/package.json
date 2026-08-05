@@ -6,7 +6,8 @@
   "homepage": "https://github.com/macintacos/wrk",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/macintacos/wrk.git"
+    "url": "git+https://github.com/macintacos/wrk.git",
+    "directory": "packages/wrk"
   },
   "publishConfig": {
     "access": "public"

@@ -5,10 +5,10 @@ that currently lives as fish functions and a standalone Python script.
 
 The repository is a [Bun](https://bun.sh) workspace holding two published packages:
 
-| Package                  | Path               | What it is                                |
-| ------------------------ | ------------------ | ----------------------------------------- |
-| `@macintacos/wrk`        | `packages/wrk`     | The CLI. Installs a `wrk` binary.         |
-| `@macintacos/wrk-picker` | `packages/picker`  | The reusable inline terminal picker.      |
+| Package                  | Path              | What it is                           |
+| ------------------------ | ----------------- | ------------------------------------ |
+| `@macintacos/wrk`        | `packages/wrk`    | The CLI. Will install a `wrk` binary. |
+| `@macintacos/wrk-picker` | `packages/picker` | The reusable inline terminal picker.  |
 
 The bare npm name `wrk` is taken, so both packages publish under the `@macintacos` scope.
 
@@ -30,12 +30,16 @@ pre-push hooks are registered as a side effect of a normal setup.
 
 Four lanes, all defined in `hk.pkl`:
 
-| Lane          | Command                       | What it does                                     |
-| ------------- | ----------------------------- | ------------------------------------------------ |
-| **format**    | `hk fix --all --no-stage`     | Rewrites files into canonical form.              |
-| **lint**      | `hk check --all`              | Read-only: formatter diffs, lint rules, types.   |
-| **typecheck** | `hk run typecheck --all`      | `tsc --noEmit` across the workspace.             |
-| **test**      | `hk run test --all`           | `bun test`.                                      |
+| Lane      | Command                   | What it does                                   |
+| --------- | ------------------------- | ---------------------------------------------- |
+| format    | `hk fix --all --no-stage` | Rewrites files into canonical form.            |
+| lint      | `hk check --all`          | Read-only: formatter diffs, lint rules, types. |
+| typecheck | `hk run typecheck --all`  | `tsc --noEmit` across the workspace.           |
+| test      | `hk run test --all`       | `bun test`.                                    |
+
+Run the last two as `hk run <lane>`, never `hk <lane>` — `hk test` is hk's own fixture
+runner and `hk typecheck` is not a subcommand. Shorter `mise run` aliases arrive with the
+task runner in EXC-989.
 
 `pre-commit` runs the format and lint lanes in fix mode; `pre-push` runs the test lane.
 

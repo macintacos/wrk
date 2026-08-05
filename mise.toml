@@ -1,9 +1,6 @@
 [settings]
 # Commit mise.lock for reproducible, checksum-pinned tool versions.
 lockfile = true
-# Route mise's npm: backend through bun (it defaults to npm and never picks bun
-# on its own), matching the package manager the workspace itself uses.
-npm.package_manager = "bun"
 
 # HK_MISE routes hk's git-hook subprocesses through `mise x`, so each hook step
 # uses the versions pinned below — even for committers who never activated mise.
