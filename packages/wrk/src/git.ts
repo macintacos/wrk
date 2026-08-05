@@ -103,9 +103,9 @@ export function git(args: string[], cwd?: string): Promise<RunResult> {
  * `wrk` exit with git's own status: this is the one place every throwing wrapper in the
  * module routes through, so the code survives as a value here or it survives nowhere.
  *
- * Exported as {@link git}'s throwing twin, for a command whose single caller does not earn
- * a wrapper — `preflight`'s `fetch` / `switch` / `pull`, which must fail loudly. A command
- * that gains a second caller earns its wrapper then, and moves in here.
+ * Exported as {@link git}'s throwing twin, for a mutation whose single caller does not earn a
+ * wrapper of its own — a `fetch`, a `switch`, a `pull`. A command that gains a second caller
+ * earns its wrapper then, and moves in here.
  */
 export async function gitOk(args: string[], cwd?: string): Promise<string> {
   const { stdout, stderr, code } = await git(args, cwd);
@@ -232,8 +232,8 @@ export interface StatusOptions {
  * plain `git status` rewrites the refreshed index, so surveying several worktrees — or
  * running while an editor does its own background `status` — turns into an intermittent
  * "Unable to create index.lock" failure. The reported entries are unchanged; only the
- * cache write is skipped. It is also what lets a caller that must not touch the repository
- * at all — `preflight`, before it has decided anything — ask this question safely.
+ * cache write is skipped. It is also what lets a caller that must not touch the repository at
+ * all — one deciding whether it is allowed to — ask this question safely.
  *
  * @throws If git failed.
  */

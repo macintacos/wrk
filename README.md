@@ -96,7 +96,7 @@ answer to give, not that the answer was no.
 ## Agent commands
 
 `wrk agent preflight` is what an agent runs before it creates a worktree. It answers
-whether to proceed, and refuses — without touching anything — when it cannot.
+whether to proceed, and says stop — without touching anything — when it cannot.
 
 ```bash
 wrk agent preflight --issue EXC-997 [--base EXC-996/parent-slug]
@@ -105,14 +105,14 @@ wrk agent preflight --issue EXC-997 [--base EXC-996/parent-slug]
 `--base` is the stacked path: it skips the default-branch sync in its entirety — no fetch,
 no switch, no pull, no dirty check — while still running the layout and isolation checks.
 
-| verdict / reason             | What it means                                                                     |
-| ---------------------------- | --------------------------------------------------------------------------------- |
-| `proceed`                    | Create the worktree; `worktree_root` is the container to place it in.               |
-| `resumed`                    | Already in this issue's worktree. Create nothing.                                   |
-| `blocked` `container-cwd`    | Run from the container. `cd` into the default-branch checkout and re-run.           |
-| `blocked` `unconverted-repo` | Not a bare-repo container. `conversion_reference` names the skill that converts it. |
-| `blocked` `unrelated-worktree` | Inside a worktree for different work. Return to the default-branch checkout.       |
-| `blocked` `dirty-checkout`   | Tracked changes would block the switch or the pull. Nothing was modified.           |
+| verdict / reason                 | What it means                                                                       |
+| -------------------------------- | ----------------------------------------------------------------------------------- |
+| `proceed`                        | Create the worktree; `worktree_root` is the container to place it in.                 |
+| `resumed`                        | Already in this issue's worktree. Create nothing.                                     |
+| `blocked` / `container-cwd`      | Run from the container. `cd` into the default-branch checkout and re-run.             |
+| `blocked` / `unconverted-repo`   | Not a bare-repo container. `conversion_reference` names the skill that converts it.   |
+| `blocked` / `unrelated-worktree` | Inside a worktree for different work. Return to the default-branch checkout.          |
+| `blocked` / `dirty-checkout`     | Tracked changes would block the switch or the pull. Nothing was modified.             |
 
 The envelope carries nine keys on every run — `verdict`, `reason`, `repo_root`,
 `default_branch`, `base`, `current_branch`, `worktree_root`, `current_worktree`,

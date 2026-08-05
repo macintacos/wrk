@@ -24,7 +24,7 @@
  * exit rules — callers branch on the payload, never on the status, so a nonzero exit means
  * `wrk` has no answer at all rather than that the answer was no. Two failures do exit
  * nonzero, and neither is a verdict: a cwd in no repository (git's own `128`, through
- * {@link CommandFailed}) and a default branch that cannot be resolved on the syncing path (a
+ * `CommandFailed`) and a default branch that cannot be resolved on the syncing path (a
  * {@link Refusal}).
  *
  * Three deliberate divergences from the Python implementation this reproduces
@@ -38,6 +38,13 @@
  * - A default branch that resolves to nothing on the syncing path is a {@link Refusal}, where
  *   the Python reached `git switch HEAD` and died with git's status. There is genuinely
  *   nothing to sync to, and no verdict describes it.
+ *
+ * Every other difference from that implementation is internal and produces the same envelope:
+ * the post-sync branch and the switch decision are both known from values already in hand
+ * rather than re-read from git, saving two spawns. The one place to watch is `??` on the
+ * `base` field, which is exact where the Python's `or` was convenient — an explicitly empty
+ * `--base` is reported back rather than silently replaced by the default, because a caller
+ * that passed one has a bug this should not hide.
  *
  * @packageDocumentation
  */
@@ -128,7 +135,7 @@ export interface PreflightReport {
   /** The run worktree the run was invoked from, or `null` when invoked from a checkout. */
   readonly current_worktree: string | null;
 
-  /** {@link CONVERSION_REFERENCE}, set only on an `unconverted-repo` refusal. */
+  /** {@link CONVERSION_REFERENCE}, set only on the `unconverted-repo` verdict. */
   readonly conversion_reference: string | null;
 }
 
@@ -145,38 +152,38 @@ export interface PreflightOptions {
   base?: string;
 }
 
-/** The fields a call site of {@link report} varies; everything else is `null`. */
-interface ReportFields {
-  verdict: Verdict;
-  repoRoot: string;
-  reason?: BlockReason;
-  defaultBranch?: string | null;
-  base?: string | null;
-  currentBranch?: string | null;
-  worktreeRoot?: string;
-  currentWorktree?: string;
-  conversionReference?: string;
-}
+/**
+ * Every key, in contract order, each holding the value a verdict that never reached it
+ * reports. {@link report} spreads over this rather than restating the nine keys per call.
+ */
+const UNREACHED: PreflightReport = {
+  verdict: "blocked",
+  reason: null,
+  repo_root: "",
+  default_branch: null,
+  base: null,
+  current_branch: null,
+  worktree_root: null,
+  current_worktree: null,
+  conversion_reference: null,
+};
 
 /**
  * Builds the full nine-key report from the handful of fields a given verdict reached.
  *
  * One literal, written once, in contract order — which is what makes "never omits a key" and
  * "keys keep a fixed order" properties of this module rather than of each return statement's
- * discipline.
+ * discipline. The spread cannot disturb the order: a key already present keeps its original
+ * position when overwritten, so {@link UNREACHED} alone fixes it.
+ *
+ * @param fields - What this verdict reached. `verdict` and `repo_root` are required because
+ *   every verdict has both, and an empty `repo_root` is the one baseline value that would be
+ *   wrong rather than merely absent.
  */
-function report(fields: ReportFields): PreflightReport {
-  return {
-    verdict: fields.verdict,
-    reason: fields.reason ?? null,
-    repo_root: fields.repoRoot,
-    default_branch: fields.defaultBranch ?? null,
-    base: fields.base ?? null,
-    current_branch: fields.currentBranch ?? null,
-    worktree_root: fields.worktreeRoot ?? null,
-    current_worktree: fields.currentWorktree ?? null,
-    conversion_reference: fields.conversionReference ?? null,
-  };
+function report(
+  fields: Partial<PreflightReport> & Pick<PreflightReport, "verdict" | "repo_root">,
+): PreflightReport {
+  return { ...UNREACHED, ...fields };
 }
 
 /**
@@ -205,6 +212,11 @@ async function syncDefaultBranch(
   from: string | null,
 ): Promise<void> {
   const hasOrigin = (await git(["remote", "get-url", "origin"], cwd)).code === 0;
+  // ponytail: the explicit fetch and the pull below are two round trips to the same remote,
+  // which against a remote host is a second network wait on the critical path of every agent
+  // run. `merge --ff-only @{upstream}` would reuse the refs this fetch just wrote — but only
+  // where the upstream is on `origin`, which the guard below does not establish. Narrow that
+  // guard first if the latency ever matters.
   if (hasOrigin) await gitOk(["fetch", "origin"], cwd);
   if (from !== defaultBranch) await gitOk(["switch", defaultBranch], cwd);
 
@@ -225,15 +237,18 @@ async function syncDefaultBranch(
  * @param cwd - Directory the calling agent is running from. Defaults to this process's cwd.
  * @param options - See {@link PreflightOptions}.
  * @returns The verdict, plus everything the caller needs in order to act on it.
- * @throws {@link CommandFailed} if `cwd` is in no repository at all — a caller error rather
- *   than a verdict, since none of the four describes it and no advice they carry would help —
- *   or if a git command in the sync failed outright.
+ * @throws `CommandFailed` if `cwd` is in no repository at all — a caller error rather than a
+ *   verdict, since none of the four describes it and no advice they carry would help — or if
+ *   a git command in the sync failed outright.
  * @throws {@link Refusal} if the default branch cannot be resolved on the syncing path.
  *
  * @example
  * ```ts
  * const answer = await preflight("EXC-997");
- * if (answer.verdict === "proceed") await addWorktree(join(answer.worktree_root, dir));
+ * // Nine flat keys rather than a union per verdict, so the container is checked, not narrowed.
+ * if (answer.verdict === "proceed" && answer.worktree_root !== null) {
+ *   await addWorktree(join(answer.worktree_root, worktreeDirName(branch)));
+ * }
  * ```
  */
 export async function preflight(
@@ -243,17 +258,18 @@ export async function preflight(
 ): Promise<PreflightReport> {
   const here = cwd ?? process.cwd();
 
-  // 1. Is there a work tree here? The probe is *checked*, so the two ways it can answer "no"
-  //    stay distinct: a bare repository says "false" at exit 0, while a directory in no
-  //    repository at all exits 128 and throws. Collapsing them would hand a caller with no
-  //    checkout below it the container verdict's "cd into the checkout below" advice.
-  //    Concurrent with `locate` because neither depends on the other and both are spawns.
-  const [inWorkTree, where] = await Promise.all([
+  // 1. Is there a work tree here? `locate` answers all three states as values, "no repository
+  //    at all" among them — so the probe beside it exists only to make git itself raise that
+  //    one, as its own 128 through `CommandFailed`. Its return value is discarded, because
+  //    `where.kind` already carries the answer. Without the probe a cwd in no repository would
+  //    be handed the container verdict's "cd into the checkout below" advice, and it has no
+  //    checkout below it. Concurrent: neither depends on the other and both are spawns.
+  const [, where] = await Promise.all([
     gitOk(["rev-parse", "--is-inside-work-tree"], cwd),
     locate(cwd),
   ]);
-  if (inWorkTree.trim() !== "true" || where.kind !== "checkout") {
-    return report({ verdict: "blocked", reason: "container-cwd", repoRoot: here });
+  if (where.kind !== "checkout") {
+    return report({ verdict: "blocked", reason: "container-cwd", repo_root: here });
   }
 
   const [bare, branch] = await Promise.all([isBareLayout(cwd), currentBranch(cwd)]);
@@ -264,9 +280,9 @@ export async function preflight(
     return report({
       verdict: "blocked",
       reason: "unconverted-repo",
-      repoRoot: where.root,
-      currentBranch: branch,
-      conversionReference: CONVERSION_REFERENCE,
+      repo_root: where.root,
+      current_branch: branch,
+      conversion_reference: CONVERSION_REFERENCE,
     });
   }
 
@@ -277,17 +293,17 @@ export async function preflight(
       return report({
         verdict: "blocked",
         reason: "unrelated-worktree",
-        repoRoot: where.root,
-        currentBranch: branch,
-        currentWorktree: where.root,
+        repo_root: where.root,
+        current_branch: branch,
+        current_worktree: where.root,
       });
     }
 
     return report({
       verdict: "resumed",
-      repoRoot: where.root,
-      currentBranch: branch,
-      currentWorktree: where.root,
+      repo_root: where.root,
+      current_branch: branch,
+      current_worktree: where.root,
     });
   }
 
@@ -303,10 +319,10 @@ export async function preflight(
       return report({
         verdict: "blocked",
         reason: "dirty-checkout",
-        repoRoot: where.root,
-        defaultBranch,
+        repo_root: where.root,
+        default_branch: defaultBranch,
         base: defaultBranch,
-        currentBranch: branch,
+        current_branch: branch,
       });
     }
 
@@ -317,6 +333,9 @@ export async function preflight(
       );
     }
 
+    // From the checkout root rather than `cwd`, the one call here that does not take `cwd`
+    // verbatim: a switch can remove the subdirectory `cwd` names, and the `@{upstream}` read
+    // after it would then run from a path that no longer exists.
     await syncDefaultBranch(where.root, defaultBranch, branch);
     // Known rather than re-read: the sync above either switched to this branch or was already
     // on it, and a fast-forward pull does not rename it. One spawn saved to learn what the
@@ -326,10 +345,10 @@ export async function preflight(
 
   return report({
     verdict: "proceed",
-    repoRoot: where.root,
-    defaultBranch,
+    repo_root: where.root,
+    default_branch: defaultBranch,
     base: options.base ?? defaultBranch,
-    currentBranch: current,
-    worktreeRoot: where.container,
+    current_branch: current,
+    worktree_root: where.container,
   });
 }

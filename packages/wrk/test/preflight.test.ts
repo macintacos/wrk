@@ -22,6 +22,7 @@ import { lstatSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSyn
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { Refusal } from "../src/output";
 import { type PreflightReport, preflight } from "../src/preflight";
 import { type RunResult, run } from "../src/proc";
 
@@ -401,14 +402,46 @@ describe("--base", () => {
     );
   });
 
-  test("leaves the dirty checkout untouched, since it never syncs", async () => {
-    const { checkout } = makeLayout(seed);
+  test("leaves the repository untouched, since it never syncs", async () => {
+    // Manifested over the *container*, not the checkout: a linked worktree's `.git` is a file,
+    // so a recursive walk of the checkout never descends into the common git dir — which is
+    // exactly where a `fetch` writes `FETCH_HEAD`. And `FETCH_HEAD` is the only artifact this
+    // fixture would produce, since the checkout is already on `main` (no switch) and a bare
+    // clone leaves `main` with no upstream (no pull). Pointed at the checkout, this case would
+    // pass an implementation that ignored the "no fetch" half of `--base` entirely.
+    const { container, checkout } = makeLayout(seed);
     writeFileSync(join(checkout, "tracked.txt"), "after\n");
-    const before = manifest(checkout);
+    const before = manifest(container);
 
     await preflight("EXC-1", checkout, { base: "EXC-0/parent" });
 
-    expect(manifest(checkout)).toEqual(before);
+    expect(manifest(container)).toEqual(before);
+  });
+});
+
+describe("the refusal path", () => {
+  test("refuses, rather than reporting a verdict, with no default branch to sync", async () => {
+    // Not one of the four block reasons and deliberately so: there is nothing to sync to, so
+    // there is no answer to give. The two things a caller sees are exit 1 and an empty stdout,
+    // which is what a future refactor into a fourth verdict would silently break.
+    const own = makeContainer(makeRepo("weird"));
+    fixtureGit(["worktree", "add", "-q", "--detach", join(own, "co"), "HEAD"], own);
+
+    await expect(preflight("EXC-1", join(own, "co"))).rejects.toBeInstanceOf(Refusal);
+  });
+
+  test("is skipped under --base, which needs no default branch", async () => {
+    const own = makeContainer(makeRepo("weird"));
+    fixtureGit(["worktree", "add", "-q", "--detach", join(own, "co"), "HEAD"], own);
+
+    expect(await preflight("EXC-1", join(own, "co"), { base: "EXC-0/parent" })).toEqual(
+      expected({
+        verdict: "proceed",
+        repo_root: join(own, "co"),
+        base: "EXC-0/parent",
+        worktree_root: own,
+      }),
+    );
   });
 });
 
