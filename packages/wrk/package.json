@@ -16,6 +16,8 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
-    "@macintacos/wrk-picker": "workspace:*"
+    "@macintacos/wrk-picker": "workspace:*",
+    "smol-toml": "^1.7.1",
+    "zod": "^4.4.3"
   }
 }
