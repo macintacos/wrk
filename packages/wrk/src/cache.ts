@@ -54,7 +54,13 @@ const NAMESPACE = "wrk";
 
 /** Identifies one cache entry. */
 export interface CacheKey {
-  /** Entry name within the per-repo directory, e.g. `"pr-graph"`. */
+  /**
+   * Entry name within the per-repo directory, e.g. `"pr-graph"`.
+   *
+   * Short by contract: {@link cacheSlug} spends the whole segment budget on its own digest,
+   * and the staging and lock paths below append to what it returns, so a name past roughly
+   * 230 characters makes those siblings `ENAMETOOLONG` while the entry itself still fits.
+   */
   name: string;
 
   /**
@@ -272,8 +278,9 @@ export async function readCache(key: CacheKey): Promise<string | null> {
  *
  * @param key - The entry to replace.
  * @param value - The contents to store.
- * @throws If the directory cannot be created, or the write or rename fails. The staging
- * file is removed first, so a failure leaves no debris beside the entry.
+ * @throws If the directory cannot be created, or the write or rename fails. Removing the
+ * staging file is best-effort: a cleanup that itself fails is swallowed rather than
+ * replacing the error the caller needs, so a failed write can leave a `.tmp` behind.
  */
 // ponytail: a process killed between the write and the rename leaves its staging file
 // behind, and nothing reaps them. Sweep `*.tmp` older than a day here if they ever pile up.
@@ -286,9 +293,8 @@ export async function writeCache(key: CacheKey, value: string): Promise<void> {
     await writeFile(staging, value, "utf8");
     await rename(staging, path);
   } catch (error) {
-    // Swallowed so a failed cleanup cannot replace the write error the caller needs — the
-    // same hazard the `finally` in `cached` documents, which also carries why `force: true`
-    // is not enough on its own.
+    // Swallowed so a failed cleanup — an unwritable directory being the likely reason the
+    // write failed in the first place — cannot replace the error the caller needs.
     await rm(staging, { force: true }).catch(() => undefined);
     throw error;
   }
@@ -396,9 +402,10 @@ export async function cached(
     // `finally` replaces whatever the block was returning, so a cleanup that failed would
     // discard a refresh that had already succeeded and reached disk. And `force: true` does
     // not make this infallible on Bun: concurrent `rm` of one directory rejects `EFAULT`
-    // there — measured at 917 of 8000 calls, against 0 of 8000 on Node — which an abandoned
-    // lock produces by design, since every caller in that burst releases it on the way out.
-    // https://github.com/oven-sh/bun/issues/36984
+    // there — roughly 11% at 8-way on Bun 1.3.14, and not at all on Node — which an
+    // abandoned lock produces by design, since every caller in that burst releases it on
+    // the way out. `recursive: true` is what triggers it, so dropping it is not a reason to
+    // think this `.catch` became redundant. https://github.com/oven-sh/bun/issues/36984
     if (claimed !== null) {
       await rm(lock, { recursive: true, force: true }).catch(() => undefined);
     }

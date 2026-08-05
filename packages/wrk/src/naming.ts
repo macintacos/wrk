@@ -56,7 +56,14 @@ const ISSUE_KEY_RE = new RegExp(`^${ISSUE_KEY_PATTERN}$`);
 /** Longest descriptive slug, in characters, before a collision suffix is appended. */
 const MAX_SLUG_LENGTH = 40;
 
-/** Longest single path segment the filesystems this runs on accept. */
+/** Slug used when a title survives slugification with nothing left. */
+const FALLBACK_SLUG = "work";
+
+/**
+ * Longest single path segment, in bytes, that APFS, ext4, btrfs and xfs all accept.
+ *
+ * Hard-coded rather than probed, which is what keeps this module free of syscalls.
+ */
 const NAME_MAX = 255;
 
 /** Hex characters of sha256 kept as a cache slug's identity. */
@@ -64,9 +71,6 @@ const CACHE_DIGEST_LENGTH = 8;
 
 /** Longest folded prefix that still leaves room for `-<digest>` within {@link NAME_MAX}. */
 const MAX_FOLDED_LENGTH = NAME_MAX - CACHE_DIGEST_LENGTH - 1;
-
-/** Slug used when a title survives slugification with nothing left. */
-const FALLBACK_SLUG = "work";
 
 /**
  * Folds every `/` in a string to `+`.
@@ -165,12 +169,10 @@ export function branchBelongsToIssue(branch: string, issue: string): boolean {
  * Callers that disagree about a cache key do not error — they silently stop sharing the
  * cache.
  *
- * The folded prefix is capped at {@link MAX_FOLDED_LENGTH}, derived from
- * {@link NAME_MAX} rather than written as a literal so that widening the digest cannot
- * silently push the segment past what the filesystem accepts. Without the cap, a container
- * path past roughly 246 characters produces a segment over `NAME_MAX` and every cache read
- * and write for that repository fails `ENAMETOOLONG` with nothing degrading. The cut is
- * taken from the *tail*, unlike {@link mintBranch}'s: this function's dominant input is a
+ * The folded prefix is capped at {@link MAX_FOLDED_LENGTH}. Without the cap, a container
+ * path past roughly 246 characters produces a segment over {@link NAME_MAX}, and every
+ * cache read and write for that repository fails `ENAMETOOLONG` with nothing degrading.
+ * The cut is taken from the *tail*, unlike {@link mintBranch}'s: this function's input is a
  * container path, whose front is `_Users_me_GitLocal` boilerplate and whose identifying
  * component is last. A character-count `.slice` is byte-exact here even though `NAME_MAX`
  * counts bytes, because the fold runs first and its output alphabet is single-byte ASCII.
