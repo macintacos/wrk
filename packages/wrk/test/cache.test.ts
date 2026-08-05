@@ -27,12 +27,23 @@ import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { cached, cachePath, readCache, writeCache } from "../src/cache";
+import { cacheSlug } from "../src/naming";
 
 /** A container path with enough separators to prove the per-repo directory is flattened. */
 const CONTAINER = "/Users/me/GitLocal/thing";
 
-/** What {@link CONTAINER} must collapse to — one segment, separators folded to `_`. */
-const CONTAINER_SLUG = "_Users_me_GitLocal_thing";
+/** The entry name every case here reads and writes. */
+const ENTRY = "pr-graph";
+
+/**
+ * The directory and file {@link CONTAINER} and {@link ENTRY} land in.
+ *
+ * Derived rather than spelled out. What these cases assert is that `cachePath` routes
+ * both segments through `cacheSlug` at all — a literal would pin `cacheSlug`'s output
+ * here as well, in a suite that does not own that rule and cannot explain it.
+ */
+const CONTAINER_SLUG = cacheSlug(CONTAINER);
+const ENTRY_SLUG = cacheSlug(ENTRY);
 
 /** Runs `body` against a throwaway cache root, removed afterwards even on failure. */
 async function withRoot(body: (root: string) => Promise<void>): Promise<void> {
@@ -72,16 +83,16 @@ async function age(path: string, ms: number): Promise<void> {
 describe("cachePath", () => {
   test("roots under $XDG_CACHE_HOME when it is an absolute path", () => {
     withXdgCacheHome("/xdg/cache", () => {
-      expect(cachePath({ name: "pr-graph", container: CONTAINER })).toBe(
-        join("/xdg/cache", "wrk", CONTAINER_SLUG, "pr-graph"),
+      expect(cachePath({ name: ENTRY, container: CONTAINER })).toBe(
+        join("/xdg/cache", "wrk", CONTAINER_SLUG, ENTRY_SLUG),
       );
     });
   });
 
   test("falls back to $HOME/.cache when XDG_CACHE_HOME is unset", () => {
     withXdgCacheHome(undefined, () => {
-      expect(cachePath({ name: "pr-graph", container: CONTAINER })).toBe(
-        join(homedir(), ".cache", "wrk", CONTAINER_SLUG, "pr-graph"),
+      expect(cachePath({ name: ENTRY, container: CONTAINER })).toBe(
+        join(homedir(), ".cache", "wrk", CONTAINER_SLUG, ENTRY_SLUG),
       );
     });
   });
@@ -91,8 +102,8 @@ describe("cachePath", () => {
     // literally would `join("", …)` into a relative path under whatever directory the user
     // happened to be standing in.
     withXdgCacheHome("", () => {
-      expect(cachePath({ name: "pr-graph", container: CONTAINER })).toBe(
-        join(homedir(), ".cache", "wrk", CONTAINER_SLUG, "pr-graph"),
+      expect(cachePath({ name: ENTRY, container: CONTAINER })).toBe(
+        join(homedir(), ".cache", "wrk", CONTAINER_SLUG, ENTRY_SLUG),
       );
     });
   });
@@ -100,15 +111,18 @@ describe("cachePath", () => {
   test("falls back when XDG_CACHE_HOME is relative", () => {
     // Required by the XDG base directory spec: a relative value is invalid and ignored.
     withXdgCacheHome("relative/cache", () => {
-      expect(cachePath({ name: "pr-graph", container: CONTAINER })).toBe(
-        join(homedir(), ".cache", "wrk", CONTAINER_SLUG, "pr-graph"),
+      expect(cachePath({ name: ENTRY, container: CONTAINER })).toBe(
+        join(homedir(), ".cache", "wrk", CONTAINER_SLUG, ENTRY_SLUG),
       );
     });
   });
 
   test("keys the per-repo directory on the container path, separators folded", () => {
-    expect(cachePath({ name: "pr-graph", container: CONTAINER, root: "/root" })).toBe(
-      join("/root", CONTAINER_SLUG, "pr-graph"),
+    // Spelled out rather than derived, and the only case here that is. Every other
+    // assertion in this block composes `cacheSlug` with itself, which would keep passing
+    // if `cachePath` stopped folding the container at all.
+    expect(cachePath({ name: ENTRY, container: CONTAINER, root: "/root" })).toMatch(
+      /^\/root\/_Users_me_GitLocal_thing-[0-9a-f]{8}\/pr-graph-[0-9a-f]{8}$/,
     );
   });
 
@@ -116,7 +130,7 @@ describe("cachePath", () => {
     // The traversal `cacheSlug` was fixed for: a container of `..` must not resolve to the
     // cache root's parent. Asserted here as well as in the naming suite because this is the
     // call site where escaping the root would actually matter.
-    const path = cachePath({ name: "pr-graph", container: "..", root: "/root" });
+    const path = cachePath({ name: ENTRY, container: "..", root: "/root" });
 
     expect(path.startsWith("/root/")).toBe(true);
   });
@@ -131,7 +145,7 @@ describe("cachePath", () => {
 describe("writeCache", () => {
   test("creates the per-repo directory and round-trips through readCache", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
 
       await writeCache(key, "one\ttwo\n");
 
@@ -141,17 +155,17 @@ describe("writeCache", () => {
 
   test("leaves no temp file behind", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
 
       await writeCache(key, "value");
 
-      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual(["pr-graph"]);
+      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual([ENTRY_SLUG]);
     });
   });
 
   test("replaces an existing entry rather than appending to it", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
 
       await writeCache(key, "old");
       await writeCache(key, "new");
@@ -168,7 +182,7 @@ describe("writeCache", () => {
     // File permissions are not a usable witness: Bun writes straight through a read-only
     // entry the process owns, so a 0444 entry proves nothing about which call replaced it.
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       await writeCache(key, "old");
       const before = (await stat(cachePath(key))).ino;
 
@@ -183,7 +197,7 @@ describe("writeCache", () => {
     // temp file: the first rename publishes the second's bytes and the second rename fails
     // with ENOENT, so a caller whose promise resolved did not write what is on disk.
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       const first = "a".repeat(4_000_000);
       const second = "b".repeat(4_000_000);
 
@@ -192,7 +206,7 @@ describe("writeCache", () => {
       expect(settled.map((outcome) => outcome.status)).toEqual(["fulfilled", "fulfilled"]);
       const stored = await readCache(key);
       expect(stored === first || stored === second).toBe(true);
-      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual(["pr-graph"]);
+      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual([ENTRY_SLUG]);
     });
   });
 
@@ -201,7 +215,7 @@ describe("writeCache", () => {
     // way to prove it cleans up after itself: a non-empty directory standing where the
     // entry belongs cannot be renamed over, so `writeCache` throws after staging its value.
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       const path = cachePath(key);
       await mkdir(path, { recursive: true });
       await writeFile(join(path, "occupant"), "not the cache's to delete");
@@ -209,7 +223,7 @@ describe("writeCache", () => {
       await expect(writeCache(key, "value")).rejects.toThrow();
 
       expect(await readdir(path)).toEqual(["occupant"]);
-      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual(["pr-graph"]);
+      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual([ENTRY_SLUG]);
     });
   });
 
@@ -217,7 +231,7 @@ describe("writeCache", () => {
     // The cleanup path removes its own staging file by name and nothing else, so another
     // process's half-written file survives a write here.
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       await writeCache(key, "seed");
       const foreign = `${cachePath(key)}.999999.tmp`;
       await writeFile(foreign, "someone else's half-written file");
@@ -245,13 +259,13 @@ describe("readCache", () => {
     await withRoot(async (root) => {
       await writeFile(join(root, CONTAINER_SLUG), "not a directory");
 
-      await expect(readCache({ name: "pr-graph", container: CONTAINER, root })).rejects.toThrow();
+      await expect(readCache({ name: ENTRY, container: CONTAINER, root })).rejects.toThrow();
     });
   });
 
   test("returns a stale entry — age is `cached`'s concern, not this one's", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       await writeCache(key, "ancient");
       await age(cachePath(key), 86_400_000);
 
@@ -263,7 +277,7 @@ describe("readCache", () => {
 describe("cached", () => {
   test("serves a fresh entry without calling refresh", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       await writeCache(key, "fresh");
       let calls = 0;
 
@@ -279,7 +293,7 @@ describe("cached", () => {
 
   test("refreshes an entry older than the TTL and writes the result back", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       await writeCache(key, "stale");
       await age(cachePath(key), 90_000);
 
@@ -292,7 +306,7 @@ describe("cached", () => {
 
   test("refreshes when there is no entry at all", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
 
       expect(await cached(key, 60_000, async () => "first")).toBe("first");
       expect(await readCache(key)).toBe("first");
@@ -301,7 +315,7 @@ describe("cached", () => {
 
   test("keeps the previous entry byte-identical when refresh rejects", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       await writeCache(key, "previous");
       await age(cachePath(key), 90_000);
 
@@ -309,7 +323,7 @@ describe("cached", () => {
 
       expect(value).toBe("previous");
       expect(await readFile(cachePath(key), "utf8")).toBe("previous");
-      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual(["pr-graph"]);
+      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual([ENTRY_SLUG]);
     });
   });
 
@@ -319,7 +333,7 @@ describe("cached", () => {
     // one, and the caller is handed stale text it had already paid the round-trip to
     // replace.
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       await writeCache(key, "previous");
       await age(cachePath(key), 90_000);
       const dir = join(root, CONTAINER_SLUG);
@@ -336,7 +350,7 @@ describe("cached", () => {
 
   test("propagates the failure when refresh rejects and nothing was cached", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
 
       await expect(
         cached(key, 60_000, () => Promise.reject(new Error("gh exploded"))),
@@ -346,7 +360,7 @@ describe("cached", () => {
 
   test("debounces a second call made while the first is still refreshing", async () => {
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       await writeCache(key, "old");
       await age(cachePath(key), 90_000);
 
@@ -394,7 +408,7 @@ describe("cached", () => {
       const refreshes: number[] = [];
 
       for (let burst = 0; burst < 3; burst++) {
-        const key = { name: "pr-graph", container: CONTAINER, root: join(root, `burst-${burst}`) };
+        const key = { name: ENTRY, container: CONTAINER, root: join(root, `burst-${burst}`) };
         await writeCache(key, "stale");
         await age(cachePath(key), 90_000);
 
@@ -441,7 +455,7 @@ describe("cached", () => {
     // to stamp and no way to debounce the first burst; the tempting fix — staking a claim by
     // writing the entry early — would hand a concurrent reader `""` as a valid value.
     await withRoot(async (root) => {
-      const key = { name: "pr-graph", container: CONTAINER, root };
+      const key = { name: ENTRY, container: CONTAINER, root };
       const started = Promise.withResolvers<void>();
       const finish = Promise.withResolvers<string>();
 

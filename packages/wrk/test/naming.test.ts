@@ -122,37 +122,42 @@ describe("branchBelongsToIssue", () => {
 });
 
 describe("cacheSlug", () => {
-  test("passes a plain issue key through unchanged", () => {
-    expect(cacheSlug("EXC-992")).toBe("EXC-992");
+  // The fold is asserted by regex throughout, with the digest matched as opaque hex. The
+  // fold is this suite's subject and stays pinned character for character; the digest's
+  // value is arithmetic nobody should have to re-derive to read a test.
+  test("passes a plain issue key through, suffixed", () => {
+    expect(cacheSlug("EXC-992")).toMatch(/^EXC-992-[0-9a-f]{8}$/);
   });
 
   test("flattens a path into a single filesystem-safe segment", () => {
     // Supersedes the fish `/` -> `_` form: every slash still folds, and the characters it
     // left alone are made safe too.
-    expect(cacheSlug("/Users/j/GitLocal/wrk")).toBe("_Users_j_GitLocal_wrk");
+    expect(cacheSlug("/Users/j/GitLocal/wrk")).toMatch(/^_Users_j_GitLocal_wrk-[0-9a-f]{8}$/);
   });
 
   test("keeps dots, underscores and dashes", () => {
-    expect(cacheSlug("wrk-1.2_beta")).toBe("wrk-1.2_beta");
+    expect(cacheSlug("wrk-1.2_beta")).toMatch(/^wrk-1\.2_beta-[0-9a-f]{8}$/);
   });
 
   test("replaces a multibyte character once, not once per code unit", () => {
     // U+1F600 is four UTF-8 bytes and two UTF-16 code units, so a byte-wise sanitizer
     // yields four underscores and a `u`-less regex yields two. Callers that disagree on a
     // cache key do not error — they silently stop sharing the cache.
-    expect(cacheSlug("a😀b")).toBe("a_b");
+    expect(cacheSlug("a😀b")).toMatch(/^a_b-[0-9a-f]{8}$/);
   });
 
   test("does not emit a key that would climb out of the cache directory", () => {
     // `.` and `..` survive the allowed alphabet intact, so a key joined onto a cache root
     // would resolve to the parent directory. Slashes fold, so one level is the whole
     // exposure — but this function's callers are entitled to treat its output as inert.
-    expect(cacheSlug("..")).toBe("__");
-    expect(cacheSlug(".")).toBe("_");
+    // The suffix is what rules both out, and the same suffix keeps them apart.
+    expect(cacheSlug("..")).not.toBe("..");
+    expect(cacheSlug(".")).not.toBe(".");
+    expect(cacheSlug("..")).not.toBe(cacheSlug("."));
   });
 
   test("keeps dots that are not the entire key", () => {
-    expect(cacheSlug("v1.2.3")).toBe("v1.2.3");
+    expect(cacheSlug("v1.2.3")).toMatch(/^v1\.2\.3-[0-9a-f]{8}$/);
   });
 
   test("does not give two containers differing only by separator the same slug", () => {
@@ -160,6 +165,13 @@ describe("cacheSlug", () => {
     // alone these two repositories share one cache entry and each is served the other's
     // data — with no error anywhere, because both agree on the key.
     expect(cacheSlug("/Users/me/GitLocal/thing")).not.toBe(cacheSlug("/Users/me/GitLocal_thing"));
+  });
+
+  test("is stable across calls, so two processes agree on an entry", () => {
+    // The whole point of the cache. A disambiguator drawn from the environment rather
+    // than the key — a counter, a pid, a timestamp — would satisfy every case above and
+    // give each process its own private cache.
+    expect(cacheSlug("/Users/me/GitLocal/thing")).toBe(cacheSlug("/Users/me/GitLocal/thing"));
   });
 });
 
