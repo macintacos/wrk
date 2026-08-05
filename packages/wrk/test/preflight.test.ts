@@ -18,7 +18,15 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { lstatSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readdirSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -109,6 +117,47 @@ function addNewCheckout(container: string, dirName: string, branch: string): str
 function makeLayout(seed: string): { container: string; checkout: string } {
   const container = makeContainer(seed);
   return { container, checkout: addCheckout(container, "main", "main") };
+}
+
+/**
+ * A container built the way `convert.ts`'s recipe builds one, rather than the way
+ * {@link makeContainer} does.
+ *
+ * The difference is the whole point for the concurrency cases below. `clone --bare`
+ * configures no fetch refspec and leaves the branch with no upstream, so `pull --ff-only` is
+ * never reached and the sync collapses to a lone `fetch`. The recipe adds the refspec, the
+ * remote-tracking refs, `origin/HEAD` and the branch's upstream — which is what a converted
+ * repository really looks like, and the only shape in which the sync runs in full.
+ */
+function makeConvertedLayout(seed: string): { container: string; checkout: string } {
+  const container = makeContainer(seed);
+  const bare = join(container, ".bare");
+  fixtureGit(["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"], bare);
+  fixtureGit(["fetch", "-q", "origin"], bare);
+  fixtureGit(["remote", "set-head", "origin", "-a"], bare);
+
+  const checkout = addCheckout(container, "main", "main");
+  fixtureGit(["branch", "--quiet", "--set-upstream-to=origin/main", "main"], checkout);
+  return { container, checkout };
+}
+
+/** Commits `name` to a seed repository, leaving every container cloned from it behind. */
+function commitToSeed(seed: string, name: string): void {
+  writeFileSync(join(seed, name), "later\n");
+  fixtureGit(["add", name], seed);
+  fixtureGit([...AUTHOR, "commit", "-q", "-m", name], seed);
+}
+
+/**
+ * The real CLI entry point, run as a child.
+ *
+ * A child rather than `main(argv, program)` in process, because what the cases using this
+ * are about is the exit status and which stream each byte reached — neither observable from
+ * inside the process producing them — and, for the concurrency cases, because `FETCH_HEAD`
+ * and `index.lock` are contended between operating-system processes.
+ */
+function wrk(args: string[], cwd: string): Promise<RunResult> {
+  return run(process.execPath, [join(import.meta.dir, "../src/cli.ts"), ...args], { cwd });
 }
 
 /**
@@ -488,17 +537,6 @@ describe("a blocked verdict leaves the repository byte-identical", () => {
 });
 
 describe("wrk agent preflight", () => {
-  /**
-   * The real CLI entry point, run as a child.
-   *
-   * A child rather than `main(argv, program)` in process, because what these cases are about
-   * is the exit status and which stream each byte reached — neither observable from inside
-   * the process producing them.
-   */
-  function wrk(args: string[], cwd: string): Promise<RunResult> {
-    return run(process.execPath, [join(import.meta.dir, "../src/cli.ts"), ...args], { cwd });
-  }
-
   test("exits 0 on proceed and prints one parseable object on stdout", async () => {
     const { container, checkout } = makeLayout(seed);
     const result = await wrk(["agent", "preflight", "--issue", "EXC-1"], checkout);
@@ -560,5 +598,94 @@ describe("wrk agent preflight", () => {
     expect(result.code).toBe(128);
     expect(result.stdout).toBe("");
     expect(result.stderr).toStartWith("wrk: ");
+  });
+});
+
+describe("concurrent runs against one container", () => {
+  /**
+   * How many preflights race. Two is what the issue asks for; four makes the collision
+   * reliable enough to fail a regression rather than to flake into passing one.
+   */
+  const RACERS = 4;
+
+  /**
+   * A converted container whose checkout is genuinely behind its remote, so the sync has real
+   * work to do.
+   *
+   * Every collision this suite is about needs the sync to reach its end: `FETCH_HEAD` is
+   * written by the fetch, and the index and the work tree are rewritten by the fast-forward.
+   * A checkout already up to date exercises none of it, so the seed gains a commit *after*
+   * the container is cloned from it.
+   */
+  function makeBehindLayout(): { container: string; checkout: string } {
+    const seed = makeRepo();
+    const layout = makeConvertedLayout(seed);
+    commitToSeed(seed, "later.txt");
+    return layout;
+  }
+
+  test("all of them proceed, and none is told the checkout is dirty", async () => {
+    // The regression. Preflight mutates the *shared* default-branch checkout, and every
+    // checkout in a container shares one common git dir, so two runs overlapping collide
+    // three ways: `FETCH_HEAD` is one file, which two fetches leave holding more than one
+    // merge candidate — `fatal: Cannot fast-forward to multiple branches`, exit 128, empty
+    // stdout; `index.lock` is taken by both the switch and the pull's merge and has no retry
+    // timeout, so the loser fails outright; and `git status`, which decides the
+    // `dirty-checkout` verdict, reads the old index while the pull is part-way through
+    // writing the new work tree, so a clean checkout reports as dirty.
+    //
+    // The third is the one worth asserting the *whole* envelope over: it is not a crash but a
+    // wrong answer, and a caller that branches on `.verdict` acts on it.
+    const { container, checkout } = makeBehindLayout();
+
+    const results = await Promise.all(
+      Array.from({ length: RACERS }, () =>
+        wrk(["agent", "preflight", "--issue", "EXC-1"], checkout),
+      ),
+    );
+
+    for (const result of results) {
+      expect({ code: result.code, stderr: result.stderr }).toEqual({ code: 0, stderr: "" });
+      expect(JSON.parse(result.stdout)).toEqual(
+        expected({
+          verdict: "proceed",
+          repo_root: checkout,
+          default_branch: "main",
+          base: "main",
+          current_branch: "main",
+          worktree_root: container,
+        }),
+      );
+    }
+  });
+
+  test("the checkout really was fast-forwarded, so the race window was real", async () => {
+    // Guards the fixture rather than the code. A container whose sync had nothing to do would
+    // pass the case above while contending for nothing at all, leaving the regression
+    // permanently green and permanently meaningless.
+    const { checkout } = makeBehindLayout();
+
+    await Promise.all(
+      Array.from({ length: RACERS }, () =>
+        wrk(["agent", "preflight", "--issue", "EXC-1"], checkout),
+      ),
+    );
+
+    expect(existsSync(join(checkout, "later.txt"))).toBe(true);
+  });
+
+  test("leaves no lock behind once the runs are over", async () => {
+    // The lock is `wrk`'s own file in the container, so it is `wrk`'s to remove. One left
+    // behind would be invisible for a full staleness window and then silently stop
+    // serialising anything.
+    const { container, checkout } = makeBehindLayout();
+
+    await Promise.all(
+      Array.from({ length: RACERS }, () =>
+        wrk(["agent", "preflight", "--issue", "EXC-1"], checkout),
+      ),
+    );
+
+    expect(readdirSync(container).filter((entry) => entry.includes("lock"))).toEqual([]);
   });
 });

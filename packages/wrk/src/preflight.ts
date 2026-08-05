@@ -14,11 +14,25 @@
  * place a sibling in outside the layout, and no sync to run from inside somebody else's
  * worktree.
  *
- * **Every check precedes the first mutation, so a `blocked` verdict leaves the repository
- * byte-identical.** That is what makes a blocking answer safe to act on: the caller is told
- * to stop and knows nothing moved, including no `FETCH_HEAD`. The only writes this module
- * performs are in {@link syncDefaultBranch}, reached last and only on the path that has
- * already decided to proceed.
+ * **Every check precedes the first mutation of the repository, so a `blocked` verdict leaves
+ * it byte-identical.** That is what makes a blocking answer safe to act on: the caller is
+ * told to stop and knows nothing moved, including no `FETCH_HEAD`. The only writes this
+ * module performs to the repository are in {@link syncDefaultBranch}, reached last and only
+ * on the path that has already decided to proceed. The one write outside it is
+ * {@link SYNC_LOCK}, a transient directory in the *container* beside the bare repository
+ * rather than inside it, removed before this function returns.
+ *
+ * **The sync is serialised across processes**, because the checkout it syncs is shared. Every
+ * checkout in a container has one common git dir between them, so two runs overlapping
+ * collide three ways: `FETCH_HEAD` is a single file, and two fetches leave it holding more
+ * than one merge candidate, which is `git pull`'s `fatal: Cannot fast-forward to multiple
+ * branches`; the remote-tracking refs are locked per ref, and a fetch that loses one fails
+ * outright; and `index.lock` is taken by both the switch and the pull's merge with no retry
+ * timeout behind it. A fourth is not a failure but a **wrong answer**: `git status` decides
+ * the `dirty-checkout` verdict from an index another run is part-way through replacing, so a
+ * clean checkout reports as dirty. The dirty check is therefore inside the critical section
+ * with the sync rather than in front of it. See [`./lock`](./lock) for the mutex itself, and
+ * why a waiter needs no timeout of its own.
  *
  * **`blocked` is a successful run.** Exit `0` for every verdict, per [`./output`](./output)'s
  * exit rules — callers branch on the payload, never on the status, so a nonzero exit means
@@ -49,9 +63,10 @@
  * @packageDocumentation
  */
 
-import { basename } from "node:path";
+import { basename, join } from "node:path";
 
 import { currentBranch, git, gitOk, statusPorcelain } from "./git";
+import { withLock } from "./lock";
 import { branchBelongsToIssue, isRunWorktree } from "./naming";
 import { Refusal } from "./output";
 import { isBareLayout, locate, resolveDefaultBranch } from "./repo";
@@ -90,6 +105,20 @@ export type BlockReason =
  * an invocation differently, so a name is the only form each can render in its own idiom.
  */
 const CONVERSION_REFERENCE = "repo-setup";
+
+/**
+ * Name of the lock directory serialising the default-branch sync, inside the container.
+ *
+ * **The container, because the container is the repository's identity** — `repo.ts`'s header
+ * is the argument, and the practical consequence is that two processes reaching this
+ * repository by any route derive the same path. A lock keyed off anything the environment
+ * supplies, an XDG cache root being the obvious candidate, serialises only the processes that
+ * happen to agree about that variable, which is not a mutex.
+ *
+ * Beside `.bare` rather than inside it: `git` owns the contents of its own directory, and
+ * this is not git's lock.
+ */
+const SYNC_LOCK = ".wrk-sync.lock";
 
 /**
  * One preflight run's answer, rendered as the single JSON object on stdout.
@@ -313,34 +342,48 @@ export async function preflight(
 
   let current = branch;
   if (options.base === undefined) {
-    // 6. Is the checkout clean enough to switch and pull? Untracked files are excluded: they
-    //    block neither, and scratch files are normal in a working checkout.
-    if ((await statusPorcelain(cwd, { untracked: false })).length > 0) {
-      return report({
-        verdict: "blocked",
-        reason: "dirty-checkout",
-        repo_root: where.root,
-        default_branch: defaultBranch,
-        base: defaultBranch,
-        current_branch: branch,
-      });
-    }
+    // Everything that reads or writes the shared checkout is one critical section, held
+    // against every other `wrk` process on this repository — see this module's header for the
+    // four collisions, the last of which is a wrong verdict rather than a failure and is why
+    // the dirty check is in here rather than in front. `--base` reaches none of it, having
+    // nothing to sync.
+    //
+    // A blocking verdict returns out of the closure rather than out of `preflight`, so the
+    // lock is released by the one `finally` that owns it.
+    const blocked = await withLock(join(where.container, SYNC_LOCK), async () => {
+      // 6. Is the checkout clean enough to switch and pull? Untracked files are excluded: they
+      //    block neither, and scratch files are normal in a working checkout.
+      if ((await statusPorcelain(cwd, { untracked: false })).length > 0) {
+        return report({
+          verdict: "blocked",
+          reason: "dirty-checkout",
+          repo_root: where.root,
+          default_branch: defaultBranch,
+          base: defaultBranch,
+          current_branch: branch,
+        });
+      }
 
-    if (defaultBranch === null) {
-      throw new Refusal(
-        `${where.root} has no default branch to sync — no origin/HEAD, no main, master or ` +
-          "trunk, and a detached HEAD; pass --base to skip the sync",
-      );
-    }
+      if (defaultBranch === null) {
+        throw new Refusal(
+          `${where.root} has no default branch to sync — no origin/HEAD, no main, master or ` +
+            "trunk, and a detached HEAD; pass --base to skip the sync",
+        );
+      }
 
-    // From the checkout root rather than `cwd`, the one call here that does not take `cwd`
-    // verbatim: a switch can remove the subdirectory `cwd` names, and the `@{upstream}` read
-    // after it would then run from a path that no longer exists.
-    await syncDefaultBranch(where.root, defaultBranch, branch);
-    // Known rather than re-read: the sync above either switched to this branch or was already
-    // on it, and a fast-forward pull does not rename it. One spawn saved to learn what the
-    // call that just returned established.
-    current = defaultBranch;
+      // From the checkout root rather than `cwd`, the one call here that does not take `cwd`
+      // verbatim: a switch can remove the subdirectory `cwd` names, and the `@{upstream}` read
+      // after it would then run from a path that no longer exists.
+      await syncDefaultBranch(where.root, defaultBranch, branch);
+      // Known rather than re-read: the sync above either switched to this branch or was already
+      // on it, and a fast-forward pull does not rename it. One spawn saved to learn what the
+      // call that just returned established. Assigned in here, where the guard above has
+      // already established that the branch is not `null`.
+      current = defaultBranch;
+
+      return null;
+    });
+    if (blocked !== null) return blocked;
   }
 
   return report({
