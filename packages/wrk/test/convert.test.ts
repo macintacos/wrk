@@ -25,6 +25,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { type Conversion, renderConversion, resolveConversion } from "../src/convert";
+import { type RunResult, run } from "../src/proc";
 import { checkoutFor, isBareLayout } from "../src/repo";
 
 /**
@@ -280,6 +281,67 @@ describe("renderConversion", () => {
 
   test("ends without a trailing newline, so console.log adds no blank line", () => {
     expect(renderConversion(RESOLVED)).not.toMatch(/\n$/);
+  });
+});
+
+describe("wrk repo convert", () => {
+  /**
+   * The real CLI entry point, run as a child.
+   *
+   * A child rather than `main(argv, program)` in process, because what these cases are about
+   * is which *stream* each byte reached and what status the run ended on — neither of which
+   * is observable from inside the process producing them, and asserting the exit status in
+   * process would leave the test runner itself exiting nonzero.
+   *
+   * Nothing sheds git's environment variables here, and nothing needs to: every git call the
+   * command makes goes through `git()`, which unsets them for its own child.
+   */
+  function wrk(args: string[], cwd: string): Promise<RunResult> {
+    return run(process.execPath, [join(import.meta.dir, "../src/cli.ts"), ...args], { cwd });
+  }
+
+  /** What the command should print for `cwd`, rendered in this process for comparison. */
+  async function expected(cwd: string): Promise<string> {
+    const conversion = await resolveConversion(cwd);
+    if (conversion === null) throw new Error(`no repository at ${cwd}`);
+    return renderConversion(conversion);
+  }
+
+  test("prints the recipe on stderr, leaving stdout empty", async () => {
+    // `output.ts` is explicit that `emit` owns stdout so a run's stdout is one JSON
+    // document, and that the only other things allowed there are commander's `--help` and an
+    // interactive component's escape sequences. A printed recipe is neither, so it is a
+    // human answer on the human channel — and an empty stdout is the half that would break
+    // every `jq` caller if this were wired the obvious-looking way.
+    const result = await wrk(["repo", "convert"], clone);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe(`${await expected(clone)}\n`);
+  });
+
+  test("--json puts the same answer on stdout as the envelope instead", async () => {
+    const result = await wrk(["repo", "convert", "--json"], clone);
+
+    expect(result.code).toBe(0);
+    expect(result.stderr).toBe("");
+    expect(JSON.parse(result.stdout)).toEqual({
+      container: clone,
+      remoteUrl: upstream,
+      defaultBranch: "main",
+      recipe: await expected(clone),
+    });
+  });
+
+  test("refuses outside a repository with one prefixed line and exit 1", async () => {
+    // A refusal, not a crash: one line on stderr, nothing on stdout, no stack trace.
+    const result = await wrk(["repo", "convert"], notARepo);
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe(
+      "wrk: not a git repository; run this from inside the repository you want to convert\n",
+    );
   });
 });
 
