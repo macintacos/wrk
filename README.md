@@ -64,3 +64,55 @@ as `hk run <lane>`, never `hk <lane>` — `hk test` is hk's own fixture runner a
 
 Biome owns JS/TS formatting and linting, `tsc` owns types, rumdl owns Markdown, and taplo
 owns TOML.
+
+## Configuration
+
+`wrk` runs with no configuration at all. Two optional files override its defaults, the
+later winning over the earlier:
+
+1. **Machine-wide** — `$XDG_CONFIG_HOME/wrk/config.json`, or `~/.config/wrk/config.json`
+   when that variable is unset, empty, or relative. Its sections sit at the root of the
+   document, since the path already says the file is `wrk`'s.
+2. **Per repository** — the `wrk` key of `.project-meta.json` in the repository's
+   **container** (beside `.bare`), not in a checkout. That file is shared with other
+   tools, so everything `wrk` reads there hangs off `wrk` — `wrk.search`, never a
+   neighbouring top-level `search`.
+
+| Setting        | Default                        | What it does                                          |
+| -------------- | ------------------------------ | ----------------------------------------------------- |
+| `search.roots` | `["~/GitLocal"]`               | Directories scanned for repository containers.        |
+| `search.depth` | `2`                            | How far below each root a container sits.             |
+| `cache.ttls`   | `{"pr-graph": 900000}`         | Milliseconds before a cache entry goes stale.         |
+| `glyphs`       | Nerd Font markers              | Marker per stack position: `top`, `bottom`, `merged`. |
+| `colours`      | `green` / `yellow` / `brblack` | Colour per stack position.                            |
+
+```jsonc
+// ~/.config/wrk/config.json
+{
+  "search": { "roots": ["~/GitLocal", "/srv/repos"], "depth": 2 },
+  "cache": { "ttls": { "pr-graph": 300000 } },
+  "colours": { "merged": "brblue" }
+}
+```
+
+```jsonc
+// <container>/.project-meta.json
+{
+  "wrk": {
+    "search": { "depth": 1 }
+  }
+}
+```
+
+`search.roots` is replaced wholesale by the highest layer that sets it — it is one
+decision, and appending to the defaults would make `~/GitLocal` impossible to remove.
+`cache.ttls`, `glyphs` and `colours` merge key by key, so overriding one entry leaves the
+others alone. A leading `~` in a root is expanded; a root that is still relative
+afterwards is dropped, because it would otherwise be scanned from wherever you happened to
+be standing.
+
+**Nothing reports a bad config.** A file that is missing, unreadable, not valid JSON, or
+carries none of these keys leaves the layer below it standing, and a single malformed
+value falls through on its own while its well-formed neighbours still apply. So a typo
+costs you the setting silently — if an override seems to do nothing, check the spelling
+and the nesting first.
