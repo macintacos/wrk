@@ -23,8 +23,8 @@
  * `~/Library/Caches` on macOS, which would quietly move the cache off the path the rest of
  * the toolchain looks in, so neither is used.
  *
- * Built on `node:fs/promises` rather than `Bun.file`, for the reason
- * {@link ../src/proc.ts | proc.ts} gives: the published artifact targets Node.
+ * Built on `node:fs/promises` rather than `Bun.file`, for the reason `proc.ts` gives: the
+ * published artifact targets Node.
  *
  * @packageDocumentation
  */
@@ -73,6 +73,16 @@ interface CacheEntry {
 }
 
 /**
+ * Distinguishes staging files written by this process.
+ *
+ * The pid alone is not enough: two overlapping writes to one key inside a single process
+ * would share a staging path, so the first rename publishes the second's bytes and the
+ * second fails with `ENOENT` — leaving a caller whose promise resolved with something other
+ * than what reached disk.
+ */
+let staged = 0;
+
+/**
  * Resolves the XDG cache root.
  *
  * Two rejections of `XDG_CACHE_HOME` are deliberate. An **empty** value is treated as
@@ -109,10 +119,11 @@ export function cachePath(key: CacheKey): string {
 /**
  * Reads an entry's contents and mtime through a single file handle.
  *
- * One handle rather than a `stat` followed by a `readFile`: it is the same amount of code
- * and it closes the window in which a concurrent {@link writeCache} renames a new entry
- * into place between the two calls, which would otherwise hand a caller a fresh mtime
- * beside stale text — the one combination that defeats the whole staleness check.
+ * One handle rather than a separate `stat` and `readFile`: both answers then describe the
+ * inode this handle was opened on, so a concurrent {@link writeCache} renaming a new entry
+ * into place mid-read cannot pair one file's mtime with another file's text. Reading the
+ * two through the path instead leaves that window open, and a fresh mtime beside stale text
+ * is the one combination that defeats the staleness check silently.
  *
  * A missing entry is `null`. Any other failure propagates, because an unreadable cache
  * directory is a real fault and reporting it as a miss would turn it into an unexplained
@@ -180,6 +191,11 @@ export async function readCache(key: CacheKey): Promise<string | null> {
  * truncated. The pid in the staging name keeps two concurrent processes from writing over
  * each other's half-built file.
  *
+ * The staging name is unique per write, not merely per process: the pid keeps two processes
+ * apart, and a counter keeps two overlapping writes within one process apart. With only the
+ * pid, concurrent writes to one key share a staging file and one caller's promise resolves
+ * having published the other's bytes.
+ *
  * The per-repo directory is created on demand, so a first-ever write needs no setup.
  *
  * @param key - The entry to replace.
@@ -187,11 +203,13 @@ export async function readCache(key: CacheKey): Promise<string | null> {
  * @throws If the directory cannot be created, or the write or rename fails. The staging
  * file is removed first, so a failure leaves no debris beside the entry.
  */
+// ponytail: a process killed between the write and the rename leaves its staging file
+// behind, and nothing reaps them. Sweep `*.tmp` older than a day here if they ever pile up.
 export async function writeCache(key: CacheKey, value: string): Promise<void> {
   const path = cachePath(key);
   await mkdir(dirname(path), { recursive: true });
 
-  const staging = `${path}.${process.pid}.tmp`;
+  const staging = `${path}.${process.pid}.${staged++}.tmp`;
   try {
     await writeFile(staging, value, "utf8");
     await rename(staging, path);
@@ -216,26 +234,31 @@ export async function writeCache(key: CacheKey, value: string): Promise<void> {
  *
  * Two consequences of the touch-debounce are accepted rather than engineered around:
  *
- * - **A cold start does not debounce.** Touching a missing entry would mean creating it
- *   empty, and a concurrent reader would then be handed `""` as a valid value — a wrong
- *   answer, which is worse than the duplicated refresh it would save. So both callers
- *   refresh and both rename; the later write wins, and either value is correct.
+ * - **A cold start does not debounce.** `utimes` cannot create a file, so a missing entry
+ *   has no mtime to stamp and there is nothing to claim the window with. Staking the claim
+ *   by writing the entry early would fix that and cost far more: a concurrent reader would
+ *   be handed `""` as a valid value, which is a wrong answer rather than a slow one. So
+ *   both callers refresh and both rename; the later write wins, and either value is whole.
  * - **A failed refresh still spends the touch**, leaving stale contents served for a full
  *   TTL rather than retried immediately. That is the wanted behaviour against a flaky
  *   `gh`: restoring the mtime on failure would reinstate the stampede the debounce exists
  *   to stop, on the slowest path there is.
  *
- * The window between reading the mtime and stamping it is real but small. Measured across
- * eight concurrent processes, a burst arriving over a few hundred milliseconds — a shell
- * redrawing its prompt, which is the case this exists for — collapses to a single refresh;
- * eight launched in the same instant occasionally produce two.
+ * Reading the mtime and stamping it is not atomic, so calls that start in the same instant
+ * can both get past the staleness check and both refresh. A burst spread over even a few
+ * milliseconds — a shell redrawing its prompt, which is the case this exists for — does
+ * not.
  *
  * @param key - The entry to read.
  * @param ttl - Milliseconds after which the entry is stale.
  * @param refresh - Produces the new contents. Called only when the entry is stale or
  * missing, and at most once per call.
  * @returns The fresh contents, or the previous contents when `refresh` fails.
- * @throws Whatever `refresh` threw, when there was no previous entry to fall back on.
+ * @throws Whatever `refresh` threw, when there was no previous entry to fall back on; or
+ * whatever {@link writeCache} threw. Only `refresh` gets the stale-contents fallback — a
+ * cache that cannot be written is a fault worth surfacing, and discarding a good refresh
+ * because it could not be stored would serve stale text the caller had already paid to
+ * replace.
  *
  * @example
  * ```ts
@@ -261,15 +284,17 @@ export async function cached(
     await touch(path);
   }
 
+  let value: string;
   try {
-    const value = await refresh();
-    await writeCache(key, value);
-
-    return value;
+    value = await refresh();
   } catch (error) {
     if (entry) {
       return entry.text;
     }
     throw error;
   }
+
+  await writeCache(key, value);
+
+  return value;
 }

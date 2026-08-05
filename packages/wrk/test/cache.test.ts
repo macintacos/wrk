@@ -12,7 +12,17 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, utimes, writeFile } from "node:fs/promises";
+import {
+  chmod,
+  mkdir,
+  mkdtemp,
+  readdir,
+  readFile,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -149,12 +159,93 @@ describe("writeCache", () => {
       expect(await readCache(key)).toBe("new");
     });
   });
+
+  test("replaces the entry by rename rather than writing over it", async () => {
+    // The inode is the witness. An entry written in place keeps its inode; one renamed over
+    // is a different file, so a `writeFile(path, …)` implementation fails here and only
+    // here — every other case in this suite passes with atomicity removed.
+    //
+    // File permissions are not a usable witness: Bun writes straight through a read-only
+    // entry the process owns, so a 0444 entry proves nothing about which call replaced it.
+    await withRoot(async (root) => {
+      const key = { name: "pr-graph", container: CONTAINER, root };
+      await writeCache(key, "old");
+      const before = (await stat(cachePath(key))).ino;
+
+      await writeCache(key, "new");
+
+      expect((await stat(cachePath(key))).ino).not.toBe(before);
+    });
+  });
+
+  test("survives two concurrent writes to the same key in one process", async () => {
+    // A staging name unique per process but not per call makes the two writes share one
+    // temp file: the first rename publishes the second's bytes and the second rename fails
+    // with ENOENT, so a caller whose promise resolved did not write what is on disk.
+    await withRoot(async (root) => {
+      const key = { name: "pr-graph", container: CONTAINER, root };
+      const first = "a".repeat(4_000_000);
+      const second = "b".repeat(4_000_000);
+
+      const settled = await Promise.allSettled([writeCache(key, first), writeCache(key, second)]);
+
+      expect(settled.map((outcome) => outcome.status)).toEqual(["fulfilled", "fulfilled"]);
+      const stored = await readCache(key);
+      expect(stored === first || stored === second).toBe(true);
+      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual(["pr-graph"]);
+    });
+  });
+
+  test("a failed rename leaves the entry alone and clears the staging file", async () => {
+    // The rename is the only thing that mutates the entry, and this is the deterministic
+    // way to prove it cleans up after itself: a non-empty directory standing where the
+    // entry belongs cannot be renamed over, so `writeCache` throws after staging its value.
+    await withRoot(async (root) => {
+      const key = { name: "pr-graph", container: CONTAINER, root };
+      const path = cachePath(key);
+      await mkdir(path, { recursive: true });
+      await writeFile(join(path, "occupant"), "not the cache's to delete");
+
+      await expect(writeCache(key, "value")).rejects.toThrow();
+
+      expect(await readdir(path)).toEqual(["occupant"]);
+      expect(await readdir(join(root, CONTAINER_SLUG))).toEqual(["pr-graph"]);
+    });
+  });
+
+  test("does not sweep away temp files it did not create", async () => {
+    // The cleanup path removes its own staging file by name and nothing else, so another
+    // process's half-written file survives a write here.
+    await withRoot(async (root) => {
+      const key = { name: "pr-graph", container: CONTAINER, root };
+      await writeCache(key, "seed");
+      const foreign = `${cachePath(key)}.999999.tmp`;
+      await writeFile(foreign, "someone else's half-written file");
+
+      await writeCache(key, "ours");
+
+      expect(await readCache(key)).toBe("ours");
+      expect(await readFile(foreign, "utf8")).toBe("someone else's half-written file");
+    });
+  });
 });
 
 describe("readCache", () => {
   test("returns null for an entry that was never written", async () => {
     await withRoot(async (root) => {
       expect(await readCache({ name: "absent", container: CONTAINER, root })).toBeNull();
+    });
+  });
+
+  test("reports an unreadable entry as a fault rather than a miss", async () => {
+    // A file standing where the per-repo directory belongs makes the open fail with ENOTDIR
+    // rather than ENOENT. Collapsing that to a miss would turn a broken cache root into an
+    // unexplained refresh on every single invocation, which is the failure this distinction
+    // exists to prevent.
+    await withRoot(async (root) => {
+      await writeFile(join(root, CONTAINER_SLUG), "not a directory");
+
+      await expect(readCache({ name: "pr-graph", container: CONTAINER, root })).rejects.toThrow();
     });
   });
 
@@ -222,6 +313,27 @@ describe("cached", () => {
     });
   });
 
+  test("surfaces a write failure rather than serving stale over a good refresh", async () => {
+    // Only `refresh` gets the stale fallback. With `writeCache` inside the same `try`, an
+    // unwritable cache directory makes a successful refresh indistinguishable from a failed
+    // one, and the caller is handed stale text it had already paid the round-trip to
+    // replace.
+    await withRoot(async (root) => {
+      const key = { name: "pr-graph", container: CONTAINER, root };
+      await writeCache(key, "previous");
+      await age(cachePath(key), 90_000);
+      const dir = join(root, CONTAINER_SLUG);
+      await chmod(dir, 0o555);
+
+      try {
+        await expect(cached(key, 60_000, async () => "fresh")).rejects.toThrow();
+      } finally {
+        // withRoot cannot remove the tree through a directory it may not write.
+        await chmod(dir, 0o755);
+      }
+    });
+  });
+
   test("propagates the failure when refresh rejects and nothing was cached", async () => {
     await withRoot(async (root) => {
       const key = { name: "pr-graph", container: CONTAINER, root };
@@ -266,9 +378,10 @@ describe("cached", () => {
     });
   });
 
-  test("does not create an entry when there is nothing to touch", async () => {
-    // A cold start deliberately skips the debounce: touching a missing entry means creating
-    // it empty, and a concurrent reader would then get "" presented as valid data.
+  test("publishes nothing until the first refresh completes", async () => {
+    // What a cold start must not do. `utimes` cannot create the entry, so there is no mtime
+    // to stamp and no way to debounce the first burst; the tempting fix — staking a claim by
+    // writing the entry early — would hand a concurrent reader `""` as a valid value.
     await withRoot(async (root) => {
       const key = { name: "pr-graph", container: CONTAINER, root };
       const started = Promise.withResolvers<void>();
@@ -285,44 +398,5 @@ describe("cached", () => {
       finish.resolve("first");
       await first;
     });
-  });
-});
-
-test("a failed rename leaves the entry alone and clears the staging file", async () => {
-  // The rename is the only thing that mutates the entry, and this is the deterministic way
-  // to prove it: make the rename fail while the write itself succeeds. A non-empty
-  // directory standing where the entry belongs cannot be renamed over, so `writeCache`
-  // throws *after* staging its value — and the criterion "renamed into place on success
-  // only" says the entry must be untouched and no debris left behind.
-  //
-  // In-process interleaving cannot test this instead: reads and writes only alternate at
-  // await points, so an in-place `writeFile` is never caught half-done. The genuine
-  // atomicity check is the cross-process probe run against a real filesystem.
-  await withRoot(async (root) => {
-    const key = { name: "pr-graph", container: CONTAINER, root };
-    const path = cachePath(key);
-    await mkdir(path, { recursive: true });
-    await writeFile(join(path, "occupant"), "not the cache's to delete");
-
-    await expect(writeCache(key, "value")).rejects.toThrow();
-
-    expect(await readdir(path)).toEqual(["occupant"]);
-    expect(await readdir(join(root, CONTAINER_SLUG))).toEqual(["pr-graph"]);
-  });
-});
-
-test("a concurrent writer's temp file does not collide with ours", async () => {
-  // The per-process temp name. Simulated here by planting a foreign process's staging file
-  // and checking our write neither reads it nor removes it.
-  await withRoot(async (root) => {
-    const key = { name: "pr-graph", container: CONTAINER, root };
-    await writeCache(key, "seed");
-    const foreign = `${cachePath(key)}.999999.tmp`;
-    await writeFile(foreign, "someone else's half-written file");
-
-    await writeCache(key, "ours");
-
-    expect(await readCache(key)).toBe("ours");
-    expect(await readFile(foreign, "utf8")).toBe("someone else's half-written file");
   });
 });
