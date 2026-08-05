@@ -93,6 +93,15 @@ A well-formed "blocked" answer is a **successful run**: callers branch on the pa
 verdict field, never on the exit status. An exit status that is not `0` means `wrk` has no
 answer to give, not that the answer was no.
 
+One command has a second machine shape. `wrk agent create --hook` prints the worktree path
+alone, because the editor's `WorktreeCreate` hook enters whatever directory the
+**last non-empty stdout line** names — a JSON document there is a path that cannot be
+entered, not a stricter answer. Both shapes obey the same failure rule, and it is the one
+the whole contract rests on: a run that fails writes **nothing** to stdout and exits
+nonzero. Callers pipe through `jq -er`, which exits `0` on empty input, so a run that
+failed while still exiting `0` would be read as a success carrying no path, and one that
+printed a partial answer before failing would be read as a success outright.
+
 ## Agent commands
 
 `wrk agent preflight` is what an agent runs before it creates a worktree. It answers
@@ -120,6 +129,23 @@ The envelope carries nine keys on every run — `verdict`, `reason`, `repo_root`
 the **container**, not a worktree; the name is misleading and frozen.
 **A blocked verdict leaves the repository byte-identical**: every check runs before the
 first mutation.
+
+`wrk agent create` is what runs next, once preflight says proceed. It creates the branch
+and its worktree together, as a sibling of the default-branch checkout inside the
+container, and emits `{worktree_path, branch}`.
+
+```bash
+wrk agent create --branch EXC-999/some-slug [--base EXC-996/parent-slug] [--hook]
+```
+
+Only the **directory** folds `/` to `+` — the branch reaches `git worktree add -b`
+verbatim, so `EXC-999/some-slug` lives in `EXC-999+some-slug`. `--base` is the stacked
+path again, and defaults to the repository's default branch. `--hook` selects the bare-path
+stdout shape described above.
+
+Unlike preflight, `create` has no blocked verdict to return: its contract is that the
+worktree now exists, so an unconverted repository is a **refusal** — exit `1`, nothing on
+stdout — rather than an answer.
 
 ## Configuration
 
