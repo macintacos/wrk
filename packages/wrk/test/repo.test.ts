@@ -142,11 +142,16 @@ describe("containerFor", () => {
     // The property the whole repo model hangs off: one stable key for the repository, from
     // anywhere inside it. `--show-toplevel` cannot do this — under this layout its basename
     // is a *branch* name, so it re-keys the moment a run worktree is created.
-    const worktree = addNewCheckout(container, "EXC-1+add-thing", "EXC-1/add-thing");
+    //
+    // Built on its own container rather than the shared one: adding a worktree to the shared
+    // fixture would leave every later `listWorktrees`-shaped assertion depending on test order.
+    const own = makeContainer(seed);
+    const main = addCheckout(own, "main", "main");
+    const worktree = addNewCheckout(own, "EXC-1+add-thing", "EXC-1/add-thing");
 
-    expect(await containerFor(container)).toBe(container);
-    expect(await containerFor(checkout)).toBe(container);
-    expect(await containerFor(worktree)).toBe(container);
+    expect(await containerFor(own)).toBe(own);
+    expect(await containerFor(main)).toBe(own);
+    expect(await containerFor(worktree)).toBe(own);
   });
 
   test("resolves from a nested subdirectory of a checkout", async () => {
@@ -161,9 +166,7 @@ describe("containerFor", () => {
   });
 
   test("answers the physical path when the container is reached through a symlink", async () => {
-    // The acceptance criterion's "a symlinked temp dir cannot defeat a match". macOS makes
-    // this the default rather than the exotic case: `/var` is a symlink to `/private/var`,
-    // so every temp-dir path is symlinked before anyone tries to be clever.
+    // The acceptance criterion's "a symlinked temp dir cannot defeat a match".
     const base = tempDir();
     const physical = join(base, "physical");
     mkdirSync(physical);
@@ -178,6 +181,27 @@ describe("containerFor", () => {
     expect(await containerFor(join(viaLink, "main"))).toBe(
       await containerFor(join(physical, "main")),
     );
+  });
+
+  test("resolves the other two path routes through a symlink as well", async () => {
+    // `containerFor` above covers only the `--git-common-dir` route. `locate().root` comes
+    // from `--show-toplevel` and `checkoutFor`'s answer from `worktree list --porcelain`, and
+    // it is the second of those a caller actually cd's into — so all three are pinned, not one.
+    const base = tempDir();
+    const physical = join(base, "physical");
+    mkdirSync(physical);
+    symlinkSync(physical, join(base, "link"));
+
+    const real = makeContainer(seed, physical);
+    addCheckout(real, "main", "main");
+    const viaLink = join(base, "link");
+
+    expect(await checkoutFor(viaLink)).toBe(join(physical, "main"));
+    expect(await locate(join(viaLink, "main"))).toEqual({
+      kind: "checkout",
+      root: join(physical, "main"),
+      container: physical,
+    });
   });
 });
 
@@ -209,6 +233,15 @@ describe("isBareLayout", () => {
     mkdirSync(join(parent, ".git"));
 
     expect(await isBareLayout(join(parent, "project.git"))).toBe(false);
+  });
+
+  test("is false when the .git pointer file exists but the repository is not bare", async () => {
+    // The other half, and the one an `isFile`-only implementation would pass every other case
+    // without. A container whose repository is not bare is not a container.
+    const own = makeContainer(seed);
+    fixtureGit(["config", "core.bare", "false"], join(own, ".bare"));
+
+    expect(await isBareLayout(own)).toBe(false);
   });
 
   test("is false outside a repository", async () => {
@@ -261,8 +294,29 @@ describe("resolveDefaultBranch", () => {
     expect(await resolveDefaultBranch(detached)).toBeNull();
   });
 
+  test("ignores an origin/HEAD left dangling by an upstream rename", async () => {
+    // `git fetch --prune` does not update origin/HEAD, so after the most ordinary upstream
+    // event in this space it points at a ref that no longer exists. Trusting it blindly names
+    // a branch nothing can check out, and `checkoutFor` then answers null with a perfectly
+    // good checkout sitting in front of it.
+    const upstream = makeRepo("master");
+    const clone = join(tempDir(), "work");
+    fixtureGit(["clone", "-q", upstream, clone]);
+    fixtureGit(["branch", "-m", "master", "main"], upstream);
+    fixtureGit(["fetch", "-q", "--prune", "origin"], clone);
+    fixtureGit(["branch", "-m", "master", "main"], clone);
+
+    expect(await resolveDefaultBranch(clone)).toBe("main");
+  });
+
   test("returns null outside a repository", async () => {
     expect(await resolveDefaultBranch(notARepo)).toBeNull();
+  });
+
+  test("falls back to the current branch from a bare container", async () => {
+    // Reading HEAD out of a bare repository is a distinct path from the plain-repo case above,
+    // and it is the one wrk's own layout takes for an unconventionally named default.
+    expect(await resolveDefaultBranch(makeContainer(makeRepo("develop")))).toBe("develop");
   });
 });
 
@@ -309,6 +363,18 @@ describe("checkoutFor", () => {
     // this pins that the "not a repository" case is settled before it is ever called.
     expect(await checkoutFor(notARepo)).toBeNull();
   });
+
+  test("ignores a prunable record whose directory is gone", async () => {
+    // `listWorktrees` deliberately reports stale administrative records so a caller can see
+    // them; this is that layer's first consumer, and a path that no longer exists is not a
+    // checkout. Git also refuses to check the branch out anywhere else while the stale record
+    // holds it, so there is no second candidate to find — `null` is the only honest answer.
+    const own = makeContainer(seed);
+    const gone = addCheckout(own, "main", "main");
+    rmSync(gone, { recursive: true, force: true });
+
+    expect(await checkoutFor(own)).toBeNull();
+  });
 });
 
 describe("locate", () => {
@@ -327,6 +393,14 @@ describe("locate", () => {
     // The middle state, and the reason the check is three-way rather than two-way: the
     // container answers no toplevel but a perfectly good common dir.
     expect(await locate(container)).toEqual({ kind: "container", container });
+  });
+
+  test("reports the same state from inside a git directory, with the container still right", async () => {
+    // `--show-toplevel` fails from inside any git directory, not only from a bare repository,
+    // so the middle state is "not in a work tree" rather than "the repository is bare". The
+    // carried container stays correct, which is what callers use it for.
+    expect(await locate(join(container, ".bare"))).toEqual({ kind: "container", container });
+    expect(await locate(join(seed, ".git"))).toEqual({ kind: "container", container: seed });
   });
 
   test("reports outside for a directory in no repository", async () => {

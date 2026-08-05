@@ -26,9 +26,11 @@
  * --porcelain` — including when the container is reached through a symlink, and including
  * when `worktree add` was handed a symlinked destination. Every path this module returns
  * comes from one of those three, and `dirname` of a resolved path is resolved, so a
- * `realpath` pass on top would be redundant work that also *changes* the answer for a
- * prunable worktree whose directory no longer exists. The property is pinned by a test that
- * builds a container under a symlink rather than by code that re-does git's work.
+ * `realpath` pass on top would be redundant work that would also *fail* rather than answer:
+ * `fs.realpath` rejects with `ENOENT` on a path that no longer exists, which is exactly the
+ * shape a prunable worktree's record has. {@link checkoutFor} drops those records instead.
+ * All three routes are pinned by tests that build a container under a symlink, rather than
+ * by code that re-does git's work.
  *
  * @packageDocumentation
  */
@@ -55,9 +57,11 @@ import {
  */
 const DEFAULT_BRANCH_FALLBACKS = ["main", "master", "trunk"] as const;
 
-/** The remote's default-branch pointer, and the prefix {@link resolveDefaultBranch} strips. */
-const ORIGIN_HEAD_REF = "refs/remotes/origin/HEAD";
+/** The prefix {@link resolveDefaultBranch} strips off `origin/HEAD`'s target. */
 const ORIGIN_PREFIX = "refs/remotes/origin/";
+
+/** The remote's own record of its default branch. Derived, so the two cannot drift apart. */
+const ORIGIN_HEAD_REF = `${ORIGIN_PREFIX}HEAD`;
 
 /** The prefix branch refs carry, as {@link listWorktrees} and `show-ref` report them. */
 const BRANCH_PREFIX = "refs/heads/";
@@ -66,9 +70,17 @@ const BRANCH_PREFIX = "refs/heads/";
  * Where a directory sits relative to the repository — the three-state "where am I?".
  *
  * The states are distinguished by which of the two `rev-parse` probes answer: a work tree
- * *and* a common dir means a checkout; no work tree but a common dir means the container,
- * which is bare and so has none; neither means no repository at all. The fourth combination
- * cannot occur — nothing has a work tree without a common dir.
+ * *and* a common dir means a checkout; a common dir with no work tree means somewhere in the
+ * repository that is not a work tree; neither means no repository at all. The fourth
+ * combination cannot occur — nothing has a work tree without a common dir.
+ *
+ * `"container"` names the case that matters — a bare-repo container, where callers land
+ * routinely because it keeps the path the repository had before conversion. It is **not**
+ * exclusively that: `--show-toplevel` fails from inside any git directory, so a plain clone's
+ * `.git`, a worktree's private gitdir, and `<container>/.bare` all report `"container"` too.
+ * The `container` value is correct in every one of them, which is what the state is for; it
+ * is a "not in a work tree" answer, not a proof the repository is bare. {@link isBareLayout}
+ * is the predicate for that.
  *
  * `container` is present in both repository states because it is the repository's key, and a
  * caller in the container needs it exactly as much as one in a checkout. `root` is the
@@ -84,7 +96,7 @@ export type Location =
  * Reports where `cwd` sits relative to the repository.
  *
  * The two probes run concurrently because neither depends on the other and both are process
- * spawns; the branch is decided once they are both back.
+ * spawns.
  *
  * @param cwd - Directory to inspect. Defaults to this process's cwd.
  * @returns One of the three states — see {@link Location}.
@@ -131,12 +143,10 @@ async function isFile(path: string): Promise<boolean> {
  *
  * **Both halves are required, because neither is sufficient.** `core.bare` alone is equally
  * true of the older `<name>.git` convention, where the derived container is a directory of
- * *other repositories* and worktrees created in it would be scattered among them. A path
- * comparison alone — "is the common dir inside this checkout?" — misreads a plain clone that
- * happens to carry an old-style nested worktree, whose common dir sits at the clone root
- * while its toplevel is the nested worktree. The `.git` pointer **file** the conversion
- * writes is what makes a container a container, and it must be a file: a normal
- * repository's `.git` is a directory.
+ * *other repositories* and worktrees created in it would be scattered among them. The `.git`
+ * pointer file alone is equally true of any ordinary repository. So the rule is both: the
+ * repository must be bare, **and** the container must hold a `.git` **file** — a normal
+ * repository's `.git` is a directory, which is what that half rules out.
  *
  * `core.bare` is read through `git config`, never `rev-parse --is-bare-repository`. The two
  * disagree exactly where it matters: the config value is a property of the *repository* and
@@ -148,6 +158,9 @@ async function isFile(path: string): Promise<boolean> {
  * @returns `true` only for a converted container. Outside a repository, `false`.
  */
 export async function isBareLayout(cwd?: string): Promise<boolean> {
+  // Sequential rather than concurrent with the `config` read below, unlike `locate`'s pair:
+  // there is no container to test the `.git` of when this is null, and outside a repository
+  // it saves the second spawn entirely.
   const container = await containerFor(cwd);
   if (container === null) return false;
 
@@ -166,8 +179,17 @@ export async function isBareLayout(cwd?: string): Promise<boolean> {
  * remote-tracking refs at all, so `origin/HEAD` is genuinely absent in the layout `wrk`
  * itself uses, making the second source the common path rather than the edge case.
  *
- * The candidates are probed sequentially by design: the first match wins, so probing all
- * three concurrently would spawn two `git` processes whose answers are discarded.
+ * `origin/HEAD` is verified to point at a ref that exists, not merely read. `git fetch
+ * --prune` does not update it, so after an upstream default-branch rename — the most ordinary
+ * event in this space — it names a branch nothing can check out, and {@link checkoutFor}
+ * would then answer `null` with a perfectly good checkout sitting in front of it. A dangling
+ * pointer is not an answer, so it falls through to the conventional names like any other
+ * absent `origin/HEAD`.
+ *
+ * The candidates could be read in one `for-each-ref` spawn instead of up to three
+ * `show-ref`s, and are not: {@link forEachRef} throws outside a repository, which would
+ * replace this function's documented `null` with an exception. Three cheap spawns in the
+ * uncommon case is the price of that contract.
  *
  * @param cwd - Directory to inspect. Defaults to this process's cwd.
  * @returns The short branch name, or `null` when there is nothing to answer — a detached
@@ -177,7 +199,9 @@ export async function isBareLayout(cwd?: string): Promise<boolean> {
  */
 export async function resolveDefaultBranch(cwd?: string): Promise<string | null> {
   const head = await symbolicRef(ORIGIN_HEAD_REF, cwd);
-  if (head?.startsWith(ORIGIN_PREFIX)) return head.slice(ORIGIN_PREFIX.length);
+  if (head?.startsWith(ORIGIN_PREFIX) && (await refExists(head, cwd))) {
+    return head.slice(ORIGIN_PREFIX.length);
+  }
 
   for (const candidate of DEFAULT_BRANCH_FALLBACKS) {
     if (await refExists(`${BRANCH_PREFIX}${candidate}`, cwd)) return candidate;
@@ -189,23 +213,29 @@ export async function resolveDefaultBranch(cwd?: string): Promise<string | null>
 /**
  * A checkout to work in, given a directory that may not be one.
  *
- * `cwd` inside a work tree resolves to that checkout's root. Otherwise `cwd` is the
- * container — bare, and so with no work tree of its own — and the answer is the checkout
- * holding the default branch. Callers arrive there routinely rather than by mistake: the
- * container keeps the path the repository had before conversion, so stale bookmarks and
- * plain habit both land in it.
+ * `cwd` inside a work tree resolves to that checkout's root. Otherwise `cwd` is in the
+ * repository but not in a work tree — the container being the case that matters — and the
+ * answer is the checkout holding the default branch. Callers arrive there routinely rather
+ * than by mistake: the container keeps the path the repository had before conversion, so
+ * stale bookmarks and plain habit both land in it.
  *
  * **The default-branch checkout is found by the branch it holds, never by its directory
  * name.** `wrk` names it for its branch when it creates one, but the hand-run conversion
  * recipe leaves the name to whoever runs it, so a name-based lookup finds the wrong checkout
  * or none at all.
  *
+ * Prunable records are skipped. They are administrative entries for worktrees whose
+ * directories are gone, and a path that does not exist is not a checkout — while the record
+ * stands, git also refuses to check that branch out anywhere else, so there is no second
+ * candidate it could be hiding.
+ *
  * @param cwd - Directory to inspect. Defaults to this process's cwd.
  * @returns The absolute checkout root, or `null` when there is no work tree to offer —
- *   either `cwd` is in no repository, or no worktree holds the default branch. Use
- *   {@link locate} to tell those apart. `null` rather than `cwd`: handing back a bare
- *   container path labelled "the checkout" would push the failure into whichever caller
- *   acted on it.
+ *   `cwd` is in no repository, no worktree holds the default branch, or the only one that
+ *   does is prunable. Use {@link locate} to tell the first apart from the rest. `null` rather
+ *   than `cwd`: handing back a path labelled "the checkout" that has no work tree, or none at
+ *   all, would push the failure into whichever caller acted on it.
+ * @throws If git failed while listing the worktrees.
  */
 export async function checkoutFor(cwd?: string): Promise<string | null> {
   const where = await locate(cwd);
@@ -219,6 +249,8 @@ export async function checkoutFor(cwd?: string): Promise<string | null> {
   if (branch === null) return null;
 
   const ref = `${BRANCH_PREFIX}${branch}`;
-  const holder = (await listWorktrees(cwd)).find((worktree) => worktree.branch === ref);
+  const holder = (await listWorktrees(cwd)).find(
+    (worktree) => worktree.branch === ref && worktree.prunable === null,
+  );
   return holder?.path ?? null;
 }
