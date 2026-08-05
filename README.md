@@ -17,6 +17,18 @@ The bare npm name `wrk` is taken, so both packages publish under the `@macintaco
 Tool versions are pinned by [mise](https://mise.jdx.dev) and checksum-locked in
 `mise.lock`; git hooks are managed by [hk](https://hk.jdx.dev).
 
+`wrk` shells out to the system `git` rather than pinning its own, and requires
+**git 2.36 or newer**: `worktree list --porcelain -z` arrived in 2.36 and
+`rev-parse --path-format` in 2.31.
+
+The floor is not merely advisory. `worktree list` rejects an unknown option loudly, but
+`rev-parse` hand-rolls its option parsing and
+**echoes an unrecognised flag to stdout, exiting 0** — so below 2.31,
+`rev-parse --path-format=absolute --git-common-dir` returns the flag itself followed by a
+relative path, and the repository resolves to a container named `--path-format=absolute`.
+That answer is silent, stable, and wrong. Check `git --version` before reaching for a
+debugger.
+
 ```bash
 mise trust      # approve this repo's mise.toml
 mise run setup  # install pinned tools, then workspace dependencies
