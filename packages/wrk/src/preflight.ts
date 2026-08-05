@@ -1,0 +1,335 @@
+/**
+ * The preflight verdict: what a calling agent should do before it creates a worktree.
+ *
+ * This is the most-depended-on answer `wrk` gives. Ten-plus skill files across two agent
+ * trees run it before every exec run, parse the object it prints, and branch on `.verdict`
+ * — so the shape below is a **frozen contract**, not an internal type. Its nine keys, their
+ * order, the three verdicts and the four block reasons are all consumed by name.
+ *
+ * **Six checks, in an order that is itself load-bearing.** Is there a work tree here; is the
+ * repository the bare-repo container the sibling layout needs; is this checkout a run
+ * worktree; whose; what is the default branch; and is the checkout clean enough to sync.
+ * Each one exists because the checks after it would otherwise ask a question that has no
+ * meaning — there is no `--show-toplevel` to read in a bare repository, no container to
+ * place a sibling in outside the layout, and no sync to run from inside somebody else's
+ * worktree.
+ *
+ * **Every check precedes the first mutation, so a `blocked` verdict leaves the repository
+ * byte-identical.** That is what makes a blocking answer safe to act on: the caller is told
+ * to stop and knows nothing moved, including no `FETCH_HEAD`. The only writes this module
+ * performs are in {@link syncDefaultBranch}, reached last and only on the path that has
+ * already decided to proceed.
+ *
+ * **`blocked` is a successful run.** Exit `0` for every verdict, per [`./output`](./output)'s
+ * exit rules — callers branch on the payload, never on the status, so a nonzero exit means
+ * `wrk` has no answer at all rather than that the answer was no. Two failures do exit
+ * nonzero, and neither is a verdict: a cwd in no repository (git's own `128`, through
+ * {@link CommandFailed}) and a default branch that cannot be resolved on the syncing path (a
+ * {@link Refusal}).
+ *
+ * Three deliberate divergences from the Python implementation this reproduces
+ * (`agent_exec_worktree.py`), all in fields no caller reads, recorded here so the
+ * conformance suite meets them as decisions:
+ *
+ * - `current_branch` is `null` rather than `""` on `container-cwd`. The empty string was a
+ *   consequence of a non-optional dataclass field, not a meaning.
+ * - `current_branch` is `null` rather than `"HEAD"` on a detached HEAD, following
+ *   {@link currentBranch}'s existing contract — `"HEAD"` is not a branch a caller can act on.
+ * - A default branch that resolves to nothing on the syncing path is a {@link Refusal}, where
+ *   the Python reached `git switch HEAD` and died with git's status. There is genuinely
+ *   nothing to sync to, and no verdict describes it.
+ *
+ * @packageDocumentation
+ */
+
+import { basename } from "node:path";
+
+import { currentBranch, git, gitOk, statusPorcelain } from "./git";
+import { branchBelongsToIssue, isRunWorktree } from "./naming";
+import { Refusal } from "./output";
+import { isBareLayout, locate, resolveDefaultBranch } from "./repo";
+
+/**
+ * What the calling agent should do next.
+ *
+ * - `proceed` — create the worktree; the default branch is synced and `worktree_root` says
+ *   where the sibling goes.
+ * - `resumed` — the session is already in this issue's worktree; create nothing.
+ * - `blocked` — stop, and read `reason` for which of the four situations it is.
+ */
+export type Verdict = "proceed" | "resumed" | "blocked";
+
+/**
+ * Why a `blocked` run stopped.
+ *
+ * - `container-cwd` — the run is in the container rather than a checkout inside it. The
+ *   checkouts are its subdirectories; `cd` into the default-branch one and re-run.
+ * - `unconverted-repo` — not a bare-repo container, so there is nowhere to put a sibling
+ *   worktree. The only reason carrying `conversion_reference`.
+ * - `unrelated-worktree` — the run is inside a worktree belonging to different work, so the
+ *   default branch was never synced and a new worktree would be seeded from that checkout.
+ * - `dirty-checkout` — tracked changes would block the switch or the pull.
+ */
+export type BlockReason =
+  | "container-cwd"
+  | "unconverted-repo"
+  | "unrelated-worktree"
+  | "dirty-checkout";
+
+/**
+ * The skill that converts a repository into the layout this command requires.
+ *
+ * A bare skill **name**, never a path: this contract is shared by two agent trees that spell
+ * an invocation differently, so a name is the only form each can render in its own idiom.
+ */
+const CONVERSION_REFERENCE = "repo-setup";
+
+/**
+ * One preflight run's answer, rendered as the single JSON object on stdout.
+ *
+ * **No key is ever omitted.** A field a given verdict does not reach is `null`, so a caller
+ * reads any of them unconditionally rather than guarding each one. The declaration order is
+ * the wire order — `envelope` inherits key order from the payload's own insertion order, and
+ * {@link report} builds this as one literal to keep that true.
+ *
+ * The keys are `snake_case` because that is what the callers already parse.
+ */
+export interface PreflightReport {
+  /** What to do next. */
+  readonly verdict: Verdict;
+
+  /** Why a blocked run stopped; `null` for every other verdict. */
+  readonly reason: BlockReason | null;
+
+  /**
+   * Root of the checkout the run was invoked from — or, on `container-cwd`, the directory it
+   * was invoked from, which has no checkout root to report.
+   */
+  readonly repo_root: string;
+
+  /** The repository's default branch, once resolved. */
+  readonly default_branch: string | null;
+
+  /** What the new worktree should be based on: the `base` option, else the default branch. */
+  readonly base: string | null;
+
+  /** The branch checked out **after** any sync, or `null` when HEAD is detached. */
+  readonly current_branch: string | null;
+
+  /**
+   * Absolute path of the **container** the new worktree belongs in, alongside the
+   * default-branch checkout.
+   *
+   * The name says "worktree" and the value is the container. It is misleading and it is
+   * frozen — callers consume it by this name.
+   */
+  readonly worktree_root: string | null;
+
+  /** The run worktree the run was invoked from, or `null` when invoked from a checkout. */
+  readonly current_worktree: string | null;
+
+  /** {@link CONVERSION_REFERENCE}, set only on an `unconverted-repo` refusal. */
+  readonly conversion_reference: string | null;
+}
+
+/** Options for {@link preflight}. */
+export interface PreflightOptions {
+  /**
+   * The branch the new worktree will be based on — the stacked path.
+   *
+   * When given, the default-branch sync is skipped **in its entirety**: no fetch, no switch,
+   * no pull, and no dirty check, since a local feature branch is never fetched or pulled. The
+   * layout and isolation checks still run, and `default_branch` is still resolved and
+   * reported.
+   */
+  base?: string;
+}
+
+/** The fields a call site of {@link report} varies; everything else is `null`. */
+interface ReportFields {
+  verdict: Verdict;
+  repoRoot: string;
+  reason?: BlockReason;
+  defaultBranch?: string | null;
+  base?: string | null;
+  currentBranch?: string | null;
+  worktreeRoot?: string;
+  currentWorktree?: string;
+  conversionReference?: string;
+}
+
+/**
+ * Builds the full nine-key report from the handful of fields a given verdict reached.
+ *
+ * One literal, written once, in contract order — which is what makes "never omits a key" and
+ * "keys keep a fixed order" properties of this module rather than of each return statement's
+ * discipline.
+ */
+function report(fields: ReportFields): PreflightReport {
+  return {
+    verdict: fields.verdict,
+    reason: fields.reason ?? null,
+    repo_root: fields.repoRoot,
+    default_branch: fields.defaultBranch ?? null,
+    base: fields.base ?? null,
+    current_branch: fields.currentBranch ?? null,
+    worktree_root: fields.worktreeRoot ?? null,
+    current_worktree: fields.currentWorktree ?? null,
+    conversion_reference: fields.conversionReference ?? null,
+  };
+}
+
+/**
+ * Brings the default branch up to date, ending with it checked out.
+ *
+ * Neither a repository without an `origin` nor a default branch without an upstream is a
+ * failed preflight — there is simply nothing to fetch or fast-forward, and both are ordinary
+ * in the bare-repo layout, where `clone --bare` creates no remote-tracking refs at all. Git
+ * calls each an error, so each is guarded rather than attempted. A remote that is configured
+ * but unreachable still throws: there the caller asked for an up-to-date base and cannot have
+ * one.
+ *
+ * The three mutations go through {@link gitOk} rather than gaining wrappers of their own, per
+ * `git.ts`'s rule that one caller does not earn a wrapper.
+ *
+ * @param cwd - The checkout to sync.
+ * @param defaultBranch - The branch to end up on, already resolved.
+ * @param from - The branch currently checked out, so the switch can be skipped when it is
+ *   already the right one. `null` for a detached HEAD, which always switches.
+ * @throws If a configured remote cannot be reached, the switch fails, or the pull is not a
+ *   fast-forward.
+ */
+async function syncDefaultBranch(
+  cwd: string,
+  defaultBranch: string,
+  from: string | null,
+): Promise<void> {
+  const hasOrigin = (await git(["remote", "get-url", "origin"], cwd)).code === 0;
+  if (hasOrigin) await gitOk(["fetch", "origin"], cwd);
+  if (from !== defaultBranch) await gitOk(["switch", defaultBranch], cwd);
+
+  // Read after the switch, not before: `@{upstream}` is a property of the branch that is
+  // checked out, so asking while parked elsewhere answers about the wrong one.
+  const tracks = (await git(["rev-parse", "--verify", "--quiet", "@{upstream}"], cwd)).code === 0;
+  if (hasOrigin && tracks) await gitOk(["pull", "--ff-only"], cwd);
+}
+
+/**
+ * Runs the Setup Worktree checks and reports what the caller should do.
+ *
+ * See this module's header for the contract: six ordered checks, three verdicts, and no
+ * mutation before a blocking one.
+ *
+ * @param issue - The run's primary issue identifier, e.g. `EXC-997`. What tells this run's
+ *   worktree from somebody else's.
+ * @param cwd - Directory the calling agent is running from. Defaults to this process's cwd.
+ * @param options - See {@link PreflightOptions}.
+ * @returns The verdict, plus everything the caller needs in order to act on it.
+ * @throws {@link CommandFailed} if `cwd` is in no repository at all — a caller error rather
+ *   than a verdict, since none of the four describes it and no advice they carry would help —
+ *   or if a git command in the sync failed outright.
+ * @throws {@link Refusal} if the default branch cannot be resolved on the syncing path.
+ *
+ * @example
+ * ```ts
+ * const answer = await preflight("EXC-997");
+ * if (answer.verdict === "proceed") await addWorktree(join(answer.worktree_root, dir));
+ * ```
+ */
+export async function preflight(
+  issue: string,
+  cwd?: string,
+  options: PreflightOptions = {},
+): Promise<PreflightReport> {
+  const here = cwd ?? process.cwd();
+
+  // 1. Is there a work tree here? The probe is *checked*, so the two ways it can answer "no"
+  //    stay distinct: a bare repository says "false" at exit 0, while a directory in no
+  //    repository at all exits 128 and throws. Collapsing them would hand a caller with no
+  //    checkout below it the container verdict's "cd into the checkout below" advice.
+  //    Concurrent with `locate` because neither depends on the other and both are spawns.
+  const [inWorkTree, where] = await Promise.all([
+    gitOk(["rev-parse", "--is-inside-work-tree"], cwd),
+    locate(cwd),
+  ]);
+  if (inWorkTree.trim() !== "true" || where.kind !== "checkout") {
+    return report({ verdict: "blocked", reason: "container-cwd", repoRoot: here });
+  }
+
+  const [bare, branch] = await Promise.all([isBareLayout(cwd), currentBranch(cwd)]);
+
+  // 2. Is it the layout a sibling worktree needs? Refused first among the repository's own
+  //    properties, since there is nowhere to put one and every later step would be wasted.
+  if (!bare) {
+    return report({
+      verdict: "blocked",
+      reason: "unconverted-repo",
+      repoRoot: where.root,
+      currentBranch: branch,
+      conversionReference: CONVERSION_REFERENCE,
+    });
+  }
+
+  // 3. Is this checkout a run worktree, and 4. is it *this* run's? Both before the sync,
+  //    which assumes a default-branch checkout.
+  if (branch !== null && isRunWorktree(basename(where.root), branch)) {
+    if (!branchBelongsToIssue(branch, issue)) {
+      return report({
+        verdict: "blocked",
+        reason: "unrelated-worktree",
+        repoRoot: where.root,
+        currentBranch: branch,
+        currentWorktree: where.root,
+      });
+    }
+
+    return report({
+      verdict: "resumed",
+      repoRoot: where.root,
+      currentBranch: branch,
+      currentWorktree: where.root,
+    });
+  }
+
+  // 5. What is the default branch? Resolved before the `base` split, so it is reported on
+  //    the stacked path too — that path skips the *sync*, not the answer.
+  const defaultBranch = await resolveDefaultBranch(cwd);
+
+  let current = branch;
+  if (options.base === undefined) {
+    // 6. Is the checkout clean enough to switch and pull? Untracked files are excluded: they
+    //    block neither, and scratch files are normal in a working checkout.
+    if ((await statusPorcelain(cwd, { untracked: false })).length > 0) {
+      return report({
+        verdict: "blocked",
+        reason: "dirty-checkout",
+        repoRoot: where.root,
+        defaultBranch,
+        base: defaultBranch,
+        currentBranch: branch,
+      });
+    }
+
+    if (defaultBranch === null) {
+      throw new Refusal(
+        `${where.root} has no default branch to sync — no origin/HEAD, no main, master or ` +
+          "trunk, and a detached HEAD; pass --base to skip the sync",
+      );
+    }
+
+    await syncDefaultBranch(where.root, defaultBranch, branch);
+    // Known rather than re-read: the sync above either switched to this branch or was already
+    // on it, and a fast-forward pull does not rename it. One spawn saved to learn what the
+    // call that just returned established.
+    current = defaultBranch;
+  }
+
+  return report({
+    verdict: "proceed",
+    repoRoot: where.root,
+    defaultBranch,
+    base: options.base ?? defaultBranch,
+    currentBranch: current,
+    worktreeRoot: where.container,
+  });
+}

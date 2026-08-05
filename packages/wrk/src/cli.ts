@@ -29,6 +29,7 @@ import { Command } from "@commander-js/extra-typings";
 
 import { renderConversion, resolveConversion } from "./convert";
 import { emit, note, Refusal, reportFailure } from "./output";
+import { preflight } from "./preflight";
 
 /**
  * Assembles the commander tree.
@@ -42,6 +43,11 @@ import { emit, note, Refusal, reportFailure } from "./output";
  * run's stdout is one JSON document, and the only stdout this program allows past it are
  * commander's own `--help` and an interactive component's escape sequences, neither of which
  * a printed recipe is. `--json` is what puts the same answer on the envelope instead.
+ *
+ * `agent preflight` takes the opposite side of that flag and never consults it: its only
+ * output is the envelope, because every one of its callers is a script that parses it. See
+ * [`./preflight`](./preflight)'s header for the contract, including why a blocking verdict
+ * still exits `0`.
  *
  * @returns The configured program, not yet parsed.
  */
@@ -69,6 +75,17 @@ export function buildProgram(): Command {
       // own insertion order, and `Conversion` is built as one literal, so this preserves it.
       if (wantsJson(command)) emit({ ...conversion, recipe });
       else note(recipe);
+    });
+
+  program
+    .command("agent")
+    .description("Deterministic git mechanics for an agent's Setup Worktree phase.")
+    .command("preflight")
+    .description("Run the Setup Worktree checks and print the verdict as JSON")
+    .requiredOption("--issue <id>", "The run's primary issue identifier, e.g. EXC-997")
+    .option("--base <branch>", "What the worktree will be based on; skips the default-branch sync")
+    .action(async (options) => {
+      emit(await preflight(options.issue, process.cwd(), { base: options.base }));
     });
 
   return program;
