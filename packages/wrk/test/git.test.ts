@@ -70,20 +70,13 @@ function makeRepo(): string {
   return dir;
 }
 
-/** A repository with no work tree, standing in for the bare-repo container's `.bare`. */
-function makeBare(): string {
-  const dir = tempDir();
-  execFileSync("git", ["init", "-q", "--bare", dir]);
-  return dir;
-}
-
 /**
  * A bare-repo container in the layout `wrk` itself uses: a `.bare` repository, a `.git`
- * file pointing at it, and each checkout a sibling directory.
+ * file pointing at it, and each checkout a sibling directory named after its branch.
  *
- * Reproduced rather than approximated because it is the only layout whose
- * `worktree list --porcelain` output contains a `bare` record at all — the entry the parser
- * has to drop, and one a plain repository never produces.
+ * Reproduced rather than approximated, because it is the shape every wrapper here has to
+ * survive — and the only one whose `worktree list --porcelain` output contains a `bare`
+ * record at all, which is the entry the parser must drop.
  */
 function makeContainer(): string {
   const dir = tempDir();
@@ -94,12 +87,12 @@ function makeContainer(): string {
 }
 
 let repo: string;
-let bare: string;
+let container: string;
 let notARepo: string;
 
 beforeAll(() => {
   repo = makeRepo();
-  bare = makeBare();
+  container = makeContainer();
   notARepo = tempDir();
 });
 
@@ -112,9 +105,10 @@ describe("git", () => {
     // The reason this module has a runner at all. `GIT_DIR` in the inherited environment
     // silently overrides `cwd`, so without the scrub every wrapper here would answer for
     // whatever repository the parent process happened to be pointed at — and `wrk` is run
-    // from inside git hooks and `git` subcommands, which is exactly where GIT_DIR is set.
+    // from inside git hooks and aliases, which is exactly where git exports them.
     const other = makeRepo();
     process.env.GIT_DIR = join(other, ".git");
+    process.env.GIT_WORK_TREE = other;
     try {
       const { stdout } = await git(
         ["rev-parse", "--path-format=absolute", "--show-toplevel"],
@@ -124,6 +118,25 @@ describe("git", () => {
       expect(stdout.trim()).toBe(repo);
     } finally {
       delete process.env.GIT_DIR;
+      delete process.env.GIT_WORK_TREE;
+    }
+  });
+
+  test("sheds the GIT_INDEX_FILE git exports to every hook", async () => {
+    // The variable that makes an incomplete scrub dangerous rather than merely incomplete:
+    // it is set in every hook's environment, it survives a GIT_DIR-only scrub, and it makes
+    // a clean checkout report as dirty — a wrong answer rather than a failure.
+    const probe = makeRepo();
+    const side = join(tempDir(), "side");
+    execFileSync("git", ["worktree", "add", "-q", side, "-b", "side"], { cwd: probe });
+    writeFileSync(join(side, "staged.txt"), "x");
+    execFileSync("git", ["add", "staged.txt"], { cwd: side });
+
+    process.env.GIT_INDEX_FILE = join(probe, ".git", "worktrees", "side", "index");
+    try {
+      expect(await statusPorcelain(probe)).toEqual([]);
+    } finally {
+      delete process.env.GIT_INDEX_FILE;
     }
   });
 
@@ -139,11 +152,12 @@ describe("showToplevel", () => {
     expect(await showToplevel(repo)).toBe(repo);
   });
 
-  test("returns null where there is no work tree", async () => {
+  test("returns null in the container, which has no work tree", async () => {
     // The container half of the three-state check EXC-993 builds on: no work tree here,
     // but `gitCommonDir` below still answers, and that pair is what distinguishes the
     // container from somewhere outside the repository entirely.
-    expect(await showToplevel(bare)).toBeNull();
+    expect(await showToplevel(container)).toBeNull();
+    expect(await gitCommonDir(container)).toBe(join(container, ".bare"));
   });
 });
 
@@ -152,11 +166,10 @@ describe("gitCommonDir", () => {
     // The distinction the whole repo model hangs off: a linked worktree's `--git-dir` is
     // `<main>/.git/worktrees/<name>`, private to it, while `--git-common-dir` is the
     // repository's shared directory and so resolves identically from every checkout.
-    const linked = join(tempDir(), "linked");
-    execFileSync("git", ["worktree", "add", "-q", linked, "-b", "linked"], { cwd: repo });
+    const checkout = join(container, "main");
 
-    expect(await gitCommonDir(linked)).toBe(join(repo, ".git"));
-    expect(await gitCommonDir(linked)).toBe(await gitCommonDir(repo));
+    expect(await gitCommonDir(checkout)).toBe(join(container, ".bare"));
+    expect(await gitCommonDir(checkout)).toBe(await gitCommonDir(container));
   });
 
   test("returns null outside a repository", async () => {
@@ -165,14 +178,14 @@ describe("gitCommonDir", () => {
 });
 
 describe("isInsideWorkTree", () => {
-  test("is true inside a checkout and false without a work tree", async () => {
-    expect(await isInsideWorkTree(repo)).toBe(true);
-    expect(await isInsideWorkTree(bare)).toBe(false);
+  test("is true inside a checkout and false in the container", async () => {
+    expect(await isInsideWorkTree(join(container, "main"))).toBe(true);
+    expect(await isInsideWorkTree(container)).toBe(false);
   });
 
   test("is false outside a repository", async () => {
     // Git exits 128 here rather than printing `false`, so this is a distinct code path
-    // from the bare case above, not a restatement of it.
+    // from the container case above, not a restatement of it.
     expect(await isInsideWorkTree(notARepo)).toBe(false);
   });
 });
@@ -182,9 +195,24 @@ describe("currentBranch", () => {
     expect(await currentBranch(repo)).toBe("main");
   });
 
+  test("is not confused by a tag that shadows the branch name", async () => {
+    // `rev-parse --abbrev-ref HEAD` shortens ambiguously and answers `heads/main` here,
+    // which is not a name any caller can use and does not match the fully qualified refs
+    // `listWorktrees` reports.
+    const shadowed = makeRepo();
+    execFileSync("git", ["tag", "main", "HEAD"], { cwd: shadowed });
+
+    expect(await currentBranch(shadowed)).toBe("main");
+  });
+
+  test("returns the branch a first commit would land on in an empty repository", async () => {
+    const unborn = tempDir();
+    execFileSync("git", ["init", "-q", "-b", "main", unborn]);
+
+    expect(await currentBranch(unborn)).toBe("main");
+  });
+
   test("returns null on a detached HEAD", async () => {
-    // `rev-parse --abbrev-ref HEAD` answers with the literal string "HEAD" when detached,
-    // which a caller would otherwise store and later look up as a branch name.
     const detached = join(tempDir(), "detached");
     execFileSync("git", ["worktree", "add", "-q", "--detach", detached], { cwd: repo });
 
@@ -198,17 +226,17 @@ describe("currentBranch", () => {
 
 describe("forEachRef", () => {
   test("lists matching refs", async () => {
-    expect(await forEachRef(["refs/heads/main"], undefined, repo)).toEqual(["refs/heads/main"]);
+    expect(await forEachRef(["refs/heads/main"], repo)).toEqual(["refs/heads/main"]);
   });
 
   test("applies a custom format", async () => {
-    expect(await forEachRef(["refs/heads/main"], "%(refname:short)", repo)).toEqual(["main"]);
+    expect(await forEachRef(["refs/heads/main"], repo, "%(refname:short)")).toEqual(["main"]);
   });
 
   test("returns an empty array when nothing matches", async () => {
     // Git exits 0 with empty stdout, and `"".split("\n")` is `[""]` rather than `[]` — so
     // this pins the filtering, not git.
-    expect(await forEachRef(["refs/heads/no-such-prefix"], undefined, repo)).toEqual([]);
+    expect(await forEachRef(["refs/heads/no-such-prefix"], repo)).toEqual([]);
   });
 });
 
@@ -240,26 +268,46 @@ describe("refExists", () => {
   });
 });
 
+describe("the throwing half of the contract", () => {
+  test("a query with no honest empty answer throws instead of returning one", async () => {
+    // Without this, swapping `gitOk` back to `git` in any of the three would return `[]`
+    // for "not a repository" and pass the entire rest of the suite.
+    await expect(listWorktrees(notARepo)).rejects.toThrow(/worktree list/);
+    await expect(statusPorcelain(notARepo)).rejects.toThrow(/status/);
+    await expect(forEachRef(["refs/heads"], notARepo)).rejects.toThrow(/for-each-ref/);
+  });
+});
+
 describe("listWorktrees", () => {
   test("captures prunable on the same record as the branch it belongs to", async () => {
     // The trap the issue names, and the reason records are parsed whole. Git emits
     // `prunable` *after* `branch`, so a parser that emits a worktree the moment it sees a
     // branch line never sees the reason — and a stale worktree reads as live, which is how
     // `wrk` ends up handing a dead path to something that acts on it.
-    const container = makeContainer();
-    const gone = join(container, "gone");
-    execFileSync("git", ["worktree", "add", "-q", gone, "-b", "gone"], { cwd: container });
+    const own = makeContainer();
+    const gone = join(own, "gone");
+    execFileSync("git", ["worktree", "add", "-q", gone, "-b", "gone"], { cwd: own });
     rmSync(gone, { recursive: true, force: true });
 
-    const entry = (await listWorktrees(container)).find((wt) => wt.path === gone);
+    const entry = (await listWorktrees(own)).find((wt) => wt.path === gone);
 
     expect(entry?.branch).toBe("refs/heads/gone");
     expect(entry?.prunable).not.toBeNull();
   });
 
-  test("skips the bare entry and keeps the real checkouts", async () => {
-    const container = makeContainer();
+  test("keeps a record whose path contains a newline in one piece", async () => {
+    // The whole reason for `-z`. Under plain `--porcelain` this record splits in two and
+    // the tail reads as a worktree at "break" — a path `removeWorktree` would then act on.
+    const own = makeContainer();
+    const awkward = join(own, "line\nbreak");
+    execFileSync("git", ["worktree", "add", "-q", awkward, "-b", "awkward"], { cwd: own });
 
+    const entry = (await listWorktrees(own)).find((wt) => wt.path === awkward);
+
+    expect(entry?.branch).toBe("refs/heads/awkward");
+  });
+
+  test("skips the bare entry and keeps the real checkouts", async () => {
     const paths = (await listWorktrees(container)).map((wt) => wt.path);
 
     expect(paths).not.toContain(join(container, ".bare"));
@@ -267,8 +315,6 @@ describe("listWorktrees", () => {
   });
 
   test("reports path, head and branch for a live worktree", async () => {
-    const container = makeContainer();
-
     const [entry] = await listWorktrees(container);
 
     expect(entry?.path).toBe(join(container, "main"));
@@ -277,12 +323,24 @@ describe("listWorktrees", () => {
     expect(entry?.prunable).toBeNull();
   });
 
-  test("reports a detached worktree with a null branch", async () => {
-    const container = makeContainer();
-    const detached = join(container, "detached");
-    execFileSync("git", ["worktree", "add", "-q", "--detach", detached], { cwd: container });
+  test("reports a null head on a branch with no commit yet", async () => {
+    // Git writes the all-zeros object id here, which is not a commit-ish a caller can hand
+    // back to it — so the field would otherwise carry a value that looks usable and is not.
+    const unborn = tempDir();
+    execFileSync("git", ["init", "-q", "-b", "main", unborn]);
 
-    const entry = (await listWorktrees(container)).find((wt) => wt.path === detached);
+    const [entry] = await listWorktrees(unborn);
+
+    expect(entry?.head).toBeNull();
+    expect(entry?.branch).toBe("refs/heads/main");
+  });
+
+  test("reports a detached worktree with a null branch", async () => {
+    const own = makeContainer();
+    const detached = join(own, "detached");
+    execFileSync("git", ["worktree", "add", "-q", "--detach", detached], { cwd: own });
+
+    const entry = (await listWorktrees(own)).find((wt) => wt.path === detached);
 
     expect(entry).toBeDefined();
     expect(entry?.branch).toBeNull();
@@ -291,72 +349,72 @@ describe("listWorktrees", () => {
 
 describe("addWorktree", () => {
   test("creates a worktree holding a new branch", async () => {
-    const container = makeContainer();
-    const added = join(container, "feature");
+    const own = makeContainer();
+    const added = join(own, "feature");
 
-    await addWorktree(added, { branch: "feature" }, container);
+    await addWorktree(added, own, { branch: "feature" });
 
-    const entry = (await listWorktrees(container)).find((wt) => wt.path === added);
+    const entry = (await listWorktrees(own)).find((wt) => wt.path === added);
     expect(entry?.branch).toBe("refs/heads/feature");
   });
 
   test("starts the new branch at the given start point", async () => {
-    const container = makeContainer();
-    const added = join(container, "from-main");
+    const own = makeContainer();
+    const added = join(own, "from-main");
 
-    await addWorktree(added, { branch: "from-main", startPoint: "main" }, container);
+    await addWorktree(added, own, { branch: "from-main", startPoint: "main" });
 
-    const list = await listWorktrees(container);
+    const list = await listWorktrees(own);
     expect(list.find((wt) => wt.path === added)?.head).toBe(
-      list.find((wt) => wt.path === join(container, "main"))?.head,
+      list.find((wt) => wt.path === join(own, "main"))?.head,
     );
   });
 
   test("rejects with git's own message when git refuses", async () => {
-    const container = makeContainer();
+    const own = makeContainer();
 
     // The main checkout already exists, so git declines — and the caller needs to be told
     // why, not handed a silent no-op.
-    await expect(
-      addWorktree(join(container, "main"), { branch: "dup" }, container),
-    ).rejects.toThrow(/git worktree add/);
+    await expect(addWorktree(join(own, "main"), own, { branch: "dup" })).rejects.toThrow(
+      /git worktree add/,
+    );
   });
 });
 
 describe("removeWorktree", () => {
   test("removes a clean worktree", async () => {
-    const container = makeContainer();
-    const added = join(container, "throwaway");
-    await addWorktree(added, { branch: "throwaway" }, container);
+    const own = makeContainer();
+    const added = join(own, "throwaway");
+    await addWorktree(added, own, { branch: "throwaway" });
 
-    await removeWorktree(added, undefined, container);
+    await removeWorktree(added, own);
 
-    expect((await listWorktrees(container)).map((wt) => wt.path)).not.toContain(added);
+    expect((await listWorktrees(own)).map((wt) => wt.path)).not.toContain(added);
   });
 
   test("refuses a dirty worktree unless forced", async () => {
-    const container = makeContainer();
-    const added = join(container, "dirty");
-    await addWorktree(added, { branch: "dirty" }, container);
+    const own = makeContainer();
+    const added = join(own, "dirty");
+    await addWorktree(added, own, { branch: "dirty" });
     writeFileSync(join(added, "untracked.txt"), "x");
 
-    await expect(removeWorktree(added, undefined, container)).rejects.toThrow();
+    await expect(removeWorktree(added, own)).rejects.toThrow();
 
-    await removeWorktree(added, { force: true }, container);
+    await removeWorktree(added, own, { force: true });
 
-    expect((await listWorktrees(container)).map((wt) => wt.path)).not.toContain(added);
+    expect((await listWorktrees(own)).map((wt) => wt.path)).not.toContain(added);
   });
 });
 
 describe("pruneWorktrees", () => {
   test("drops the administrative entry for a worktree whose directory is gone", async () => {
-    const container = makeContainer();
-    const gone = join(container, "gone");
-    await addWorktree(gone, { branch: "gone" }, container);
+    const own = makeContainer();
+    const gone = join(own, "gone");
+    await addWorktree(gone, own, { branch: "gone" });
     rmSync(gone, { recursive: true, force: true });
 
-    await pruneWorktrees(container);
+    await pruneWorktrees(own);
 
-    expect((await listWorktrees(container)).map((wt) => wt.path)).not.toContain(gone);
+    expect((await listWorktrees(own)).map((wt) => wt.path)).not.toContain(gone);
   });
 });

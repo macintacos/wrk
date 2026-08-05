@@ -5,19 +5,28 @@
  * how git spells it, and layered on {@link run} from `./proc`. Porcelain output formats are
  * parsed here so no caller has to know which git version prints what.
  *
- * Two conventions run through the whole module.
+ * Three conventions run through the whole module.
  *
- * **A wrapper answers "no" only where git's nonzero exit encodes a specific expected
- * negative answer** — no such ref, not a symbolic ref, not in a work tree. Those return
- * `null` or `false`, inheriting {@link run}'s "a nonzero exit is a value" contract.
- * Everything else insists on success and throws with git's own stderr, because an empty
- * result would launder a real failure into a plausible-looking answer.
+ * **`cwd` is the first optional parameter of every wrapper**, since it is the one thing
+ * every caller varies — `wrk` exists to operate on checkouts other than the one it is
+ * running in. Options that tune a command come after it, so no call site has to pass
+ * `undefined` to reach the argument it actually cares about.
+ *
+ * **A query reads any refusal as "no"; a command with no "no" to express throws.**
+ * {@link showToplevel}, {@link gitCommonDir}, {@link isInsideWorkTree}, {@link currentBranch},
+ * {@link symbolicRef} and {@link refExists} answer `null` or `false` for every nonzero exit,
+ * including "not a repository" — a caller's next move is the same whichever it was, and the
+ * first two are themselves how repo-ness gets probed. {@link listWorktrees},
+ * {@link forEachRef}, {@link statusPorcelain} and the worktree mutations have no such
+ * answer, so they throw carrying git's own stderr rather than return an empty result a
+ * caller would read as real.
  *
  * **Output is fully buffered**, since {@link run} has no `maxBuffer` equivalent. That is a
- * deliberate call rather than an oversight: nothing here runs `git log` or `git diff`, so
- * the largest output any wrapper can produce is bounded by the repository's current state —
- * its refs, its worktrees, its dirty paths — at tens of bytes per line, never by the size
- * of history. Whoever adds a diff or log wrapper owns that decision separately.
+ * deliberate call rather than an oversight: no wrapper here runs `git log` or `git diff`, so
+ * the largest output any of them can produce is bounded by the repository's current state —
+ * its refs, its worktrees, its dirty paths — at tens of bytes per line, never by the size of
+ * history. The bound is a property of which commands are wrapped, not something enforced:
+ * {@link git} is exported and will buffer whatever it is handed.
  *
  * @packageDocumentation
  */
@@ -25,14 +34,46 @@
 import { type RunResult, run } from "./proc";
 
 /**
+ * Every variable `git rev-parse --local-env-vars` reports, mapped to `undefined` so
+ * {@link git} unsets each one.
+ *
+ * This is git's own answer to "what binds me to one particular repository", and therefore
+ * the complete set of things that can override a `cwd`. Two of them do real damage and are
+ * not obvious: git exports `GIT_INDEX_FILE` to **every hook**, which points
+ * {@link statusPorcelain} at another worktree's index and makes a clean checkout report as
+ * dirty; and `GIT_COMMON_DIR` redirects {@link gitCommonDir} and {@link listWorktrees}
+ * wholesale, which is how a worktree list ends up describing a different repository than the
+ * one about to be acted on.
+ *
+ * Re-derive the list from `git rev-parse --local-env-vars` rather than editing it by hand.
+ */
+const LOCAL_REPO_ENV: Record<string, undefined> = Object.fromEntries(
+  [
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_CONFIG",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_IMPLICIT_WORK_TREE",
+    "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE",
+    "GIT_NO_REPLACE_OBJECTS",
+    "GIT_REPLACE_REF_BASE",
+    "GIT_PREFIX",
+    "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR",
+  ].map((name) => [name, undefined]),
+);
+
+/**
  * Runs `git` with `args` in `cwd` and resolves with what it said — the escape hatch for any
  * plumbing command this module does not wrap.
  *
- * `GIT_DIR` and `GIT_WORK_TREE` are unset for the child. Both silently override `cwd` when
- * inherited, which would make every wrapper in this module answer for whatever repository
- * the parent process was pointed at instead of the one asked for — and `wrk` is run from
- * inside git hooks and aliases, which is precisely where git exports them. Doing it here
- * rather than per wrapper means the next wrapper anyone adds cannot forget it.
+ * Every repository-binding variable in the inherited environment is unset for the child
+ * (see {@link LOCAL_REPO_ENV}), so `cwd` alone decides which repository answers. Doing it
+ * here rather than per wrapper is what keeps it true of the next wrapper anyone adds.
  *
  * A nonzero exit resolves rather than throwing, exactly as {@link run} does.
  *
@@ -40,7 +81,7 @@ import { type RunResult, run } from "./proc";
  * @param cwd - Directory to run in. Defaults to this process's cwd.
  */
 export function git(args: string[], cwd?: string): Promise<RunResult> {
-  return run("git", args, { cwd, env: { GIT_DIR: undefined, GIT_WORK_TREE: undefined } });
+  return run("git", args, { cwd, env: LOCAL_REPO_ENV });
 }
 
 /**
@@ -72,10 +113,9 @@ function lines(stdout: string): string[] {
 }
 
 /** Runs `git rev-parse` with `args`, returning trimmed stdout, or `null` if git refused. */
-function revParse(args: string[], cwd?: string): Promise<string | null> {
-  return git(["rev-parse", ...args], cwd).then(({ stdout, code }) =>
-    code === 0 ? stdout.trim() : null,
-  );
+async function revParse(args: string[], cwd?: string): Promise<string | null> {
+  const { stdout, code } = await git(["rev-parse", ...args], cwd);
+  return code === 0 ? stdout.trim() : null;
 }
 
 /**
@@ -114,32 +154,42 @@ export async function isInsideWorkTree(cwd?: string): Promise<boolean> {
   return (await revParse(["--is-inside-work-tree"], cwd)) === "true";
 }
 
+/** The `refs/heads/` prefix {@link currentBranch} strips. */
+const BRANCH_PREFIX = "refs/heads/";
+
 /**
  * The short name of the checked-out branch, or `null` when there is not one.
  *
- * `null` means detached HEAD, an unborn branch, or no repository. Git reports a detached
- * HEAD as the literal string `HEAD`, which a caller would otherwise store and later fail to
- * look up as a branch; that case is folded into `null` here. A branch genuinely named `HEAD`
- * is indistinguishable, which git itself warns about at creation time.
+ * `null` means a detached HEAD or no repository. On an unborn branch — a fresh repository
+ * with no commit — the branch name is still reported, because it is still the branch a commit
+ * would land on.
+ *
+ * Read through `symbolic-ref` rather than `rev-parse --abbrev-ref HEAD`, which the issue's
+ * acceptance criteria name. `--abbrev-ref` shortens ambiguously: with a tag named `main`
+ * alongside the branch `main` it answers `heads/main`, which is not a name any caller can use
+ * — `refs/heads/` + it is `refs/heads/heads/main` — and which would not match the
+ * fully-qualified refs {@link listWorktrees} reports. `symbolic-ref` reads HEAD exactly, and
+ * exits nonzero when detached, so the "HEAD means detached" special case disappears with it.
  */
 export async function currentBranch(cwd?: string): Promise<string | null> {
-  const branch = await revParse(["--abbrev-ref", "HEAD"], cwd);
-  return branch === "HEAD" ? null : branch;
+  const ref = await symbolicRef("HEAD", cwd);
+  if (ref === null || !ref.startsWith(BRANCH_PREFIX)) return null;
+  return ref.slice(BRANCH_PREFIX.length);
 }
 
 /**
  * Refs matching `patterns`, one entry per ref.
  *
  * @param patterns - Ref patterns, e.g. `["refs/heads"]`. Matching nothing is not an error.
+ * @param cwd - Directory to run in.
  * @param format - A `for-each-ref` format string. A format containing newlines splits one
  *   ref across several entries.
- * @param cwd - Directory to run in.
  * @throws If git failed — matching no refs returns `[]` rather than failing.
  */
 export async function forEachRef(
   patterns: string[],
-  format = "%(refname)",
   cwd?: string,
+  format = "%(refname)",
 ): Promise<string[]> {
   return lines(await gitOk(["for-each-ref", `--format=${format}`, ...patterns], cwd));
 }
@@ -152,10 +202,16 @@ export async function forEachRef(
  * path masquerading as an entry. Line mode always puts one entry on one line, at the cost of
  * C-quoting paths containing unusual characters.
  *
+ * `--no-optional-locks` because reading status is not worth contending for `index.lock`:
+ * plain `git status` rewrites the refreshed index, so surveying several worktrees — or
+ * running while an editor does its own background `status` — turns into an intermittent
+ * "Unable to create index.lock" failure. The reported entries are unchanged; only the
+ * cache write is skipped.
+ *
  * @throws If git failed.
  */
 export async function statusPorcelain(cwd?: string): Promise<string[]> {
-  return lines(await gitOk(["status", "--porcelain"], cwd));
+  return lines(await gitOk(["--no-optional-locks", "status", "--porcelain"], cwd));
 }
 
 /**
@@ -234,7 +290,10 @@ function parseWorktree(record: string): Worktree | null {
         path = value;
         break;
       case "HEAD":
-        head = value;
+        // Git writes the all-zeros object id for a branch with no commit yet, which is not
+        // a commit-ish any caller can hand back to it. Matched by shape rather than by
+        // length so SHA-256 repositories, where it is 64 characters, are covered too.
+        head = /^0+$/.test(value) ? null : value;
         break;
       case "branch":
         branch = value;
@@ -283,13 +342,18 @@ export interface WorktreeAddOptions {
 /**
  * Creates a worktree at `path`.
  *
+ * **With neither option set, git's own convenience DWIM takes over** and creates a branch
+ * named after `path`'s basename — or, where `worktree.guessRemote` is configured, tracks a
+ * same-named remote branch instead. Pass `branch` to decide the name rather than inheriting
+ * it from a directory name and a config setting.
+ *
  * @throws If git refused — the path is taken, the branch already exists, or the branch is
  *   checked out somewhere else. The message carries git's own stderr.
  */
 export async function addWorktree(
   path: string,
-  options: WorktreeAddOptions = {},
   cwd?: string,
+  options: WorktreeAddOptions = {},
 ): Promise<void> {
   const args = ["worktree", "add"];
   if (options.branch !== undefined) args.push("-b", options.branch);
@@ -311,8 +375,8 @@ export interface WorktreeRemoveOptions {
  */
 export async function removeWorktree(
   path: string,
-  options: WorktreeRemoveOptions = {},
   cwd?: string,
+  options: WorktreeRemoveOptions = {},
 ): Promise<void> {
   const args = ["worktree", "remove"];
   if (options.force === true) args.push("--force");
