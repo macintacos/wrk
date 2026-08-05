@@ -32,6 +32,35 @@ import {
   symbolicRef,
 } from "../src/git";
 
+/**
+ * The environment for fixture commands: this process's, minus everything binding git to a
+ * repository.
+ *
+ * Read from git itself rather than from `../src/git`, so the fixtures stay independent of
+ * the module they build repositories for, and stay complete if git grows another variable.
+ */
+const FIXTURE_ENV: Record<string, string | undefined> = {
+  ...process.env,
+  ...Object.fromEntries(
+    execFileSync("git", ["rev-parse", "--local-env-vars"], { encoding: "utf8" })
+      .split("\n")
+      .filter((name) => name !== "")
+      .map((name) => [name, undefined]),
+  ),
+};
+
+/**
+ * Runs `git` to build a fixture, with any inherited repository binding shed.
+ *
+ * Not a convenience. This suite runs under the repository's own pre-push hook, and git
+ * exports `GIT_DIR` to every hook — under which `git init <dir>` re-initialises *that*
+ * repository and leaves `<dir>` empty, so every fixture collapses. It is the same trap
+ * `git.ts` exists to close, arriving from the other side.
+ */
+function fixtureGit(args: string[], cwd?: string): void {
+  execFileSync("git", args, { cwd, env: FIXTURE_ENV });
+}
+
 /** Temp roots to delete once the suite finishes. */
 const roots: string[] = [];
 
@@ -51,22 +80,9 @@ function tempDir(): string {
 /** A repository on branch `main` with exactly one commit. */
 function makeRepo(): string {
   const dir = tempDir();
-  execFileSync("git", ["init", "-q", "-b", "main", dir]);
-  execFileSync(
-    "git",
-    [
-      "-c",
-      "user.email=t@example.com",
-      "-c",
-      "user.name=T",
-      "commit",
-      "-q",
-      "--allow-empty",
-      "-m",
-      "init",
-    ],
-    { cwd: dir },
-  );
+  fixtureGit(["init", "-q", "-b", "main", dir]);
+  const identity = ["-c", "user.email=t@example.com", "-c", "user.name=T"];
+  fixtureGit([...identity, "commit", "-q", "--allow-empty", "-m", "init"], dir);
   return dir;
 }
 
@@ -80,9 +96,9 @@ function makeRepo(): string {
  */
 function makeContainer(): string {
   const dir = tempDir();
-  execFileSync("git", ["clone", "-q", "--bare", makeRepo(), join(dir, ".bare")]);
+  fixtureGit(["clone", "-q", "--bare", makeRepo(), join(dir, ".bare")]);
   writeFileSync(join(dir, ".git"), "gitdir: ./.bare\n");
-  execFileSync("git", ["worktree", "add", "-q", join(dir, "main"), "main"], { cwd: dir });
+  fixtureGit(["worktree", "add", "-q", join(dir, "main"), "main"], dir);
   return dir;
 }
 
@@ -128,9 +144,9 @@ describe("git", () => {
     // a clean checkout report as dirty — a wrong answer rather than a failure.
     const probe = makeRepo();
     const side = join(tempDir(), "side");
-    execFileSync("git", ["worktree", "add", "-q", side, "-b", "side"], { cwd: probe });
+    fixtureGit(["worktree", "add", "-q", side, "-b", "side"], probe);
     writeFileSync(join(side, "staged.txt"), "x");
-    execFileSync("git", ["add", "staged.txt"], { cwd: side });
+    fixtureGit(["add", "staged.txt"], side);
 
     process.env.GIT_INDEX_FILE = join(probe, ".git", "worktrees", "side", "index");
     try {
@@ -200,21 +216,21 @@ describe("currentBranch", () => {
     // which is not a name any caller can use and does not match the fully qualified refs
     // `listWorktrees` reports.
     const shadowed = makeRepo();
-    execFileSync("git", ["tag", "main", "HEAD"], { cwd: shadowed });
+    fixtureGit(["tag", "main", "HEAD"], shadowed);
 
     expect(await currentBranch(shadowed)).toBe("main");
   });
 
   test("returns the branch a first commit would land on in an empty repository", async () => {
     const unborn = tempDir();
-    execFileSync("git", ["init", "-q", "-b", "main", unborn]);
+    fixtureGit(["init", "-q", "-b", "main", unborn]);
 
     expect(await currentBranch(unborn)).toBe("main");
   });
 
   test("returns null on a detached HEAD", async () => {
     const detached = join(tempDir(), "detached");
-    execFileSync("git", ["worktree", "add", "-q", "--detach", detached], { cwd: repo });
+    fixtureGit(["worktree", "add", "-q", "--detach", detached], repo);
 
     expect(await currentBranch(detached)).toBeNull();
   });
@@ -286,7 +302,7 @@ describe("listWorktrees", () => {
     // `wrk` ends up handing a dead path to something that acts on it.
     const own = makeContainer();
     const gone = join(own, "gone");
-    execFileSync("git", ["worktree", "add", "-q", gone, "-b", "gone"], { cwd: own });
+    fixtureGit(["worktree", "add", "-q", gone, "-b", "gone"], own);
     rmSync(gone, { recursive: true, force: true });
 
     const entry = (await listWorktrees(own)).find((wt) => wt.path === gone);
@@ -300,7 +316,7 @@ describe("listWorktrees", () => {
     // the tail reads as a worktree at "break" — a path `removeWorktree` would then act on.
     const own = makeContainer();
     const awkward = join(own, "line\nbreak");
-    execFileSync("git", ["worktree", "add", "-q", awkward, "-b", "awkward"], { cwd: own });
+    fixtureGit(["worktree", "add", "-q", awkward, "-b", "awkward"], own);
 
     const entry = (await listWorktrees(own)).find((wt) => wt.path === awkward);
 
@@ -327,7 +343,7 @@ describe("listWorktrees", () => {
     // Git writes the all-zeros object id here, which is not a commit-ish a caller can hand
     // back to it — so the field would otherwise carry a value that looks usable and is not.
     const unborn = tempDir();
-    execFileSync("git", ["init", "-q", "-b", "main", unborn]);
+    fixtureGit(["init", "-q", "-b", "main", unborn]);
 
     const [entry] = await listWorktrees(unborn);
 
@@ -338,7 +354,7 @@ describe("listWorktrees", () => {
   test("reports a detached worktree with a null branch", async () => {
     const own = makeContainer();
     const detached = join(own, "detached");
-    execFileSync("git", ["worktree", "add", "-q", "--detach", detached], { cwd: own });
+    fixtureGit(["worktree", "add", "-q", "--detach", detached], own);
 
     const entry = (await listWorktrees(own)).find((wt) => wt.path === detached);
 
