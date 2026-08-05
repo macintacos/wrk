@@ -63,12 +63,17 @@
  */
 
 /**
- * What every human-facing failure line is prefixed with.
+ * What every human-facing line `wrk` writes is prefixed with.
  *
  * The tool's name, so a message stays attributable once it is one line among many in an
  * agent's transcript or a shell's scrollback.
+ *
+ * Exported for the modules that write their own progress and warnings through {@link note}
+ * rather than raising for {@link reportFailure} to render — provisioning a worktree is the
+ * first. A second literal `"wrk: "` elsewhere in the package is exactly the shape that drifts,
+ * which is the whole reason this is shared rather than restated.
  */
-const PREFIX = "wrk: ";
+export const PREFIX = "wrk: ";
 
 /**
  * Renders one payload as the envelope's JSON text, without the trailing newline.
