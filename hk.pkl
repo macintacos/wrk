@@ -31,8 +31,10 @@ import "package://github.com/jdx/hk/releases/download/v1.54.0/hk@1.54.0#/Builtin
 //      lane. The lane is `hk run test`; likewise `hk run typecheck`, since
 //      `hk typecheck` is not a subcommand at all.
 //
-// Both disappear if EXC-989's `.mise/tasks/` forwarders end up calling
-// `bun x tsc --noEmit` and `bun test` directly; revisit then.
+// `mise run typecheck` and `mise run test` call tsc and bun directly rather than
+// routing through these lanes: hk adds nothing to a whole-program command, and
+// `hk run test` has nowhere to put a forwarded test path. The lanes stay because
+// the pre-commit and pre-push hooks below are what run them.
 
 // tsc is a dev dependency rather than a mise tool, so it runs through bun. It is
 // a whole-program check: no `{{ files }}` argument, so a matching staged file
@@ -83,6 +85,14 @@ local formatters = new Mapping<String, Step> {
 
   ["TOML(Format)      [[builtins.taplo_format]]"] = Builtins.taplo_format
 
+  // Taken bare. The builtin's `match_any` already pairs an extension glob with a
+  // shebang-based `types` selector, so it reaches the extensionless
+  // .mise/tasks/* forwarders without a glob override — and in hk 1.54 adding one
+  // is not merely redundant but rejected, since `match_any` and a top-level
+  // `glob` cannot be combined. It runs `shfmt --apply-ignore` with no -i, and no
+  // .editorconfig section matches shell, so indentation is shfmt's default: tabs.
+  ["Shell(Format)     [[builtins.shfmt]]"] = Builtins.shfmt
+
   ["Pkl(Format)       [[builtins.pkl_format]]"] = Builtins.pkl_format
 }
 
@@ -107,6 +117,11 @@ local linters = new Mapping<String, Step> {
   }
 
   ["TOML(Lint)        [[builtins.taplo]]"] = Builtins.taplo
+
+  // Bare for the same reason as Shell(Format) — the builtin's shebang selector
+  // is what covers the forwarders, which are the shell this repo most needs
+  // linted and exactly the files an extension glob would miss.
+  ["Shell(Lint)       [[builtins.shellcheck]]"] = Builtins.shellcheck
 
   // pkl lints by evaluating the file, which resolves the remote amends/import
   // package (cached after the first run).

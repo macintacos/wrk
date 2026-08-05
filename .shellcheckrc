@@ -1,0 +1,12 @@
+# Follow `source`d files instead of skipping them (SC1091). The .mise/tasks/
+# forwarders all source scripts/bootstrap.sh, so without this the one file every
+# task depends on is the one file shellcheck never reads in context.
+#
+external-sources=true
+
+# Resolve each `# shellcheck source=` directive against the directory of the file
+# being checked rather than the current one, so a forwarder is followed the same
+# from the repo root, from an editor, or from anywhere else. Each directive then
+# spells its own relative path, which keeps this independent of how deep any
+# particular script sits.
+source-path=SCRIPTDIR
