@@ -12,14 +12,17 @@
  * the filesystem — {@link mintBranch} is handed the set of branches to avoid rather than
  * discovering it. That is what makes the rules cheap enough to pin exhaustively in tests,
  * which is precisely what the previous implementations lacked while they drifted. The
- * layers that own git state supply the inputs. Its one import, `node:crypto` for
- * {@link cacheSlug}'s digest, performs no I/O and reads nothing from the environment, so
- * the claim survives it.
+ * layers that own git state supply the inputs. Its two imports leave the claim intact:
+ * `node:crypto`, for {@link cacheSlug}'s digest, and `./output`, for the {@link Refusal}
+ * {@link mintBranch} throws — neither performs I/O at import nor reads the environment, and
+ * `output.ts` itself imports nothing at all.
  *
  * @packageDocumentation
  */
 
 import { createHash } from "node:crypto";
+
+import { Refusal } from "./output";
 
 /**
  * The project-key-and-number shape, written once and anchored differently below.
@@ -226,7 +229,11 @@ function slugify(title: string): string {
  * @param title - The issue's title, in any shape.
  * @param existing - Branches already taken. Defaults to none.
  * @returns A branch name of the form `<ISSUE-ID>/<slug>`.
- * @throws If `issue` is not a well-formed issue identifier.
+ * @throws {@link Refusal} If `issue` is not a well-formed issue identifier. A {@link Refusal}
+ *   rather than a plain `Error` because a malformed key is something a user typed — `EXC996`
+ *   for `EXC-996` — not a bug in `wrk`. `reportFailure` maps a refusal to one prefixed
+ *   `wrk:` line on stderr and exit `1`, and rethrows anything it does not recognise so the
+ *   runtime prints a stack; a plain `Error` here would answer a typo with that stack.
  *
  * @example
  * ```ts
@@ -239,7 +246,7 @@ function slugify(title: string): string {
  */
 export function mintBranch(issue: string, title: string, existing: Iterable<string> = []): string {
   if (!ISSUE_KEY_RE.test(issue)) {
-    throw new Error(`Not a well-formed issue identifier: ${issue}`);
+    throw new Refusal(`Not a well-formed issue identifier: ${issue} — expected a key like EXC-123`);
   }
 
   const slug = slugify(title).slice(0, MAX_SLUG_LENGTH).replace(/-+$/, "") || FALLBACK_SLUG;

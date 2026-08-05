@@ -47,11 +47,11 @@
  * **{@link CommandFailed} lives here, rather than beside `RunResult` in `proc.ts`, because
  * an exit rule needs a type to be expressed over.** `proc.ts` deliberately reports a
  * nonzero exit as a *value* and raises nothing, so an error class there would be one the
- * module itself never throws. The consequence is that `git.ts` imports this module — the
- * one arrow in the package that runs from plumbing towards presentation. It is safe to
- * leave pointing that way only because this module imports nothing at all and is not
- * permitted to: anything here that reached back for a repository-shaped value would close
- * the loop.
+ * module itself never throws. The consequence is that `git.ts` and `naming.ts` import this
+ * module — the two arrows in the package that run from plumbing towards presentation. They
+ * are safe to leave pointing that way only because this module imports nothing at all and
+ * is not permitted to: anything here that reached back for a repository-shaped value would
+ * close the loop.
  *
  * @packageDocumentation
  */
