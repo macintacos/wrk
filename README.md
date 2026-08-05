@@ -128,7 +128,16 @@ The envelope carries nine keys on every run — `verdict`, `reason`, `repo_root`
 `conversion_reference` — so any of them can be read unconditionally. `worktree_root` is
 the **container**, not a worktree; the name is misleading and frozen.
 **A blocked verdict leaves the repository byte-identical**: every check runs before the
-first mutation.
+first mutation of the repository.
+
+**Concurrent runs are safe, and need no lock from the caller.** The checkout preflight
+syncs is shared, and every checkout in a container has one git directory between them, so
+two runs overlapping would otherwise collide on `FETCH_HEAD` — which is `git pull`'s
+`fatal: Cannot fast-forward to multiple branches` — on the remote-tracking ref locks, and
+on `index.lock`. Worse than any of those, `git status` reads an index another run is
+part-way through replacing, so a clean checkout is reported dirty and the answer is wrong
+rather than absent. The sync and that dirty check are therefore one critical section,
+serialised inside `wrk` by a lock directory in the container.
 
 `wrk agent create` is what runs next, once preflight says proceed. It creates the branch
 and its worktree together, as a sibling of the default-branch checkout inside the
