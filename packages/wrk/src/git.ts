@@ -38,7 +38,7 @@
 
 import { z } from "zod";
 
-import { CommandFailed } from "./output";
+import { CommandFailed } from "./errors";
 import { type RunResult, run } from "./proc";
 
 /**

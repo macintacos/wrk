@@ -31,7 +31,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { Refusal } from "../src/output";
+import { Refusal } from "../src/errors";
 import { type PreflightReport, preflight } from "../src/preflight";
 import { type RunResult, run } from "../src/proc";
 

@@ -19,6 +19,7 @@ import { buildProgram, wantsJson } from "../src/cli";
 import { type RunResult, run } from "../src/proc";
 
 const CLI_MODULE = join(import.meta.dir, "../src/cli");
+const ERRORS_MODULE = join(import.meta.dir, "../src/errors");
 const OUTPUT_MODULE = join(import.meta.dir, "../src/output");
 
 /**
@@ -32,6 +33,7 @@ function inChild(body: string): Promise<RunResult> {
     "-e",
     [
       `import { buildProgram, main } from ${JSON.stringify(CLI_MODULE)};`,
+      `import * as errors from ${JSON.stringify(ERRORS_MODULE)};`,
       `import * as output from ${JSON.stringify(OUTPUT_MODULE)};`,
       "const program = buildProgram();",
       `program.command("probe").action(() => { ${body} });`,
@@ -100,7 +102,7 @@ describe("the global --json flag", () => {
 
 describe("main", () => {
   test("turns a refusal into exit 1 and one line on stderr", async () => {
-    const result = await inChild('throw new output.Refusal("cwd is not empty");');
+    const result = await inChild('throw new errors.Refusal("cwd is not empty");');
 
     expect(result.code).toBe(1);
     expect(result.stderr).toBe("wrk: cwd is not empty\n");
@@ -109,7 +111,7 @@ describe("main", () => {
 
   test("inherits the exit status of a command that failed underneath it", async () => {
     const result = await inChild(
-      'throw new output.CommandFailed(["git", "rev-parse"], 128, "fatal: not a repository");',
+      'throw new errors.CommandFailed(["git", "rev-parse"], 128, "fatal: not a repository");',
     );
 
     expect(result.code).toBe(128);

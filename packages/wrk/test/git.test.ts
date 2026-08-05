@@ -16,6 +16,7 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { CommandFailed } from "../src/errors";
 import {
   addWorktree,
   currentBranch,
@@ -33,7 +34,6 @@ import {
   statusPorcelain,
   symbolicRef,
 } from "../src/git";
-import { CommandFailed } from "../src/output";
 
 /**
  * The environment for fixture commands: this process's, minus everything binding git to a

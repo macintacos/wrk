@@ -65,10 +65,10 @@
 
 import { basename, join } from "node:path";
 
+import { Refusal } from "./errors";
 import { currentBranch, git, gitOk, statusPorcelain } from "./git";
 import { withLock } from "./lock";
 import { branchBelongsToIssue, isRunWorktree } from "./naming";
-import { Refusal } from "./output";
 import { isBareLayout, locate, resolveDefaultBranch } from "./repo";
 
 /**

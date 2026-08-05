@@ -28,7 +28,8 @@
 import { Command } from "@commander-js/extra-typings";
 
 import { renderConversion, resolveConversion } from "./convert";
-import { emit, emitLine, note, Refusal, reportFailure } from "./output";
+import { Refusal } from "./errors";
+import { emit, emitLine, note, reportFailure } from "./output";
 import { preflight } from "./preflight";
 import { createWorktree } from "./worktree";
 
