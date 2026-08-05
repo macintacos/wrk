@@ -18,9 +18,11 @@
  * including "not a repository" — a caller's next move is the same whichever it was, and the
  * first two are themselves how repo-ness gets probed. {@link listWorktrees},
  * {@link forEachRef}, {@link statusPorcelain} and the worktree mutations have no such
- * answer, so they throw carrying git's own stderr rather than return an empty result a
- * caller would read as real. {@link listWorktrees} has one further failure of its own: a
- * record it cannot read, which carries the record rather than any stderr.
+ * answer, so they throw a {@link CommandFailed} carrying git's own exit status and stderr
+ * rather than return an empty result a caller would read as real — the status being what
+ * lets `wrk` exit with the code of the command that failed underneath it.
+ * {@link listWorktrees} has one further failure of its own: a record it cannot read, which
+ * is a plain `Error` carrying the record rather than any stderr.
  *
  * **Output is fully buffered**, since {@link run} has no `maxBuffer` equivalent. That is a
  * deliberate call rather than an oversight: no wrapper here runs `git log` or `git diff`, so
@@ -322,8 +324,8 @@ const WORKTREE = z
  * @internal
  * @throws If the record is not one {@link WORKTREE} accepts, carrying the record itself.
  *   Git's own stderr says nothing about a record git successfully printed, so the record is
- *   what a reader needs — and the message follows {@link gitOk}'s shape rather than letting
- *   a `ZodError`'s issue array out of the module.
+ *   what a reader needs — and the message follows {@link CommandFailed}'s shape rather than
+ *   letting a `ZodError`'s issue array out of the module.
  */
 export function parseWorktree(record: string): Worktree | null {
   const attributes = Object.fromEntries(

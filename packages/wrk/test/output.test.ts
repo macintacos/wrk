@@ -109,9 +109,12 @@ describe("reportFailure", () => {
         'new output.CommandFailed(["git", "rev-parse", "--git-dir"], 128, "fatal: not a repository\\n"));',
     );
 
+    // Exact for the same reason the refusal case is exact: two `toContain`s would still
+    // pass against an implementation that printed a stack after the message.
     expect(result.code).toBe(128);
-    expect(result.stderr).toContain("git rev-parse --git-dir");
-    expect(result.stderr).toContain("fatal: not a repository");
+    expect(result.stderr).toBe(
+      "wrk: git rev-parse --git-dir failed (exit 128): fatal: not a repository\n",
+    );
     expect(result.stdout).toBe("");
   });
 

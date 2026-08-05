@@ -68,11 +68,14 @@ owns TOML.
 ## Output contract
 
 `wrk` is read by machines before it is read by people, so its two streams have separate
-jobs. **stdout is the machine channel**: one JSON object per run and nothing else.
-**stderr is the human channel**: progress, warnings and failure messages, whatever the
-run's outcome. A global `--json` flag puts a command that would otherwise print for a
-human onto the same envelope; the agent-facing commands are JSON either way, because their
-callers parse them either way.
+jobs. **stdout is the machine channel**: every answer a command produces goes there, as
+one JSON object per run. **stderr is the human channel**: progress, warnings and failure
+messages, whatever the run's outcome. `--help` is the exception that proves it — a caller
+asking for help is a human, so it renders on stdout and no envelope is involved.
+
+A global `--json` flag puts a command that would otherwise print for a human onto the same
+envelope. The agent-facing commands are JSON either way, because their callers parse them
+either way.
 
 The envelope **never omits a key**. A value the run did not reach is `null`, not a missing
 key, so `.reason` can be read unconditionally rather than guarded. Keys come out in the
@@ -80,11 +83,11 @@ order the result type declares them, so two runs of the same command diff cleanl
 
 Three exit rules, and the first is the one to know:
 
-| Outcome | Exit | Shape |
-| --- | --- | --- |
-| A verdict — **including one that says stop** | `0` | The envelope, on stdout. |
-| A refusal | `1` | One `wrk: …` line on stderr. No stack trace, nothing on stdout. |
-| A command `wrk` ran failed | that command's own status | Its message and stderr, on stderr. |
+| Outcome                                   | Exit        | Shape                                      |
+| ----------------------------------------- | ----------- | ------------------------------------------ |
+| A verdict — **including one saying stop** | `0`         | The envelope, on stdout.                   |
+| A refusal                                 | `1`         | One `wrk: …` line on stderr. Nothing else. |
+| A command `wrk` ran failed                | the child's | Its argv, status and stderr, on stderr.    |
 
 A well-formed "blocked" answer is a **successful run**: callers branch on the payload's
 verdict field, never on the exit status. An exit status that is not `0` means `wrk` has no

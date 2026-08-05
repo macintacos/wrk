@@ -59,7 +59,9 @@ export function buildProgram(): Command {
  * asks of its argument is that it can report its merged options.
  *
  * @param command - The command whose invocation is being asked about.
- * @returns `true` when `--json` appeared anywhere before the subcommand's arguments.
+ * @returns `true` when `--json` appeared anywhere in argv — before the subcommand name or
+ *   after its arguments alike, which is the consequence of the header's decision not to
+ *   enable positional options.
  *
  * @example
  * ```ts

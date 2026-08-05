@@ -78,6 +78,18 @@ describe("the global --json flag", () => {
     expect(seen).toEqual([true]);
   });
 
+  test("reaches it from after the subcommand's own arguments too", async () => {
+    // Not a second spelling of the case above: this one holds only because the root
+    // declines commander's positional-options settings, which the module header calls out
+    // as its one deliberate divergence from `scripts/tasks/cli.ts`. Adding either of them
+    // would leave `--json` here unclaimed, and every case that puts the flag first green.
+    const { program, seen } = withProbe();
+
+    await program.parseAsync(["probe", "--json"], { from: "user" });
+
+    expect(seen).toEqual([true]);
+  });
+
   test("is off when it was not asked for", async () => {
     const { program, seen } = withProbe();
 

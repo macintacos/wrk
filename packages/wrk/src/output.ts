@@ -6,18 +6,22 @@
  * is the whole of what those callers are promised — two channels, one envelope, three exit
  * rules — and it is deliberately the only place any of the three is decided.
  *
- * **stdout is the machine channel; stderr is the human one.** {@link emit} is the only
- * thing that writes to stdout, so a run's stdout is one JSON document and nothing else,
- * and every progress line, warning and failure message goes to stderr through
- * {@link note}. Interleaving the two is the failure this split exists to prevent: a single
- * "cloning…" line on stdout turns a parseable answer into a `jq` syntax error, and it does
- * so only on the runs slow enough to have printed progress.
+ * **stdout is the machine channel; stderr is the human one.** Every *answer* a command
+ * produces goes through {@link emit}, so a run's stdout is one JSON document, and every
+ * progress line, warning and failure message goes to stderr through {@link note}.
+ * Interleaving the two is the failure this split exists to prevent: a single "cloning…"
+ * line on stdout turns a parseable answer into a `jq` syntax error, and it does so only on
+ * the runs slow enough to have printed progress.
  *
- * **The envelope never omits a key.** An absent value is `null`, never a missing key, so a
- * caller reads any documented field unconditionally rather than guarding each one — see
- * {@link envelope}. Key order is the payload's own declaration order, which
- * `JSON.stringify` preserves; a result type declared once as a literal is therefore
- * serialized identically on every run, which is what makes a captured run diffable.
+ * Two things on stdout are **not** answers and are not this module's to route. Commander
+ * renders `--help` there itself, which is correct — a caller asking for help is a human.
+ * And an interactive component must be constructed against stderr (Ink's `render` takes a
+ * `stdout` option) rather than allowed its default, or its escape sequences land in the
+ * machine channel.
+ *
+ * **The envelope never omits a key**, and its keys keep a fixed order. An absent value is
+ * `null`, never a missing key, so a caller reads any documented field unconditionally
+ * rather than guarding each one. {@link envelope} holds both mechanisms.
  *
  * **Three exit rules, and the first is the surprising one.** A *verdict* — including one
  * that tells the caller to stop — exits `0`, because callers branch on the payload's
@@ -39,6 +43,15 @@
  * The streams come from `node:process` rather than from `Bun.stdout`, for the reason
  * `proc.ts` gives for its own choice: the published artifact targets Node, so a Bun-only
  * API here would have to be unpicked at build time.
+ *
+ * **{@link CommandFailed} lives here, rather than beside `RunResult` in `proc.ts`, because
+ * an exit rule needs a type to be expressed over.** `proc.ts` deliberately reports a
+ * nonzero exit as a *value* and raises nothing, so an error class there would be one the
+ * module itself never throws. The consequence is that `git.ts` imports this module — the
+ * one arrow in the package that runs from plumbing towards presentation. It is safe to
+ * leave pointing that way only because this module imports nothing at all and is not
+ * permitted to: anything here that reached back for a repository-shaped value would close
+ * the loop.
  *
  * @packageDocumentation
  */
@@ -70,8 +83,13 @@ const PREFIX = "wrk: ";
  * caller assembling a payload conditionally is the one shape that can vary, and the fix is
  * to build the literal whole rather than to add machinery here.
  *
- * @param payload - The object to render. An object, never a bare array or scalar: the
- *   contract is one JSON *object* per run.
+ * @param payload - The object to render, carrying JSON-native values only. `object` rather
+ *   than `Record<string, unknown>`, which reads tighter but rejects every `interface`-
+ *   declared result type in this package — TypeScript withholds an implicit index
+ *   signature from interfaces. So the type says "not a scalar" and no more, and two
+ *   constraints go unenforced: the payload is one JSON *object* per run, never a bare
+ *   array, and a `Map` or `Set` value renders as `{}` while a function- or symbol-valued
+ *   key is still dropped, both silently.
  * @returns Indented JSON, ready for {@link emit}.
  *
  * @example
@@ -169,7 +187,7 @@ export class CommandFailed extends Error {
  * @example
  * ```ts
  * try {
- *   await main();
+ *   await program.parseAsync(argv, { from: "user" });
  * } catch (error) {
  *   process.exitCode = reportFailure(error);
  * }
