@@ -1,12 +1,18 @@
 /**
  * Contract of the printed bare-repo conversion recipe.
  *
- * Two halves, tested differently on purpose. {@link resolveConversion} reads a real
+ * Three kinds of case, deliberately different in cost. {@link resolveConversion} reads a real
  * repository, so its cases drive the real `git` binary against repositories built in temp
  * directories — the same discipline `repo.test.ts` uses, and for the same reason: container
  * resolution is precisely the code that passes against a mock and fails against a real
- * layout. {@link renderConversion} takes a plain value and returns a string, so its cases
- * need no repository at all and assert the recipe's exact text.
+ * layout. {@link renderConversion} takes a plain value and returns a string, so its cases need
+ * no repository and assert the recipe's exact text. And one case *runs* a rendered recipe
+ * against a real repository, because every wording assertion here would stay green if the
+ * steps were reordered into something that no longer converts anything.
+ *
+ * Running a rendered recipe does not weaken "never executes anything" — that is a property of
+ * `src/convert.ts`, which does the rendering and nothing else. The `bash` below is this
+ * suite's, not the module's.
  *
  * Fixtures are built with `execFileSync` rather than with this module's own wrappers, so a
  * broken wrapper cannot quietly build the repository that then proves it correct.
@@ -14,11 +20,12 @@
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { type Conversion, renderConversion, resolveConversion } from "../src/convert";
+import { checkoutFor, isBareLayout } from "../src/repo";
 
 /**
  * The environment for fixture commands: this process's, minus everything binding git to a
@@ -36,6 +43,9 @@ const FIXTURE_ENV: Record<string, string | undefined> = {
       .map((name) => [name, undefined]),
   ),
 };
+
+/** Identity for fixture commits, so the suite does not depend on the machine's git config. */
+const AUTHOR = ["-c", "user.email=t@example.com", "-c", "user.name=T"];
 
 /**
  * Runs `git` to build a fixture, with any inherited repository binding shed.
@@ -58,8 +68,8 @@ const roots: string[] = [];
  * to `/private/var/folders/…`. Git answers with the resolved path, so an unresolved fixture
  * path fails every comparison for a reason that has nothing to do with the code.
  */
-function tempDir(prefix = "wrk-convert-"): string {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
+function tempDir(): string {
+  const dir = realpathSync(mkdtempSync(join(tmpdir(), "wrk-convert-")));
   roots.push(dir);
   return dir;
 }
@@ -68,20 +78,7 @@ function tempDir(prefix = "wrk-convert-"): string {
 function makeRepo(branch = "main"): string {
   const dir = tempDir();
   fixtureGit(["init", "-q", "-b", branch, dir]);
-  fixtureGit(
-    [
-      "-c",
-      "user.email=t@example.com",
-      "-c",
-      "user.name=T",
-      "commit",
-      "-q",
-      "--allow-empty",
-      "-m",
-      "init",
-    ],
-    dir,
-  );
+  fixtureGit([...AUTHOR, "commit", "-q", "--allow-empty", "-m", "init"], dir);
   return dir;
 }
 
@@ -154,25 +151,20 @@ describe("resolveConversion", () => {
     // The issue's second acceptance criterion, and the whole reason this command prints:
     // resolving reads, and only reads. Recorded before and after a full resolve-and-render.
     const own = makeClone(upstream, "untouched");
-    const before = {
+    const snapshot = () => ({
       head: fixtureGit(["rev-parse", "HEAD"], own),
       status: fixtureGit(["status", "--porcelain"], own),
       refs: fixtureGit(["for-each-ref"], own),
       worktrees: fixtureGit(["worktree", "list", "--porcelain"], own),
       config: fixtureGit(["config", "--local", "--list"], own),
-    };
+    });
+    const before = snapshot();
 
     const conversion = await resolveConversion(own);
     expect(conversion).not.toBeNull();
     if (conversion !== null) renderConversion(conversion);
 
-    expect({
-      head: fixtureGit(["rev-parse", "HEAD"], own),
-      status: fixtureGit(["status", "--porcelain"], own),
-      refs: fixtureGit(["for-each-ref"], own),
-      worktrees: fixtureGit(["worktree", "list", "--porcelain"], own),
-      config: fixtureGit(["config", "--local", "--list"], own),
-    }).toEqual(before);
+    expect(snapshot()).toEqual(before);
     expect(before.status).toBe("");
   });
 });
@@ -207,12 +199,15 @@ describe("renderConversion", () => {
 
   test("quotes a container path containing a space, everywhere it appears", () => {
     // Unquoted, `mv my project my project.old` renames something else entirely — and the
-    // caller pastes this straight into a shell.
+    // caller pastes this straight into a shell. Every site, including the `cd` in the
+    // closing notes, which is the one line the reader is most likely to copy on its own.
     const recipe = renderConversion({ ...RESOLVED, container: "/Users/t/Git Local/my project" });
 
     expect(recipe).toContain("cd '/Users/t/Git Local'\n");
     expect(recipe).toContain("mv 'my project' 'my project.old'\n");
+    expect(recipe).toContain("mkdir 'my project'\n");
     expect(recipe).toContain("git clone --bare '../my project.old' .bare\n");
+    expect(recipe).toContain("cd '/Users/t/Git Local/my project/trunk'");
   });
 
   test("leaves an ordinary path unquoted", () => {
@@ -223,6 +218,21 @@ describe("renderConversion", () => {
     const recipe = renderConversion({ ...RESOLVED, remoteUrl: "ssh://host/a'b.git" });
 
     expect(recipe).toContain(`remote set-url origin 'ssh://host/a'\\''b.git'`);
+  });
+
+  test("folds a slashed default branch into a flat checkout directory", () => {
+    // The layout is flat siblings of `.bare`, so `release/v2` must not create a nested
+    // `<container>/release/v2`. Only the directory folds; the branch handed to `worktree add`
+    // and to `--set-upstream-to` keeps its slashes, or git would make a literal `release+v2`
+    // ref that tracks nothing.
+    const recipe = renderConversion({ ...RESOLVED, defaultBranch: "release/v2" });
+
+    expect(recipe).toContain("git worktree add release+v2 release/v2\n");
+    expect(recipe).toContain(
+      "git -C release+v2 branch --set-upstream-to=origin/release/v2 release/v2\n",
+    );
+    expect(recipe).toContain("git -C release+v2 status");
+    expect(recipe).toContain("cd /Users/t/GitLocal/my-project/release+v2");
   });
 
   test("carries all six verification checks", () => {
@@ -240,17 +250,26 @@ describe("renderConversion", () => {
     }
   });
 
-  test("warns about the three kinds of work a re-clone does not carry across", () => {
+  test("warns about every kind of work a re-clone does not carry across", () => {
     const recipe = renderConversion(RESOLVED);
 
     expect(recipe).toContain("Uncommitted work");
     expect(recipe).toContain("Untracked files");
     expect(recipe).toContain("refs/stash is not copied by any clone");
+    // The one that only bites in an already-converted container — which this command
+    // deliberately does not refuse, so the warning is the only thing covering it.
+    expect(recipe).toContain("Linked worktrees");
+  });
+
+  test("says to work from the checkout rather than the container afterwards", () => {
+    // The container keeps the path the repository always had, so this is the trap the
+    // printed recipe is the last chance to name.
+    expect(renderConversion(RESOLVED)).toContain("never from the container");
   });
 
   test("is safe to paste whole: every line is a comment, a command, or blank", () => {
     // The property that lets the output be read top to bottom in a terminal. A bare prose
-    // line would try to execute — and the paragraphs here talk about `rm` and `mv`.
+    // line would run command substitution — the paragraphs here carry backticks.
     const commands = ["cd ", "mv ", "mkdir ", "printf ", "ls ", "git "];
 
     for (const line of renderConversion(RESOLVED).split("\n")) {
@@ -259,7 +278,44 @@ describe("renderConversion", () => {
     }
   });
 
-  test("ends with exactly one newline, so printing it adds no blank line", () => {
-    expect(renderConversion(RESOLVED)).toMatch(/[^\n]\n$/);
+  test("ends without a trailing newline, so console.log adds no blank line", () => {
+    expect(renderConversion(RESOLVED)).not.toMatch(/\n$/);
+  });
+});
+
+describe("the rendered recipe", () => {
+  test("actually converts the repository into the layout wrk requires", async () => {
+    // Every case above asserts wording. Reorder step 3's `config remote.origin.fetch` after
+    // the fetch, drop the `.git` pointer, or clone from the remote instead of the old
+    // checkout, and all of them stay green while the conversion stops producing a container.
+    // This is the case that fails instead.
+    const container = makeClone(upstream, "convertible");
+    fixtureGit(["checkout", "-q", "-b", "local-only"], container);
+    fixtureGit([...AUTHOR, "commit", "-q", "--allow-empty", "-m", "never pushed"], container);
+    fixtureGit(["checkout", "-q", "main"], container);
+
+    const conversion = await resolveConversion(container);
+    expect(conversion).not.toBeNull();
+    if (conversion === null) return;
+
+    const script = join(tempDir(), "recipe.sh");
+    writeFileSync(script, renderConversion(conversion));
+    // Output captured rather than inherited: the recipe's clone and fetch are chatty on
+    // stderr by design, and a passing test should say nothing.
+    execFileSync("bash", ["-euo", "pipefail", script], { env: FIXTURE_ENV, stdio: "pipe" });
+
+    expect(await isBareLayout(container)).toBe(true);
+    expect(await checkoutFor(container)).toBe(join(container, "main"));
+
+    const checkout = join(container, "main");
+    // The clone-from-the-old-checkout claim the recipe's own step 2 makes.
+    expect(fixtureGit(["branch", "--list", "--format=%(refname:short)"], checkout)).toContain(
+      "local-only",
+    );
+    // Step 3's refspec and upstream, which nothing populates without it.
+    expect(fixtureGit(["rev-parse", "--abbrev-ref", "@{upstream}"], checkout).trim()).toBe(
+      "origin/main",
+    );
+    expect(fixtureGit(["status", "--porcelain"], checkout)).toBe("");
   });
 });

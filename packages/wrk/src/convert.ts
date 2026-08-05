@@ -16,16 +16,19 @@
  * what lets the recipe's exact wording be tested without a repository, and what makes
  * "never executes anything" a property of the module's shape rather than a promise.
  *
- * The recipe's steps, and the reasoning comments they carry, are the prose form kept in the
- * `repo-setup` skill's `bare-repo-conversion.md` reference. This module is that reference
- * with the repository's real container, remote and default branch substituted in.
+ * The recipe is the prose form of the `repo-setup` skill's `bare-repo-conversion.md`
+ * reference — its *Before you start*, *The recipe*, *Verify* and *Afterwards* sections —
+ * with the repository's real container, remote and default branch substituted in. The
+ * reference's layout diagram is not rendered: it describes the destination rather than how to
+ * reach it, and whoever is reading this has already been sent here.
  *
  * @packageDocumentation
  */
 
-import { basename, dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 import { git } from "./git";
+import { worktreeDirName } from "./naming";
 import { containerFor, resolveDefaultBranch } from "./repo";
 
 /**
@@ -60,6 +63,13 @@ export interface Conversion {
  * and outside a repository all three fail anyway — so there is no cheap early exit to be had
  * by ordering them, only latency to lose.
  *
+ * **An already-converted container is answered, not refused**, though `isBareLayout` sits one
+ * call away in a module this one already imports from. Printing is read-only, and the
+ * caller's preflight is what routes them here, so a refusal would withhold a recipe from
+ * someone who knows why they asked. The rendered *Before you start* block is what covers that
+ * case instead: its linked-worktree warning is the one that matters there, since an
+ * already-converted container is precisely the shape that has them.
+ *
  * @param cwd - Directory to inspect. Defaults to this process's cwd.
  * @returns The values to substitute, or `null` when `cwd` is in no repository — there is
  *   nothing to convert there, and a recipe naming an arbitrary directory would be one the
@@ -83,11 +93,13 @@ export async function resolveConversion(cwd?: string): Promise<Conversion | null
 }
 
 /**
- * Characters that need no shell quoting, as `shlex.quote` defines the set.
+ * A whole value needing no shell quoting, as `shlex.quote` defines the set.
  *
- * Deliberately conservative: anything outside it is quoted rather than reasoned about.
+ * Anchored, and `+` rather than `*`, so the empty string does **not** match and is quoted —
+ * bare, it would vanish rather than be an argument. Deliberately conservative otherwise:
+ * anything outside the set is quoted rather than reasoned about.
  */
-const SHELL_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
+const SHELL_SAFE_RE = /^[A-Za-z0-9_@%+=:,./-]+$/;
 
 /**
  * `value` as a single shell word.
@@ -97,22 +109,30 @@ const SHELL_SAFE = /^[A-Za-z0-9_@%+=:,./-]+$/;
  * something the caller did not mean. A single-quoted string is literal to every POSIX shell,
  * so the only case needing care is an embedded `'`, closed and re-opened around an escaped
  * one.
- *
- * The empty string is quoted too, since bare it would vanish rather than be an argument.
  */
 function quote(value: string): string {
-  return SHELL_SAFE.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
+  return SHELL_SAFE_RE.test(value) ? value : `'${value.replaceAll("'", `'\\''`)}'`;
 }
 
-/** The six checks of the verification gate, rendered with their expectations aligned. */
-function verification(container: string, branch: string, quotedBranch: string): string {
+/**
+ * The six checks of the verification gate, rendered with their expectations aligned.
+ *
+ * Aligned at render time rather than written into a static template because the column
+ * depends on the branch name's length, which is not known until here.
+ *
+ * @param container - The container, for the `--git-common-dir` expectation.
+ * @param branch - The default branch, for the expectations naming a ref.
+ * @param dir - The checkout's directory as a shell word. Not `branch` spelled differently:
+ *   it is folded, so a branch carrying a `/` still names one flat sibling.
+ */
+function verification(container: string, branch: string, dir: string): string {
   const checks: ReadonlyArray<readonly [string, string]> = [
-    [`git -C ${quotedBranch} config core.bare`, "true"],
-    ["ls -l .git", "a FILE holding `gitdir: ./.bare`, not a directory"],
-    [`git -C ${quotedBranch} rev-parse --git-common-dir`, `${container}/.bare`],
-    [`git -C ${quotedBranch} rev-parse --abbrev-ref '@{upstream}'`, `origin/${branch}`],
-    [`git -C ${quotedBranch} branch --list`, "every branch the old checkout had"],
-    [`git -C ${quotedBranch} status`, `clean, on ${branch}`],
+    [`git -C ${dir} config core.bare`, "true"],
+    ["ls -l .git", "a FILE holding `gitdir: ./.bare` -- a directory means step 2 landed wrong"],
+    [`git -C ${dir} rev-parse --git-common-dir`, `${container}/.bare`],
+    [`git -C ${dir} rev-parse --abbrev-ref '@{upstream}'`, `origin/${branch}`],
+    [`git -C ${dir} branch --list`, "every branch the old checkout had"],
+    [`git -C ${dir} status`, `clean, on ${branch}`],
   ];
 
   const width = Math.max(...checks.map(([check]) => check.length));
@@ -126,26 +146,37 @@ function verification(container: string, branch: string, quotedBranch: string): 
  * and its exact wording is testable without building a repository.
  *
  * **Every line is a shell comment or one of the recipe's own commands**, so the whole block
- * can be pasted into a terminal and read top to bottom without a paragraph of prose trying
- * to execute. The prose here talks about `mv` and `rm`, so that is a safety property rather
- * than a stylistic one.
+ * can be pasted into a terminal and read top to bottom. That is a safety property rather than
+ * a stylistic one: the explanatory lines carry backticks and a `refs/heads/*` glob, so a
+ * prose line that lost its `#` would run command substitution and glob expansion rather than
+ * merely reading oddly.
  *
- * A value that did not resolve renders as an angle-bracketed placeholder — quoted, like
- * every other substitution, which keeps it from being read as a shell redirection if the
- * block is pasted before the caller fills it in.
+ * A value that did not resolve renders as an angle-bracketed placeholder — quoted, like every
+ * other substitution, which keeps it from being read as a shell redirection if the block is
+ * pasted before the caller fills it in.
  *
  * @param conversion - What {@link resolveConversion} read.
- * @returns The recipe, ending in exactly one newline.
+ * @returns The recipe, with **no** trailing newline, so that the whole command body is
+ *   `console.log(renderConversion(await resolveConversion()))` — `console.log` supplies the
+ *   final newline, and one here would print a blank line after it.
  */
 export function renderConversion(conversion: Conversion): string {
   const { container, remoteUrl, defaultBranch } = conversion;
   const branch = defaultBranch ?? "<default-branch>";
   const name = basename(container);
+  const oldName = `${name}.old`;
   const parent = quote(dirname(container));
-  const old = quote(`${name}.old`);
+  // The checkout is a flat sibling of `.bare`, so the *directory* folds while the branch
+  // handed to `worktree add` keeps its slashes. `naming.ts` owns that rule for `wrk`'s own
+  // worktrees, and the checkout this recipe creates is subject to it just the same.
+  const dirName = worktreeDirName(branch);
+  const dir = quote(dirName);
   const url = quote(remoteUrl ?? "<remote-url>");
-  const b = quote(branch);
 
+  // ponytail: the paste-safe property holds for newline-free paths only -- a container path
+  // containing a newline splits the comment lines interpolating it, leaving their tails as
+  // live commands. POSIX permits such a name and git reports it verbatim. Refuse that
+  // container in the command layer if it ever bites.
   return `# Convert ${container} to the bare-repo layout.
 #
 # Nothing below has been run. The conversion renames and re-clones the checkout you are
@@ -161,6 +192,9 @@ export function renderConversion(conversion: Conversion): string {
 #     state. Copy them into the new checkout afterwards.
 #   - Stashes do not survive: refs/stash is not copied by any clone. Pop or commit the whole
 #     stack first; \`git stash list\` must be empty.
+#   - Linked worktrees. Each one's .git file names an absolute path step 1 renames, so after
+#     the move git cannot read them at all and any uncommitted work inside them is
+#     unreachable; \`git worktree list\` must show only this checkout.
 #
 # Local-only branches and unpushed commits do survive, because step 2 clones from the old
 # checkout rather than from the remote. Keeping that old checkout until the verification
@@ -172,7 +206,7 @@ export function renderConversion(conversion: Conversion): string {
 #    repository -- cd-ing into a directory you are about to rename leaves the shell inside
 #    the renamed copy.
 cd ${parent}
-mv ${quote(name)} ${old}
+mv ${quote(name)} ${quote(oldName)}
 mkdir ${quote(name)}
 cd ${quote(name)}
 
@@ -181,7 +215,7 @@ cd ${quote(name)}
 #    repository. Cloning from the OLD CHECKOUT rather than from the remote is what carries
 #    local-only branches and unpushed commits across; the remote URL is restored straight
 #    after.
-git clone --bare ${quote(`../${name}.old`)} .bare
+git clone --bare ${quote(`../${oldName}`)} .bare
 git --git-dir=.bare remote set-url origin ${url}
 printf 'gitdir: ./.bare\\n' > .git
 
@@ -196,19 +230,27 @@ git --git-dir=.bare remote set-head origin -a
 
 # 4. Check the default branch out as the first worktree -- the directory is named after the
 #    branch -- and set its upstream.
-git worktree add ${b} ${b}
-git -C ${b} branch --set-upstream-to=${quote(`origin/${branch}`)} ${b}
+git worktree add ${dir} ${quote(branch)}
+git -C ${dir} branch --set-upstream-to=${quote(`origin/${branch}`)} ${quote(branch)}
 
 # --- Verify -----------------------------------------------------------------------------
 #
 # All six must hold before the old checkout is deleted.
-${verification(container, branch, b)}
+${verification(container, branch, dir)}
 
-# Then re-run the preflight that refused, from the new checkout:
+# --- Afterwards -------------------------------------------------------------------------
 #
-#     cd ${container}/${branch}
+# Work from the new checkout, never from the container. The container keeps the path the
+# repository always had, so a stale bookmark and plain habit both land one level too high,
+# where there is no work tree at all:
 #
-# It should proceed, naming as the container the directory step 1 renamed. Only once it
-# does, remove ${name}.old.
-`;
+#     cd ${quote(join(container, dirName))}
+#
+# From there, re-run the preflight that refused: it should proceed, naming as the container
+# the directory step 1 renamed. Then:
+#
+#   - Copy the untracked files noted at the top into the new checkout.
+#   - Re-point whatever held the old path -- tool configs, shell aliases, editor projects, a
+#     dotfile manager's source directory.
+#   - Remove ${oldName} once all of the above checks out.`;
 }
