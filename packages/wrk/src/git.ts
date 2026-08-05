@@ -34,6 +34,7 @@
 
 import { z } from "zod";
 
+import { CommandFailed } from "./output";
 import { type RunResult, run } from "./proc";
 
 /**
@@ -93,13 +94,15 @@ export function git(args: string[], cwd?: string): Promise<RunResult> {
  * For the commands where git has no "no" to express — listing worktrees, reading status,
  * mutating anything — so a failure surfaces as git's own message rather than as an empty
  * list the caller reads as a real answer.
+ *
+ * The failure is a {@link CommandFailed} rather than a plain `Error`, which is what lets
+ * `wrk` exit with git's own status: this is the one place every throwing wrapper in the
+ * module routes through, so the code survives as a value here or it survives nowhere.
  */
-// ponytail: a plain Error, so an exit code cannot be branched on. Introduce a GitError
-// carrying `code` if a caller ever needs to distinguish failures programmatically.
 async function gitOk(args: string[], cwd?: string): Promise<string> {
   const { stdout, stderr, code } = await git(args, cwd);
   if (code !== 0) {
-    throw new Error(`git ${args.join(" ")} failed (exit ${code}): ${stderr.trim()}`);
+    throw new CommandFailed(["git", ...args], code, stderr);
   }
   return stdout;
 }

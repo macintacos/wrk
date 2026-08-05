@@ -32,6 +32,7 @@ import {
   statusPorcelain,
   symbolicRef,
 } from "../src/git";
+import { CommandFailed } from "../src/output";
 
 /**
  * The environment for fixture commands: this process's, minus everything binding git to a
@@ -292,6 +293,16 @@ describe("the throwing half of the contract", () => {
     await expect(listWorktrees(notARepo)).rejects.toThrow(/worktree list/);
     await expect(statusPorcelain(notARepo)).rejects.toThrow(/status/);
     await expect(forEachRef(["refs/heads"], notARepo)).rejects.toThrow(/for-each-ref/);
+  });
+
+  test("what it throws carries git's own exit status", async () => {
+    // The half a message cannot express: `wrk` exits with the status of the command that
+    // failed underneath it, so the code has to survive as a value rather than as prose in
+    // an Error's text. 128 is git's "not a repository".
+    const failure: unknown = await listWorktrees(notARepo).catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(CommandFailed);
+    expect((failure as CommandFailed).code).toBe(128);
   });
 });
 
