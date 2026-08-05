@@ -1,0 +1,108 @@
+/**
+ * The `wrk` program root: the one commander tree every command hangs off.
+ *
+ * This module owns three things and deliberately nothing else — the program's identity,
+ * the global `--json` flag, and the top-level failure handler that turns a thrown value
+ * into an exit status. Commands are registered by the issues that build them, so the tree
+ * here is still empty; until the first one lands, a bare `wrk` parses successfully and
+ * does nothing, and `wrk --help` is the only output it has to give.
+ *
+ * It follows [`scripts/tasks/cli.ts`](../../../scripts/tasks/cli.ts), this repository's
+ * existing commander tree, in the ways that matter: `@commander-js/extra-typings`, a
+ * `buildProgram()` factory returning an unparsed tree so tests drive the real thing, and
+ * an `import.meta.main` guard so importing this module from a test does not parse the test
+ * runner's own argv. One divergence, and only one: that tree sets
+ * `enablePositionalOptions()` and `passThroughOptions()` because its job is to forward
+ * unknown flags on to another tool, and `wrk` owns its own flags, so neither is carried
+ * over — an unknown flag here is a mistake worth rejecting.
+ *
+ * The contract this program's output obeys lives in [`./output`](./output), whose header
+ * is the specification; this module is only where the flag is declared and where the exit
+ * rules are applied.
+ *
+ * @packageDocumentation
+ */
+
+import { Command } from "@commander-js/extra-typings";
+
+import { reportFailure } from "./output";
+
+/**
+ * Assembles the commander tree.
+ *
+ * @returns The configured program, not yet parsed and carrying no subcommands.
+ */
+export function buildProgram(): Command {
+  return new Command()
+    .name("wrk")
+    .description("Worktree, PR-stack and agent-workflow tooling.")
+    .option("--json", "Emit machine-readable JSON on stdout instead of human output");
+}
+
+/**
+ * Whether this invocation asked for the JSON envelope.
+ *
+ * Read through `optsWithGlobals` rather than `opts`, which is the whole reason this is a
+ * function: `--json` is declared on the root, and a subcommand's own `opts()` does not see
+ * an option it did not declare. Passing the *running* command — the one commander hands a
+ * subcommand's action as its last argument — is what makes the flag global in fact.
+ *
+ * Commands whose only output is the envelope ignore this: the agent-facing surface is JSON
+ * unconditionally, because its callers parse it unconditionally. The flag is what puts a
+ * command that would otherwise print for a human onto the same envelope.
+ *
+ * The parameter is the one method this needs rather than `Command` itself, and
+ * deliberately so. `extra-typings` threads each command's options through the class's type
+ * parameters, so a `Command` written without them resolves `optsWithGlobals()` to `{}` and
+ * this would not compile — while spelling them out here would pin every future caller to
+ * one exact instantiation. Naming the method is both looser and more honest: what this
+ * asks of its argument is that it can report its merged options.
+ *
+ * @param command - The command whose invocation is being asked about.
+ * @returns `true` when `--json` appeared anywhere before the subcommand's arguments.
+ *
+ * @example
+ * ```ts
+ * program.command("doctor").action((_options, command) => {
+ *   if (wantsJson(command)) emit(report);
+ *   else note(render(report));
+ * });
+ * ```
+ */
+export function wantsJson(command: { optsWithGlobals(): { json?: unknown } }): boolean {
+  return command.optsWithGlobals().json === true;
+}
+
+/**
+ * Parses `argv` and maps any failure that reaches the top to an exit status.
+ *
+ * `process.exitCode` is assigned rather than `process.exit` called, for the reason
+ * [`./output`](./output)'s header gives: stdout is a pipe on every agent-facing
+ * invocation, and `process.exit` would discard the envelope still in flight.
+ *
+ * `program` is a parameter so a test can drive the real tree with a probe command
+ * attached, the same seam `scripts/tasks/cli.ts` opens by injecting its actions.
+ *
+ * One failure route bypasses this: commander answers a malformed argv itself, printing its
+ * own message and calling `process.exit(1)` without ever reaching the `catch`. That is
+ * left alone rather than intercepted with `exitOverride`, because it lands on the right
+ * side of both rules anyway — the message goes to stderr, and nothing has been written to
+ * stdout yet, so there is no envelope in flight for the abrupt exit to truncate.
+ *
+ * @param argv - Arguments after the program name.
+ * @param program - The tree to parse with. Defaults to {@link buildProgram}'s.
+ * @throws Whatever {@link reportFailure} declines to map — an unexpected error is a bug in
+ *   `wrk`, and the runtime's own report of it is the useful one.
+ */
+export async function main(argv: string[], program: Command = buildProgram()): Promise<void> {
+  try {
+    await program.parseAsync(argv, { from: "user" });
+  } catch (error) {
+    process.exitCode = reportFailure(error);
+  }
+}
+
+// Guarded so importing this module from a test does not parse the test runner's own argv.
+if (import.meta.main) {
+  await main(process.argv.slice(2));
+}
