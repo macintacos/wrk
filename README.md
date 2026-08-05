@@ -83,7 +83,7 @@ later winning over the earlier:
 | `search.roots` | `["~/GitLocal"]`               | Directories scanned for repository containers.        |
 | `search.depth` | `2`                            | How far below each root a container sits.             |
 | `cache.ttls`   | `{"pr-graph": 900000}`         | Milliseconds before a cache entry goes stale.         |
-| `glyphs`       | Nerd Font markers              | Marker per stack position: `top`, `bottom`, `merged`. |
+| `glyphs`       | `U+F062` / `U+F063` / `U+F00C` | Marker per stack position: `top`, `bottom`, `merged`. |
 | `colours`      | `green` / `yellow` / `brblack` | Colour per stack position.                            |
 
 ```jsonc

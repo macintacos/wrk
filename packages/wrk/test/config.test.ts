@@ -15,7 +15,7 @@
 import { describe, expect, test } from "bun:test";
 import { chmod, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { homedir, tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 import { DEFAULTS, globalConfigPath, loadConfig } from "../src/config";
 
@@ -29,8 +29,16 @@ async function withTemp(body: (dir: string) => Promise<void>): Promise<void> {
   }
 }
 
-/** Runs `body` with `XDG_CONFIG_HOME` set to `value`, or unset when it is `undefined`. */
-function withXdgConfigHome(value: string | undefined, body: () => void): void {
+/**
+ * Runs `body` with `XDG_CONFIG_HOME` set to `value`, or unset when it is `undefined`.
+ *
+ * Accepts an async body so a case can `await loadConfig()` — the default-path case has to,
+ * since the variable must still be set when the read happens.
+ */
+async function withXdgConfigHome(
+  value: string | undefined,
+  body: () => void | Promise<void>,
+): Promise<void> {
   const previous = process.env.XDG_CONFIG_HOME;
   if (value === undefined) {
     delete process.env.XDG_CONFIG_HOME;
@@ -38,7 +46,7 @@ function withXdgConfigHome(value: string | undefined, body: () => void): void {
     process.env.XDG_CONFIG_HOME = value;
   }
   try {
-    body();
+    await body();
   } finally {
     if (previous === undefined) {
       delete process.env.XDG_CONFIG_HOME;
@@ -50,13 +58,13 @@ function withXdgConfigHome(value: string | undefined, body: () => void): void {
 
 /** Writes `value` as JSON at `path`, creating its parent directory. */
 async function writeJson(path: string, value: unknown): Promise<void> {
-  await mkdir(join(path, ".."), { recursive: true });
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, JSON.stringify(value), "utf8");
 }
 
 /** Writes `text` verbatim at `path`, for fixtures that are deliberately not valid JSON. */
 async function writeText(path: string, text: string): Promise<void> {
-  await mkdir(join(path, ".."), { recursive: true });
+  await mkdir(dirname(path), { recursive: true });
   await writeFile(path, text, "utf8");
 }
 
@@ -71,30 +79,43 @@ async function withMeta(dir: string, meta: unknown): Promise<string> {
 const FOREIGN_META = { search: { externalPaths: ["~/GitLocal", "~/.config"] } };
 
 describe("globalConfigPath", () => {
-  test("roots under $XDG_CONFIG_HOME when it is an absolute path", () => {
-    withXdgConfigHome("/xdg/config", () => {
+  test("roots under $XDG_CONFIG_HOME when it is an absolute path", async () => {
+    await withXdgConfigHome("/xdg/config", () => {
       expect(globalConfigPath()).toBe(join("/xdg/config", "wrk", "config.json"));
     });
   });
 
-  test("falls back to $HOME/.config when XDG_CONFIG_HOME is unset", () => {
-    withXdgConfigHome(undefined, () => {
+  test("falls back to $HOME/.config when XDG_CONFIG_HOME is unset", async () => {
+    await withXdgConfigHome(undefined, () => {
       expect(globalConfigPath()).toBe(join(homedir(), ".config", "wrk", "config.json"));
     });
   });
 
-  test("falls back when XDG_CONFIG_HOME is set but empty", () => {
+  test("falls back when XDG_CONFIG_HOME is set but empty", async () => {
     // An exported-but-empty variable is how a shell says "unset" in practice; taking it
     // literally would `join("", …)` into a path relative to the cwd.
-    withXdgConfigHome("", () => {
+    await withXdgConfigHome("", () => {
       expect(globalConfigPath()).toBe(join(homedir(), ".config", "wrk", "config.json"));
     });
   });
 
-  test("falls back when XDG_CONFIG_HOME is relative", () => {
+  test("falls back when XDG_CONFIG_HOME is relative", async () => {
     // Required by the XDG base directory spec: a relative value is invalid and ignored.
-    withXdgConfigHome("relative/config", () => {
+    await withXdgConfigHome("relative/config", () => {
       expect(globalConfigPath()).toBe(join(homedir(), ".config", "wrk", "config.json"));
+    });
+  });
+
+  test("is where loadConfig looks when it is given no globalPath", async () => {
+    // Without this, nothing exercises `loadConfig`'s default argument — the module's main
+    // user-facing path, and the one the README tells people to create. `XDG_CONFIG_HOME`
+    // is redirected at the temp dir so the case cannot read a real ~/.config/wrk.
+    await withTemp(async (dir) => {
+      await writeJson(join(dir, "wrk", "config.json"), { search: { depth: 9 } });
+
+      await withXdgConfigHome(dir, async () => {
+        expect((await loadConfig()).search.depth).toBe(9);
+      });
     });
   });
 });
@@ -113,13 +134,41 @@ describe("DEFAULTS", () => {
   });
 
   test("survives a caller mutating a config it was handed", async () => {
+    // Only the array and the two records can alias — a scalar cannot, so mutating `depth`
+    // would pass against an implementation that handed back `DEFAULTS`' own objects.
+    //
+    // The expected values are captured *before* the mutation rather than read off
+    // `DEFAULTS` afterwards. Asserting against `DEFAULTS` post-mutation compares a
+    // corrupted object with itself and can never fail, which is exactly how an aliasing
+    // implementation slips through.
     await withTemp(async (dir) => {
-      const config = await loadConfig({ globalPath: join(dir, "absent.json") });
-      const mutable = config as { search: { depth: number } };
-      mutable.search.depth = 99;
+      const globalPath = join(dir, "absent.json");
+      const before = {
+        roots: [...DEFAULTS.search.roots],
+        ttl: DEFAULTS.cache.ttls["pr-graph"],
+        glyph: DEFAULTS.glyphs.top,
+      };
 
-      expect(DEFAULTS.search.depth).toBe(2);
-      expect((await loadConfig({ globalPath: join(dir, "absent.json") })).search.depth).toBe(2);
+      const config = await loadConfig({ globalPath });
+      // Through `unknown` because the cast deliberately strips `readonly` — the point is
+      // to do what the type system forbids and prove the runtime holds up anyway.
+      const mutable = config as unknown as {
+        search: { roots: string[] };
+        cache: { ttls: Record<string, number> };
+        glyphs: { top: string };
+      };
+      mutable.search.roots.push("/injected");
+      mutable.cache.ttls["pr-graph"] = 1;
+      mutable.glyphs.top = "X";
+
+      expect(DEFAULTS.search.roots).toEqual(before.roots);
+      expect(DEFAULTS.cache.ttls["pr-graph"]).toBe(before.ttl);
+      expect(DEFAULTS.glyphs.top).toBe(before.glyph);
+
+      const fresh = await loadConfig({ globalPath });
+      expect(fresh.search.roots).toEqual(before.roots);
+      expect(fresh.cache.ttls["pr-graph"]).toBe(before.ttl);
+      expect(fresh.glyphs.top).toBe(before.glyph);
     });
   });
 });
@@ -196,6 +245,17 @@ describe("loadConfig layering", () => {
       expect(await loadConfig({ container, globalPath: join(dir, "absent.json") })).toEqual(
         DEFAULTS,
       );
+    });
+  });
+
+  test("ignores a wrk key in the global file, whose sections sit at the root", async () => {
+    // The other half of the asymmetric namespacing, and the mistake a user makes straight
+    // after reading the per-repo example: a `wrk` wrapper belongs only in .project-meta.json.
+    await withTemp(async (dir) => {
+      const globalPath = join(dir, "config.json");
+      await writeJson(globalPath, { wrk: { search: { depth: 4 } } });
+
+      expect(await loadConfig({ globalPath })).toEqual(DEFAULTS);
     });
   });
 

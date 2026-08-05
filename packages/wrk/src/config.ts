@@ -23,10 +23,13 @@
  * parameter, exactly as `cache.ts` takes `CacheKey.container`, which keeps container
  * resolution `repo.ts`'s single responsibility and leaves this module testable with no git
  * repository anywhere in sight. One consequence is inherited rather than fought: on a git
- * older than 2.31, `containerFor` answers with the literal string `--path-format=absolute`
- * (see the README's git-floor note), and handed that, this module reads a file that does
- * not exist and degrades — so an unsupported git costs the per-repo layer, silently, which
- * is the behaviour the acceptance criteria ask for anyway.
+ * older than 2.31, `rev-parse` echoes the unrecognised `--path-format` flag to stdout and
+ * exits 0 (see the README's git-floor note), so `containerFor` answers with a path derived
+ * from that echo rather than with a real container. Handed one, this module reads a file
+ * that is not the container's and degrades — so an unsupported git costs the per-repo
+ * layer silently, which is what the acceptance criteria ask for anyway. Note the derived
+ * path can be as innocuous as `.`, so the file read may be a `.project-meta.json` relative
+ * to the process cwd; it is still not the repository's, and the answer is still defaults.
  *
  * The defaults are not invented: they are what the fish implementation this package
  * replaces does today, so adopting `wrk` with no config at all changes nothing.
@@ -112,7 +115,7 @@ export interface WrkConfig {
 /** Which layers {@link loadConfig} reads, and where from. */
 export interface ConfigSources {
   /**
-   * Repository container supplying the per-repo layer, as {@link containerFor} answers it.
+   * Repository container supplying the per-repo layer, as `containerFor` answers it.
    *
    * Absent or `null` skips that layer — `null` is what a caller outside any repository
    * has, and it is not an error here.
@@ -222,22 +225,6 @@ function section(layer: Layer, name: keyof WrkConfig): Layer | null {
 }
 
 /**
- * The first value the layers supply for one field, searched highest-priority first.
- *
- * `undefined` from `take` means "this layer has nothing usable here", which is how a
- * malformed field falls through to the layer below instead of taking the whole layer with
- * it.
- */
-function pick<T>(layers: readonly Layer[], take: (layer: Layer) => T | undefined, fallback: T): T {
-  for (const layer of [...layers].reverse()) {
-    const value = take(layer);
-    if (value !== undefined) return value;
-  }
-
-  return fallback;
-}
-
-/**
  * Expands a leading `~`, and only a leading `~`.
  *
  * `~otheruser` is deliberately left alone: resolving another user's home means reading the
@@ -307,17 +294,32 @@ function takeMark(marks: Layer | null, position: keyof ByStackPosition): string 
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-/** Resolves one `{top, bottom, merged}` section across the layers, field by field. */
+/**
+ * Resolves one `{top, bottom, merged}` section, folding the layers on in priority order.
+ *
+ * `??` is exact rather than convenient here: {@link takeMark} already rejects the empty
+ * string, so the only `undefined` reaching it means "this layer offered nothing usable for
+ * this position" — which is how one malformed mark falls through while its siblings in the
+ * same object still land.
+ */
 function takeByPosition(
   layers: readonly Layer[],
   name: "glyphs" | "colours",
   fallback: ByStackPosition,
 ): ByStackPosition {
-  return {
-    top: pick(layers, (layer) => takeMark(section(layer, name), "top"), fallback.top),
-    bottom: pick(layers, (layer) => takeMark(section(layer, name), "bottom"), fallback.bottom),
-    merged: pick(layers, (layer) => takeMark(section(layer, name), "merged"), fallback.merged),
-  };
+  // Copied rather than aliased, so the answer is never `DEFAULTS`' own object.
+  let marks: ByStackPosition = { ...fallback };
+
+  for (const layer of layers) {
+    const supplied = section(layer, name);
+    marks = {
+      top: takeMark(supplied, "top") ?? marks.top,
+      bottom: takeMark(supplied, "bottom") ?? marks.bottom,
+      merged: takeMark(supplied, "merged") ?? marks.merged,
+    };
+  }
+
+  return marks;
 }
 
 /**
@@ -341,7 +343,7 @@ function takeByPosition(
  * @example
  * ```ts
  * const config = await loadConfig({ container: await containerFor() });
- * const ttl = config.cache.ttls["pr-graph"] ?? 900_000;
+ * const { roots, depth } = config.search;
  * ```
  */
 // ponytail: validation is hand-rolled `typeof` guards. Reach for a schema library only if
@@ -354,21 +356,24 @@ export async function loadConfig(sources: ConfigSources = {}): Promise<WrkConfig
     container ? readProjectLayer(container) : null,
   ]);
 
-  // Lowest priority first, so `pick` can walk them in reverse.
+  // Every fold below applies the layers in this order, so a later one wins. A third layer
+  // is added to the end of this array and needs no other change.
   const layers = [globalLayer, projectLayer].filter((layer) => layer !== null);
 
   const ttls: Record<string, number> = { ...DEFAULTS.cache.ttls };
+  let roots: readonly string[] = DEFAULTS.search.roots;
+  let depth = DEFAULTS.search.depth;
+
   for (const layer of layers) {
+    const search = section(layer, "search");
+    roots = takeRoots(search) ?? roots;
+    depth = takeDepth(search) ?? depth;
     Object.assign(ttls, takeTtls(section(layer, "cache")));
   }
 
   return {
-    search: {
-      roots: pick(layers, (layer) => takeRoots(section(layer, "search")), [
-        ...DEFAULTS.search.roots,
-      ]),
-      depth: pick(layers, (layer) => takeDepth(section(layer, "search")), DEFAULTS.search.depth),
-    },
+    // Spread rather than passed through: `roots` may still be `DEFAULTS`' own array here.
+    search: { roots: [...roots], depth },
     cache: { ttls },
     glyphs: takeByPosition(layers, "glyphs", DEFAULTS.glyphs),
     colours: takeByPosition(layers, "colours", DEFAULTS.colours),
