@@ -2,22 +2,48 @@
  * Where `wrk` reads its own settings.
  *
  * Three layers, lowest first: {@link DEFAULTS}, then a machine-wide file at
- * `$XDG_CONFIG_HOME/wrk/config.json`, then a `wrk` namespace inside the repository
+ * `$XDG_CONFIG_HOME/wrk/config.toml`, then a `wrk` namespace inside the repository
  * container's `.project-meta.json`. {@link loadConfig} folds them into one
  * {@link WrkConfig} and never reports a problem with any of them — a config that is
- * absent, unreadable, not JSON, or simply carries none of the keys leaves the layers below
- * it standing.
+ * absent, unreadable, unparseable, or simply carries none of the keys leaves the layers
+ * below it standing.
  *
- * **The namespacing is asymmetric, deliberately.** The global file is already namespaced
- * by its path, so its sections sit at the root of the document. `.project-meta.json` is
- * *shared* — the ones on disk today carry a top-level `search` key belonging to an
- * unrelated tool — so everything `wrk` reads there hangs off a `wrk` key, and `wrk`'s own
- * search settings are `wrk.search`, never the neighbouring top-level `search`.
+ * **The two layers are in different formats, deliberately.** The global file is TOML,
+ * which is what a human hand-edits comfortably and what the rest of this repo's tooling
+ * already speaks. `.project-meta.json` is *shared* — the ones on disk today carry a
+ * top-level `search` key belonging to an unrelated tool — so it stays JSON, keeps its name,
+ * and everything `wrk` reads there hangs off a `wrk` key. Reformatting a file another tool
+ * owns to match this one's taste is not a tidy-up, it is a break. The namespacing is
+ * asymmetric for the same reason: the global file is already namespaced by its path, so its
+ * sections sit at the root of the document, while `wrk`'s per-repo search settings are
+ * `wrk.search`, never the neighbouring top-level `search`.
  *
- * **Validation is per field, not per layer.** One malformed value falls through to the
- * layer beneath it while its well-formed neighbours in the same object still apply, which
- * is what "degrades to defaults" has to mean for a file a human hand-edits. A whole layer
- * is discarded only when the document itself cannot be read as a JSON object.
+ * **The parsing is bought; the layering is not.** `smol-toml` reads the global document —
+ * hand-rolling TOML means disagreeing with the spec somewhere inside a file a human edits
+ * by hand. It won over the other parsers on maintenance and surface: `@iarna/toml` and
+ * `toml` both predate TOML 1.0 and have been dormant for years, and `@ltd/j-toml` carries a
+ * far larger API for a module that wants `parse(text)` and nothing else.
+ *
+ * The layering stayed here after weighing two config libraries against it. `cosmiconfig`
+ * exists to *discover* config across a dozen conventional locations, which this module
+ * deliberately does not want: there are exactly two layers at two known paths, and a stray
+ * `wrk.config.js` two directories up silently becoming configuration would be a misfeature.
+ * It also has no TOML loader, so it would sit on top of this dependency rather than replace
+ * it. `c12` does layer natively and does read TOML, but it is in beta for a module a shell
+ * prompt calls on every redraw, it pulls a substantial dependency graph into a package that
+ * otherwise has three, and it merges *whole layers* — the wrong granularity for the
+ * per-field degradation below, which would have had to stay hand-written underneath it
+ * anyway. In fairness to that last argument, `zod` is now the largest thing in this
+ * package's own graph; what it buys is the per-field degradation itself, which is the part
+ * `c12` would not have replaced.
+ *
+ * **Validation is per field, not per layer.** Every field is parsed through its own schema
+ * on its own {@link take}, so one malformed value falls through to the layer beneath it
+ * while its well-formed neighbours in the same table still apply — which is what "degrades
+ * to defaults" has to mean for a file a human hand-edits. A whole layer is discarded only
+ * when the document itself cannot be read: a TOML document error (an unterminated table
+ * header, a redefined key, an integer too large to represent losslessly) or a
+ * `.project-meta.json` that is not a JSON object.
  *
  * **This module spawns nothing and resolves no repository.** The container arrives as a
  * parameter, exactly as `cache.ts` takes `CacheKey.container`, which keeps container
@@ -41,6 +67,9 @@ import { readFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join } from "node:path";
 
+import { parse as parseToml } from "smol-toml";
+import { z } from "zod";
+
 /**
  * Directory under the XDG config root, and the key the per-repo settings hang off.
  *
@@ -50,10 +79,119 @@ import { isAbsolute, join } from "node:path";
 const NAMESPACE = "wrk";
 
 /** The machine-wide config file's name within its namespaced directory. */
-const GLOBAL_FILENAME = "config.json";
+const GLOBAL_FILENAME = "config.toml";
 
 /** The container-level file the per-repo layer is read from. Shared with other tools. */
 const PROJECT_META = ".project-meta.json";
+
+/**
+ * Expands a leading `~`, and only a leading `~`.
+ *
+ * `~otheruser` is deliberately left alone: resolving another user's home means reading the
+ * password database, and the result is dropped a moment later anyway for not being
+ * absolute — which is the honest answer for a root `wrk` cannot locate.
+ */
+function expandHome(path: string): string {
+  if (path === "~") return homedir();
+
+  return path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
+}
+
+/** One glyph or colour. The empty string is rejected as absent rather than accepted. */
+const MARK = z.string().min(1);
+
+/** A `{top, bottom, merged}` section — see {@link ByStackPosition}. */
+const BY_POSITION = z.object({ top: MARK, bottom: MARK, merged: MARK }).readonly();
+
+/**
+ * The usable search roots a layer supplies.
+ *
+ * Entries that are not strings, and entries still relative after expansion, are dropped
+ * individually — a relative root would be scanned from wherever the user happened to be
+ * standing, which is the same hazard {@link globalConfigPath} rejects a relative
+ * `XDG_CONFIG_HOME` for. A list that empties out fails the parse rather than answering
+ * "search nowhere", so a typo'd `"GitLocal"` yields the layer below rather than a picker
+ * that silently finds nothing.
+ */
+const ROOTS = z
+  .array(z.unknown())
+  .transform((entries) =>
+    entries
+      .filter((entry) => typeof entry === "string")
+      .map(expandHome)
+      .filter(isAbsolute),
+  )
+  .refine((roots) => roots.length > 0)
+  .readonly();
+
+/** A search depth a directory scan could actually use. `0` means the root is itself one. */
+const DEPTH = z.int().nonnegative();
+
+/**
+ * One entry's staleness threshold, in milliseconds.
+ *
+ * `0` is meaningful — refresh on every read — so it is accepted rather than treated as
+ * absent. `z.number()` already rejects `NaN` and `Infinity`, which TOML can express as
+ * float literals inside an otherwise well-formed document.
+ */
+const TTL = z.number().nonnegative();
+
+/**
+ * The well-formed TTL entries of one layer, keyed by the entry's `CacheKey.name`.
+ *
+ * Parsed entry by entry rather than as one record, because TTLs merge key by key:
+ * overriding one entry's TTL must not drop every other entry's, and neither must one
+ * malformed entry. An entry with no key here has no configured TTL; what to do about that
+ * is its caller's decision, not this module's.
+ */
+const TTLS = z
+  .record(z.string(), z.unknown())
+  .transform((entries) =>
+    Object.fromEntries(
+      Object.entries(entries).flatMap(([name, value]) => {
+        const ms = TTL.safeParse(value);
+        return ms.success ? [[name, ms.data] as const] : [];
+      }),
+    ),
+  )
+  .readonly();
+
+/**
+ * Everything `wrk` lets a user override, as a schema.
+ *
+ * The schema is the definition and {@link WrkConfig} is derived from it, so there is no
+ * second declaration to keep in sync by hand. The cost of deriving rather than declaring is
+ * that the per-field prose lives here and on the leaf schemas above rather than on the
+ * exported type, where an editor would surface it on hover — accepted, because a type kept
+ * in sync by hand is the failure this is meant to prevent.
+ *
+ * **This schema types the config and checks the defaults; it does not read the layers.**
+ * {@link loadConfig} folds the files by name, field by field, so a field added here is
+ * typed, documented and validated in {@link DEFAULTS} while being silently ignored in both
+ * config files until it gets its own `take` line in that fold.
+ *
+ * Parsing {@link DEFAULTS} through it is what makes a default violating an invariant the
+ * type system cannot express — an empty glyph, a wholly relative `roots` — fail at import
+ * rather than ship. Not every invariant, though: {@link TTLS} and {@link ROOTS} *drop* bad
+ * entries rather than rejecting, so a default with a negative TTL parses to an empty `ttls`
+ * instead of throwing. `config.test.ts`'s defaults-parity case is what catches those.
+ *
+ * `search.roots` and `search.depth` are one decision spelled as two fields — together they
+ * replace the `find ~/GitLocal -mindepth 2 -maxdepth 2` the fish implementation hardcodes,
+ * and a root whose containers sit at a different nesting is unusable with the depth frozen
+ * at 2. `glyphs` and `colours` are the marker and the colour the stack annotator draws per
+ * stack position. The colours stay opaque strings, because turning a name into an escape
+ * sequence is the business of whatever draws the picker, and a config layer that validated
+ * the name would have to track that renderer's palette to do it.
+ */
+const CONFIG = z
+  .object({
+    search: z.object({ roots: ROOTS, depth: DEPTH }).readonly(),
+    cache: z.object({ ttls: TTLS }).readonly(),
+    glyphs: BY_POSITION,
+    colours: BY_POSITION,
+  })
+  .readonly();
 
 /**
  * A value per position in a PR stack.
@@ -62,55 +200,10 @@ const PROJECT_META = ".project-meta.json";
  * its bottom, and a branch already merged. A one-layer stack is none of them and carries
  * no marker at all, which is why there is no fourth field.
  */
-export interface ByStackPosition {
-  /** Top of the stack. */
-  readonly top: string;
-  /** Bottom of the stack. */
-  readonly bottom: string;
-  /** Already merged. */
-  readonly merged: string;
-}
+export type ByStackPosition = z.infer<typeof BY_POSITION>;
 
-/** Everything `wrk` lets a user override. */
-export interface WrkConfig {
-  /**
-   * Where repository containers are looked for.
-   *
-   * Replaces the `find ~/GitLocal -mindepth 2 -maxdepth 2` the fish implementation
-   * hardcodes. `depth` is configurable alongside `roots` because the pair is one decision:
-   * a root whose containers sit at a different nesting than `~/GitLocal`'s is unusable
-   * with the depth frozen at 2.
-   */
-  readonly search: {
-    /** Absolute directories to scan. Any `~` was expanded when the config was read. */
-    readonly roots: readonly string[];
-    /** How far below each root a container sits. `0` means the root is itself one. */
-    readonly depth: number;
-  };
-
-  readonly cache: {
-    /**
-     * Milliseconds before a cache entry goes stale, keyed by the entry's `CacheKey.name`.
-     *
-     * `0` is a meaningful value — refresh on every read — and is therefore accepted rather
-     * than treated as absent. An entry with no key here has no configured TTL; what to do
-     * about that is its caller's decision, not this module's.
-     */
-    readonly ttls: Readonly<Record<string, number>>;
-  };
-
-  /** Marker characters per stack position. Nerd Font private-use code points by default. */
-  readonly glyphs: ByStackPosition;
-
-  /**
-   * Colour per stack position.
-   *
-   * The values stay opaque strings. Turning a name into an escape sequence is the
-   * business of whatever draws the picker, and a config layer that validated the name
-   * would have to track that renderer's palette to do it.
-   */
-  readonly colours: ByStackPosition;
-}
+/** Everything `wrk` lets a user override. Derived from {@link CONFIG}, never declared twice. */
+export type WrkConfig = z.infer<typeof CONFIG>;
 
 /** Which layers {@link loadConfig} reads, and where from. */
 export interface ConfigSources {
@@ -138,8 +231,12 @@ export interface ConfigSources {
  * levels down, a fifteen-minute PR-graph cache, and the three glyph-and-colour pairs the
  * stack annotator draws with.
  *
- * `roots` is stored expanded, so every consumer sees absolute paths whichever layer an
- * answer came from.
+ * `roots` is written the way a user would write it and comes back expanded, so every
+ * consumer sees absolute paths whichever layer an answer came from.
+ *
+ * Deep-frozen, because {@link CONFIG} ends in `.readonly()`. {@link loadConfig}'s answer is
+ * deliberately *not* frozen — it is built by hand and handed to a caller who may do what it
+ * likes with it — so the two differ, and only this one is safe to alias.
  *
  * The glyphs are spelled as code points rather than as literal characters. They are Nerd
  * Font private-use points, so a literal renders as a blank box in any editor lacking that
@@ -147,8 +244,8 @@ export interface ConfigSources {
  * file. `config.test.ts` asserts the literal characters, so the two spellings check each
  * other.
  */
-export const DEFAULTS: WrkConfig = {
-  search: { roots: [join(homedir(), "GitLocal")], depth: 2 },
+export const DEFAULTS: WrkConfig = CONFIG.parse({
+  search: { roots: ["~/GitLocal"], depth: 2 },
   cache: { ttls: { "pr-graph": 900_000 } },
   glyphs: {
     top: String.fromCodePoint(0xf062),
@@ -156,15 +253,46 @@ export const DEFAULTS: WrkConfig = {
     merged: String.fromCodePoint(0xf00c),
   },
   colours: { top: "green", bottom: "yellow", merged: "brblack" },
-};
+});
 
-/** One layer's raw document, after it has been confirmed to be a JSON object. */
-type Layer = Record<string, unknown>;
+/**
+ * Any table: one layer's whole document, or one named section of it.
+ *
+ * The same schema does both jobs because they are the same question — "is this something
+ * that has named fields?" — and it answers it for every non-table a document can hold: an
+ * array, a scalar, `null`. It is also the only thing standing between an `unknown` parse
+ * result and a value the folds below can index, so it is narrowing rather than defence.
+ */
+const LAYER = z.record(z.string(), z.unknown());
 
-/** Whether `value` is a plain JSON object — an array is not one, and neither is `null`. */
-function isObject(value: unknown): value is Layer {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
+/** One layer's raw document, after it has been confirmed to be a table. */
+type Layer = z.infer<typeof LAYER>;
+
+/**
+ * One field's value as `schema` reads it, or `null` when this layer offers nothing usable
+ * for it.
+ *
+ * Every field goes through its own call, which is what makes degradation per field rather
+ * than per layer: a schema that rejects cannot take its neighbours down with it.
+ *
+ * `null` rather than `undefined` for "nothing here", matching `cache.ts`, `git.ts` and
+ * `repo.ts` — and unambiguous only because no schema in this module answers `null`. One
+ * that did would need its own way to say it found nothing.
+ */
+function take<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> | null {
+  const result = schema.safeParse(value);
+
+  return result.success ? result.data : null;
 }
+
+/**
+ * The `wrk` namespace of a `.project-meta.json`, and nothing else in the document.
+ *
+ * `z.object` strips every key it is not told about, so the neighbouring tool's top-level
+ * `search` is discarded by the parse itself — it is not merely stepped around, it never
+ * reaches the fold. That is the whole guarantee this layer owes a file `wrk` is a guest in.
+ */
+const PROJECT_NAMESPACE = z.object({ [NAMESPACE]: LAYER }).transform((meta) => meta[NAMESPACE]);
 
 /**
  * Resolves the machine-wide config file's path.
@@ -191,116 +319,50 @@ export function globalConfigPath(): string {
 }
 
 /**
- * Reads one JSON document, answering `null` for every way it can fail to be one.
+ * Reads one document through `parse`, answering `null` for every way that can fail.
  *
- * Missing, unreadable, a directory, empty, truncated, or a JSON array or scalar at the
- * root all collapse to the same answer, because the caller does the same thing with each:
- * fall through to the layer below. Distinguishing them would only be useful for a
- * diagnostic this module is specified not to emit.
+ * Missing, unreadable, a directory, or rejected by the parser all collapse to the same
+ * answer, because the caller does the same thing with each: fall through to the layer
+ * below. Distinguishing them would only be useful for a diagnostic this module is
+ * specified not to emit. Whether what came back is usable is the caller's schema's
+ * question, not this function's — `null` fails every one of them anyway.
+ *
+ * `parse` is a parameter because the two layers are in two formats and everything else
+ * about reading them is identical.
  */
-async function readLayer(path: string): Promise<Layer | null> {
+async function readDocument(path: string, parse: (text: string) => unknown): Promise<unknown> {
   const text = await readFile(path, "utf8").catch(() => null);
   if (text === null) return null;
 
   try {
-    const parsed: unknown = JSON.parse(text);
-    return isObject(parsed) ? parsed : null;
+    return parse(text);
   } catch {
     return null;
   }
 }
 
+/** Reads the machine-wide TOML document. */
+async function readGlobalLayer(path: string): Promise<Layer | null> {
+  return take(LAYER, await readDocument(path, parseToml));
+}
+
 /** Reads the `wrk` namespace out of a container's `.project-meta.json`. */
 async function readProjectLayer(container: string): Promise<Layer | null> {
-  const meta = await readLayer(join(container, PROJECT_META));
-  const namespaced = meta?.[NAMESPACE];
-
-  return isObject(namespaced) ? namespaced : null;
+  return take(PROJECT_NAMESPACE, await readDocument(join(container, PROJECT_META), JSON.parse));
 }
 
-/** One named section of a layer, or `null` when the layer omits it or it is not an object. */
+/** One named section of a layer, or `null` when it is absent or is not a table. */
 function section(layer: Layer, name: keyof WrkConfig): Layer | null {
-  const value = layer[name];
-  return isObject(value) ? value : null;
-}
-
-/**
- * Expands a leading `~`, and only a leading `~`.
- *
- * `~otheruser` is deliberately left alone: resolving another user's home means reading the
- * password database, and the result is dropped a moment later anyway for not being
- * absolute — which is the honest answer for a root `wrk` cannot locate.
- */
-function expandHome(path: string): string {
-  if (path === "~") return homedir();
-
-  return path.startsWith("~/") ? join(homedir(), path.slice(2)) : path;
-}
-
-/**
- * The usable search roots a layer supplies, or `undefined` when it supplies none.
- *
- * Entries that are not strings, and entries still relative after expansion, are dropped
- * individually — a relative root would be scanned from wherever the user happened to be
- * standing, which is the same hazard `globalConfigPath` rejects a relative
- * `XDG_CONFIG_HOME` for. A list that empties out is treated as no answer rather than as
- * "search nowhere", so a typo'd `"GitLocal"` yields the layer below rather than a picker
- * that silently finds nothing.
- */
-function takeRoots(search: Layer | null): string[] | undefined {
-  const value = search?.roots;
-  if (!Array.isArray(value)) return undefined;
-
-  const roots: string[] = [];
-  for (const entry of value) {
-    if (typeof entry !== "string") continue;
-
-    const expanded = expandHome(entry);
-    if (isAbsolute(expanded)) roots.push(expanded);
-  }
-
-  return roots.length > 0 ? roots : undefined;
-}
-
-/** A layer's search depth, if it is one a directory scan could actually use. */
-function takeDepth(search: Layer | null): number | undefined {
-  const value = search?.depth;
-
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : undefined;
-}
-
-/**
- * The well-formed TTL entries of one layer.
- *
- * Returns a map rather than a whole-value answer because TTLs merge key by key: overriding
- * one entry's TTL must not drop every other entry's. A bad entry is skipped on its own.
- */
-function takeTtls(cache: Layer | null): Record<string, number> {
-  const value = cache?.ttls;
-  if (!isObject(value)) return {};
-
-  const ttls: Record<string, number> = {};
-  for (const [name, ms] of Object.entries(value)) {
-    if (typeof ms === "number" && Number.isFinite(ms) && ms >= 0) ttls[name] = ms;
-  }
-
-  return ttls;
-}
-
-/** A layer's value for one glyph or colour. Empty strings are rejected as absent. */
-function takeMark(marks: Layer | null, position: keyof ByStackPosition): string | undefined {
-  const value = marks?.[position];
-
-  return typeof value === "string" && value.length > 0 ? value : undefined;
+  return take(LAYER, layer[name]);
 }
 
 /**
  * Resolves one `{top, bottom, merged}` section, folding the layers on in priority order.
  *
- * `??` is exact rather than convenient here: {@link takeMark} already rejects the empty
+ * `??` is exact rather than convenient here: {@link MARK} already rejects the empty
  * string, so the only `undefined` reaching it means "this layer offered nothing usable for
  * this position" — which is how one malformed mark falls through while its siblings in the
- * same object still land.
+ * same table still land.
  */
 function takeByPosition(
   layers: readonly Layer[],
@@ -313,9 +375,9 @@ function takeByPosition(
   for (const layer of layers) {
     const supplied = section(layer, name);
     marks = {
-      top: takeMark(supplied, "top") ?? marks.top,
-      bottom: takeMark(supplied, "bottom") ?? marks.bottom,
-      merged: takeMark(supplied, "merged") ?? marks.merged,
+      top: take(MARK, supplied?.top) ?? marks.top,
+      bottom: take(MARK, supplied?.bottom) ?? marks.bottom,
+      merged: take(MARK, supplied?.merged) ?? marks.merged,
     };
   }
 
@@ -326,7 +388,9 @@ function takeByPosition(
  * Reads and merges every configuration layer.
  *
  * Nothing here throws or warns. A caller gets a complete {@link WrkConfig} whatever state
- * the files are in, which is what lets a shell prompt call it without a guard.
+ * the files are in, which is what lets a shell prompt call it without a guard. The module's
+ * one throw site is {@link DEFAULTS}' own parse, which fires at import and only for a
+ * default this repository shipped wrong.
  *
  * Two merge rules, and the difference between them is the point. `search.roots` is
  * **replaced wholesale** by the highest layer offering a usable value — it is one decision
@@ -346,18 +410,17 @@ function takeByPosition(
  * const { roots, depth } = config.search;
  * ```
  */
-// ponytail: validation is hand-rolled `typeof` guards. Reach for a schema library only if
-// this grows past a handful of sections — today one would be more code, not less.
 export async function loadConfig(sources: ConfigSources = {}): Promise<WrkConfig> {
   const { container, globalPath = globalConfigPath() } = sources;
 
   const [globalLayer, projectLayer] = await Promise.all([
-    readLayer(globalPath),
+    readGlobalLayer(globalPath),
     container ? readProjectLayer(container) : null,
   ]);
 
   // Every fold below applies the layers in this order, so a later one wins. A third layer
-  // is added to the end of this array and needs no other change.
+  // is added to the end of this array and needs no other change — but a new *field* needs
+  // its own `take` line below, since nothing walks {@link CONFIG} to find them.
   const layers = [globalLayer, projectLayer].filter((layer) => layer !== null);
 
   const ttls: Record<string, number> = { ...DEFAULTS.cache.ttls };
@@ -366,9 +429,10 @@ export async function loadConfig(sources: ConfigSources = {}): Promise<WrkConfig
 
   for (const layer of layers) {
     const search = section(layer, "search");
-    roots = takeRoots(search) ?? roots;
-    depth = takeDepth(search) ?? depth;
-    Object.assign(ttls, takeTtls(section(layer, "cache")));
+    roots = take(ROOTS, search?.roots) ?? roots;
+    depth = take(DEPTH, search?.depth) ?? depth;
+    // `Object.assign` skips a `null` source, so `take`'s "nothing here" needs no guard.
+    Object.assign(ttls, take(TTLS, section(layer, "cache")?.ttls));
   }
 
   return {

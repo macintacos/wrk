@@ -8,6 +8,12 @@
  * owns a format is two decisions welded together and the format is always the one that
  * changes.
  *
+ * That is also why there is no schema-aware read here, unlike `config.ts` and the worktree
+ * porcelain in `git.ts`, where a Zod schema owns the boundary. Nothing deserialises a cache
+ * entry yet — there is no caller to design the seam against, and a `cachedJson(key, schema,
+ * …)` invented before the first one would be guessing at what it needs. It is a real
+ * boundary and it will want one; the shape belongs to whoever brings the first consumer.
+ *
  * Three properties make it safe to point a shell prompt at:
  *
  * - **Atomic replacement.** A refresh stages to a per-process temp file and `rename`s it
