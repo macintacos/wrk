@@ -19,6 +19,12 @@
  * `stdout` option) rather than allowed its default, or its escape sequences land in the
  * machine channel.
  *
+ * There is one answer that is deliberately **not** JSON, and it is routed through here
+ * rather than written behind this module's back: {@link emitLine}, the shape the editor's
+ * `WorktreeCreate` hook consumes. Its consumer is not a parser but a `cd`, so the envelope
+ * would be the wrong answer rather than a more rigorous one. A command uses one or the
+ * other and never both — see {@link emitLine} for why that is a rule rather than a style.
+ *
  * **The envelope never omits a key**, and its keys keep a fixed order. An absent value is
  * `null`, never a missing key, so a caller reads any documented field unconditionally
  * rather than guarding each one. {@link envelope} holds both mechanisms.
@@ -112,6 +118,32 @@ export function envelope(payload: object): string {
  */
 export function emit(payload: object): void {
   process.stdout.write(`${envelope(payload)}\n`);
+}
+
+/**
+ * Writes one bare line to stdout, for the caller that reads a path rather than a document.
+ *
+ * The editor's `WorktreeCreate` hook is that caller and currently the only one. Claude Code
+ * enters whatever directory the hook's **last non-empty stdout line** names, so what it
+ * wants is a path and nothing else — no braces, no quotes, no key. Handing it the envelope
+ * would not be a stricter answer, it would be a directory that cannot be entered.
+ *
+ * **A command uses this or {@link emit}, never both.** Both write to the one stdout, so a
+ * run that called each would emit a document with a stray line glued to it, unparseable to
+ * the `jq` caller and a nonexistent path to the hook — the single stream broken for both
+ * consumers at once.
+ *
+ * Nothing is written on the failing path, and that is the property the hook's contract
+ * actually rests on rather than a happy accident: a command builds its answer before it
+ * prints, so a throw reaches `main`'s handler with stdout still untouched, and the caller
+ * sees an empty stdout with a nonzero status. That matters because the `jq -er` filters on
+ * the other side of this contract exit `0` on empty input — a run that failed while still
+ * printing something would be read as a success.
+ *
+ * @param line - The text, without a trailing newline.
+ */
+export function emitLine(line: string): void {
+  process.stdout.write(`${line}\n`);
 }
 
 /**

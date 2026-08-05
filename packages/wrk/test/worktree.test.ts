@@ -1,6 +1,7 @@
 /**
- * Contract of the `create` engine: where a run worktree lands, what branch it is given, what
- * it is branched from, and what it refuses.
+ * Contract of the `create` engine and of the `wrk agent create` command over it: where a run
+ * worktree lands, what branch it is given, what it is branched from, what it refuses, and
+ * which of the two stdout shapes each invocation produces.
  *
  * Every case drives the real `git` binary against real repositories built in temp
  * directories, in the actual bare-repo container shape. The acceptance criterion — the
@@ -15,6 +16,12 @@
  * both suites import. A shared fixture-repo builder is the explicit scope of EXC-1003, and
  * extracting one here would settle that issue's design as a side effect of writing this
  * suite.
+ *
+ * The command cases run the real CLI in a child process, for `cli.test.ts`'s reason — `main`
+ * assigns `process.exitCode` rather than calling `process.exit`, so asserting a status in
+ * process would leave the test runner itself exiting nonzero. Here a child buys a second
+ * thing the engine cases cannot give: stdout as an actual stream, which is the only way to
+ * assert what this contract most needs asserted — that a *failed* run writes nothing to it.
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -24,7 +31,21 @@ import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import { CommandFailed, Refusal } from "../src/output";
+import { type RunResult, run } from "../src/proc";
 import { createWorktree } from "../src/worktree";
+
+/** The CLI entry point, run as a script by the command cases below. */
+const CLI = join(import.meta.dir, "../src/cli.ts");
+
+/**
+ * Runs `wrk agent create` in a child process, from `cwd`.
+ *
+ * `process.execPath` is the runtime already running this suite, so no toolchain lookup is
+ * involved and the child is the same binary a user's `wrk` would be.
+ */
+function agentCreate(cwd: string, args: string[]): Promise<RunResult> {
+  return run(process.execPath, [CLI, "agent", "create", ...args], { cwd });
+}
 
 /**
  * The environment for fixture commands: this process's, minus everything binding git to a
@@ -286,5 +307,71 @@ describe("createWorktree", () => {
 
     expect(failure).toBeInstanceOf(CommandFailed);
     expect((failure as CommandFailed).code).not.toBe(0);
+  });
+});
+
+describe("wrk agent create", () => {
+  test("emits the envelope, carrying worktree_path first", async () => {
+    const container = makeConverted();
+
+    const result = await agentCreate(container, ["--branch", "EXC-20/envelope"]);
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      worktree_path: join(container, "EXC-20+envelope"),
+      branch: "EXC-20/envelope",
+    });
+    // Key order is part of the contract, not an accident of the serializer: two runs of the
+    // same command have to diff cleanly.
+    expect(Object.keys(JSON.parse(result.stdout))).toEqual(["worktree_path", "branch"]);
+  });
+
+  test("prints the worktree path alone under --hook, with no JSON around it", async () => {
+    // What the editor's WorktreeCreate hook consumes: it enters whatever the last non-empty
+    // stdout line names, so a brace or a quote anywhere in it is a directory that cannot be
+    // entered.
+    const container = makeConverted();
+
+    const result = await agentCreate(container, ["--branch", "EXC-21/hook", "--hook"]);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe(`${join(container, "EXC-21+hook")}\n`);
+  });
+
+  test("writes nothing to stdout when it refuses, so `jq -er` fails rather than exiting 0", async () => {
+    // The whole reason the failure shape is specified. `jq -er` exits 0 on *empty* input, so
+    // a run that failed while still exiting 0 would be read as a success with no path — and
+    // an envelope emitted before the failure would be read as a success outright.
+    const result = await agentCreate(plainClone, ["--branch", "EXC-22/nope"]);
+
+    expect(result.stdout).toBe("");
+    expect(result.code).toBe(1);
+    expect(result.stderr).toMatch(/^wrk: not a bare-repo container.*repo-setup skill\n$/);
+  });
+
+  test("writes nothing to stdout when it refuses under --hook either", async () => {
+    // Distinct from the case above rather than a restatement of it: --hook takes a different
+    // write path, and it is the mode where a stray line is worst — the editor would enter it.
+    const result = await agentCreate(plainClone, ["--branch", "EXC-23/nope", "--hook"]);
+
+    expect(result.stdout).toBe("");
+    expect(result.code).toBe(1);
+  });
+
+  test("exits with git's own status, and still says nothing on stdout, when git refuses", async () => {
+    const container = makeConverted();
+
+    const result = await agentCreate(container, ["--branch", "release"]);
+
+    expect(result.stdout).toBe("");
+    expect(result.code).not.toBe(0);
+    expect(result.stderr).toMatch(/^wrk: git worktree add/);
+  });
+
+  test("rejects a missing --branch on stderr, before anything reaches stdout", async () => {
+    const result = await agentCreate(makeConverted(), []);
+
+    expect(result.stdout).toBe("");
+    expect(result.code).not.toBe(0);
   });
 });
