@@ -101,7 +101,7 @@ export function buildProgram(): Command {
   agent
     .command("repo-setup")
     .description("Clone a repository into a bare-repo container in the current directory")
-    .argument("<url>", "What to clone, in any form `git clone` accepts")
+    .argument("<url>", "What to clone, in any form git clone accepts")
     .action(async (url: string) => {
       emit(await repoSetup(process.cwd(), url));
     });

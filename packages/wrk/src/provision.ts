@@ -201,21 +201,19 @@ async function codegraph(checkout: string, ...args: string[]): Promise<void> {
 /**
  * Builds an index in a checkout that has none — {@link codegraph}'s inverse gate.
  *
- * **The checkout's own existence is checked, not merely the index's absence.** {@link tool}
- * reads an `ENOENT` as "the tool is not installed", and a `cwd` that does not exist produces a
- * byte-identical one — so a gate that only asks whether `.codegraph` is missing is satisfied by
- * a path that is missing entirely, and would swallow that in the silence reserved for a machine
- * without `codegraph`. Every other step in this module clears the same bar by stat-ing a file
- * it needs; this one has nothing it needs, so it stats the directory itself.
+ * **This is the one step that does not stat a path inside `cwd` first**, which {@link tool}
+ * names as the precondition for reading its `ENOENT` as "the tool is not installed": `init`
+ * needs nothing to be there, so there is nothing to stat. The reading stays safe anyway,
+ * because the alternative is not a *different* outcome. A `cwd` that does not exist makes the
+ * spawn fail whether or not this checked for it, and `bestEffort` is the only thing above
+ * either way — so a guard here would buy silence in place of a warning, which is the wrong
+ * direction. The sole caller is {@link provisionCheckout}, which is handed a checkout `git
+ * worktree add` has just created.
  *
  * @param checkout - Freshly-cloned checkout to index; a no-op if it already has an index.
  */
 async function initCodegraph(checkout: string): Promise<void> {
-  const [root, index] = await Promise.all([
-    statOf(checkout),
-    statOf(join(checkout, CODEGRAPH_DIR)),
-  ]);
-  if (root?.isDirectory() !== true || index?.isDirectory() === true) return;
+  if ((await statOf(join(checkout, CODEGRAPH_DIR)))?.isDirectory() === true) return;
 
   await runCodegraph(checkout, "init");
 }

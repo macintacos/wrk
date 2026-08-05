@@ -118,10 +118,11 @@ repository by choosing where to run. Two refusals, in this order: already inside
 repository — convert it instead — and then a cwd that is not empty. An existing checkout
 trips both, and the first is the one whose advice applies.
 
-**On any failure the cwd is emptied before the error is reported.** That is not tidiness:
-`.bare` plus the `.git` pointer *is* a repository, so wreckage left behind would trip the
-inside-a-repository refusal on the next attempt and send you off to convert a container
-with no checkout in it.
+**If a step fails after the clone has started, the cwd is emptied before the error is
+reported** — a refusal never gets that far, which is exactly why both checks run first.
+That is not tidiness: `.bare` plus the `.git` pointer *is* a repository, so wreckage left
+behind would trip the inside-a-repository refusal on the next attempt and send you off to
+convert a container with no checkout in it.
 
 The checkout directory folds `/` to `+` exactly as a run worktree's does, so a default
 branch named `release/2.0` lands in `release+2.0` while the branch keeps its slashes.

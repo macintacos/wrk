@@ -12,8 +12,8 @@
  * repository by choosing where to run, which is what makes the command composable with a
  * `mkdir` the caller already had to do.
  *
- * **Three constraints shape the argv, and each is a security property rather than a
- * preference.**
+ * **Two properties of how git is invoked, and both are security properties rather than
+ * preferences.**
  *
  * `GIT_TERMINAL_PROMPT=0` is set on every call that reaches the network — the clone, the fetch
  * *and* the `set-head`. git reads `/dev/tty` directly, so capturing a child's output does not
@@ -22,10 +22,15 @@
  * remote, and a credential helper that answered the clone need not still answer the two after
  * it.
  *
- * The URL is passed after a `--`, because it crosses a trust boundary: an agent relays whatever
- * a human or a ticket body supplied, and a leading `--upload-pack=<cmd>` is a command git would
- * run. Without the separator git also consumes it as its own option and reads `.bare` as the
- * repository, so the failure would not even name the input that caused it.
+ * **Every argv position carrying remote- or caller-supplied data is preceded by a `--`.** The
+ * URL is the obvious one: an agent relays whatever a human or a ticket body supplied, a leading
+ * `--upload-pack=<cmd>` is a command git would run, and without the separator git consumes it as
+ * its own option and reads `.bare` as the repository, so the failure would not even name the
+ * input that caused it. The branch name is the less obvious one and gets the same treatment —
+ * it is read back off `origin/HEAD`, so it comes from the remote, and `refs/heads/-x` is a name
+ * `git check-ref-format` accepts and a bare clone fetches. Neither `worktree add` nor `branch`
+ * has an option that executes anything, so that one fails closed today; the separator is there
+ * so the boundary is a property of the argv rather than of which options git happens to have.
  *
  * **A failure empties the cwd rather than leaving a half-built container**, and that matters
  * more than the usual tidiness argument: `.bare` plus the `.git` pointer *is* a repository, so
@@ -59,10 +64,11 @@ const ORIGIN_REFSPEC = "+refs/heads/*:refs/remotes/origin/*";
 /**
  * The environment every networked step runs under — see this module's header.
  *
- * Layered over `git.ts`'s own repository-shedding set rather than replacing it, which is what
- * {@link gitOk}'s `env` parameter exists to guarantee.
+ * Named for what it does rather than for the Python's `offline`, which reads as the opposite of
+ * the truth: this marks precisely the three calls that *do* reach the network, and all it
+ * suppresses there is the credential prompt.
  */
-const OFFLINE = { GIT_TERMINAL_PROMPT: "0" } as const;
+const NO_PROMPT = { GIT_TERMINAL_PROMPT: "0" } as const;
 
 /**
  * What `repo-setup` produced: the container, the checkout in it, and the branch that named it.
@@ -96,16 +102,29 @@ export interface Initialized {
  * Deletes everything a failed {@link repoSetup} left behind.
  *
  * Safe to empty the directory outright because {@link repoSetup} refused unless the cwd was
- * empty, so nothing in it predates this run.
+ * empty, so nothing in it predates the run.
  *
- * Sequential rather than concurrent: the entries are few, and a fan-out of `rm` calls into one
- * directory buys nothing measurable against a partial clone.
+ * **Every failure here is swallowed**, which is the one thing this function must get right: it
+ * runs from a `catch`, so a rejection would replace the {@link CommandFailed} carrying git's exit
+ * status and stderr with a filesystem error `reportFailure` does not recognise — turning a
+ * one-line refusal into a stack trace and losing the status the caller is meant to inherit.
+ * `force: true` alone does not cover it: it ignores `ENOENT` and nothing else.
+ *
+ * Sequential rather than concurrent, for the reason `cache.ts` records: recursive `rm` calls
+ * overlapping in one directory fail with `EFAULT` on Bun
+ * ([oven-sh/bun#36984](https://github.com/oven-sh/bun/issues/36984)), and the entries here are
+ * few enough that there is nothing to win by racing them anyway.
  *
  * @param cwd - The container being discarded.
  */
 async function discardPartialContainer(cwd: string): Promise<void> {
-  for (const entry of await readdir(cwd)) {
-    await rm(join(cwd, entry), { recursive: true, force: true });
+  // ponytail: empties the directory rather than removing the three paths this run created, so a
+  // file that arrived *during* a multi-minute clone goes with it. Naming them instead is more
+  // code, not less -- the checkout's name is not known until `resolveDefaultBranch` answers, so
+  // a failure before that has nothing to name. Narrow the deletion if it ever bites.
+  const entries = await readdir(cwd).catch(() => []);
+  for (const entry of entries) {
+    await rm(join(cwd, entry), { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -117,10 +136,10 @@ async function discardPartialContainer(cwd: string): Promise<void> {
  * applies to it. Reversed, someone standing in their own repository would be told to go and
  * find an empty directory.
  *
- * The inside-a-repository probe answers "yes" for any directory when a `GIT_DIR` is inherited.
- * That fails safe: a spurious refusal, never a clone into somebody else's repository. `git.ts`
- * sheds that variable for the child anyway, so it takes an inherited one *this* process cannot
- * see to reach the case at all.
+ * `git.ts` unsets every variable `git rev-parse --local-env-vars` names, so an inherited
+ * `GIT_DIR` cannot reach the inside-a-repository probe and make it answer "yes" for any
+ * directory at all. The residual is a git that honours a binding variable that list omits, and
+ * it fails safe: a spurious refusal, never a clone into somebody else's repository.
  *
  * **The checkout directory is folded**, where the Python implementation this reproduces leaves
  * the branch name as it found it. The checkout is a flat sibling of `.bare`, so a default branch
@@ -135,9 +154,11 @@ async function discardPartialContainer(cwd: string): Promise<void> {
  * @param url - What to clone, in any form `git clone` accepts.
  * @returns The container, the checkout inside it, and the default branch — see
  *   {@link Initialized}.
- * @throws {@link Refusal} if `cwd` is inside a repository, or is not empty. Both name the
- *   directory: it is the one thing the user has to look at, and nothing else in the output
- *   carries it.
+ * @throws {@link Refusal} if `cwd` is inside a repository or is not empty — each naming the
+ *   directory, since it is the one thing the user has to look at and nothing else in the output
+ *   carries it — or, from inside the cleanup boundary, if the clone produced no branch to check
+ *   out. That third one names the URL instead, and see its throw site for why it is unreachable
+ *   in practice.
  * @throws {@link CommandFailed} if any git step failed. It carries git's own exit status, which
  *   is what `wrk` exits with, so nothing here needs to map it — and the cwd has been emptied
  *   before it is raised.
@@ -167,26 +188,31 @@ export async function repoSetup(cwd: string, url: string): Promise<Initialized> 
   let checkout: string;
   let defaultBranch: string;
   try {
-    await gitOk(["clone", "--bare", "--", url, BARE_DIR], cwd, OFFLINE);
+    await gitOk(["clone", "--bare", "--", url, BARE_DIR], cwd, NO_PROMPT);
     // The pointer is what makes every git command run from the container -- or from any
     // checkout under it -- find the repository.
     await writeFile(join(cwd, ".git"), `gitdir: ./${BARE_DIR}\n`, "utf8");
 
     await gitOk(["config", "remote.origin.fetch", ORIGIN_REFSPEC], bare);
-    await gitOk(["fetch", "origin"], bare, OFFLINE);
+    await gitOk(["fetch", "origin"], bare, NO_PROMPT);
     // Belt-and-braces: git 2.47 and newer set origin/HEAD during the fetch above, older git
     // does not -- and `resolveDefaultBranch` reads it first.
-    await gitOk(["remote", "set-head", "origin", "-a"], bare, OFFLINE);
+    await gitOk(["remote", "set-head", "origin", "-a"], bare, NO_PROMPT);
 
     const branch = await resolveDefaultBranch(cwd);
     if (branch === null) {
+      // Unreachable in practice: `set-head -a` above fails outright unless the remote had a HEAD
+      // to copy, and a resolvable HEAD is a branch. Thrown rather than asserted because
+      // `resolveDefaultBranch` is honestly nullable, and a refusal is the honest answer.
       throw new Refusal(`${url} has no branch to check out; clone it by hand and look at it`);
     }
 
+    // Bound once: the directory name and the path have to agree, and two calls can drift.
+    const dir = worktreeDirName(branch);
     defaultBranch = branch;
-    checkout = join(cwd, worktreeDirName(branch));
-    await gitOk(["worktree", "add", worktreeDirName(branch), branch], cwd);
-    await gitOk(["branch", `--set-upstream-to=origin/${branch}`, branch], checkout);
+    checkout = join(cwd, dir);
+    await gitOk(["worktree", "add", "--", dir, branch], cwd);
+    await gitOk(["branch", `--set-upstream-to=origin/${branch}`, "--", branch], checkout);
   } catch (error) {
     await discardPartialContainer(cwd);
     throw error;

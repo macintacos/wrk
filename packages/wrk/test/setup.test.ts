@@ -251,6 +251,35 @@ describe("repoSetup", () => {
     );
   });
 
+  test("provisions the checkout it built, and survives a tool that fails doing it", async () => {
+    // Two things at once, and the first is why this case exists at all: with `PATH` holding only
+    // `git` for the rest of the file, provisioning is a silent no-op everywhere else, so nothing
+    // would notice the call being deleted. `provision.test.ts` owns the pipeline's own gating;
+    // what is asserted here is that `repoSetup` reaches it, and that a tool exiting nonzero
+    // leaves the container standing — git finished building it before this ran.
+    const bin = tempDir();
+    const log = join(bin, "log.tsv");
+    symlinkSync(REAL_GIT, join(bin, "git"));
+    writeFileSync(
+      join(bin, "codegraph"),
+      `#!/bin/sh\nprintf '%s\\t%s\\n' "$(pwd)" "codegraph $*" >> ${JSON.stringify(log)}\nexit 3\n`,
+    );
+    chmodSync(join(bin, "codegraph"), 0o755);
+
+    const saved = process.env.PATH;
+    process.env.PATH = bin;
+    try {
+      const container = tempDir();
+
+      const built = await repoSetup(container, seed);
+
+      expect(readFileSync(log, "utf8")).toBe(`${built.checkout_path}\tcodegraph init\n`);
+      expect(readdirSync(container).toSorted()).toEqual([".bare", ".git", "main"]);
+    } finally {
+      process.env.PATH = saved;
+    }
+  });
+
   test("refuses a directory inside a repository first, though it is also not empty", async () => {
     // The ordering criterion, and it needs both conditions true at once: an existing checkout
     // trips *both* refusals, and only this one has advice that applies. A swapped pair would
@@ -347,7 +376,8 @@ function makeRecordingGit(): { bin: string; log: string } {
       // literally: in a plain string biome reads it as a template placeholder someone forgot
       // to make interpolating, which is exactly the mistake the rule exists to catch.
       `{ printf "%s" "\${GIT_TERMINAL_PROMPT-unset}"; printf "\\t%s" "$@"; printf "\\n"; } >> "$WRK_GIT_LOG"`,
-      `exec ${REAL_GIT} "$@"`,
+      // Quoted, so a git installed under a path containing a space still execs.
+      `exec ${JSON.stringify(REAL_GIT)} "$@"`,
       "",
     ].join("\n"),
   );
@@ -418,20 +448,18 @@ describe("the git calls repo-setup makes", () => {
     // available that this builds the layout the rest of `wrk` expects. Only the mutating and
     // networked steps are listed: the read-only probes between them are `repo.ts`'s business
     // and change as its resolution rules do.
-    const steps = calls
-      .map(({ args }) => args.slice(0, 3).join(" "))
-      .filter((step) =>
-        ["clone", "config remote.origin.fetch", "fetch origin", "remote set-head", "worktree add"]
-          .map((prefix) => step.startsWith(prefix))
-          .includes(true),
-      );
+    // Whole argvs, not prefixes: a truncated comparison would leave `set-head`'s `-a` and every
+    // `--` after the first unpinned, which is most of what this case exists to assert.
+    const mutating = ["clone", "config", "fetch", "remote", "worktree", "branch"];
+    const steps = calls.map(({ args }) => args).filter((args) => mutating.includes(args[0] ?? ""));
 
     expect(steps).toEqual([
-      "clone --bare --",
-      "config remote.origin.fetch +refs/heads/*:refs/remotes/origin/*",
-      "fetch origin",
-      "remote set-head origin",
-      `worktree add main`,
+      ["clone", "--bare", "--", seed, ".bare"],
+      ["config", "remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"],
+      ["fetch", "origin"],
+      ["remote", "set-head", "origin", "-a"],
+      ["worktree", "add", "--", "main", "main"],
+      ["branch", "--set-upstream-to=origin/main", "--", "main"],
     ]);
   });
 });
