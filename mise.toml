@@ -23,10 +23,21 @@ biome = "2.5"  # JS/TS format + lint (config in biome.jsonc)
 rumdl = "0.2"  # Markdown format + lint (config in .rumdl.toml)
 taplo = "0.10" # TOML format + lint (config in taplo.toml)
 
-# yamlfmt, shfmt and shellcheck are deliberately absent: this repo has no YAML
-# and no shell scripts yet. They arrive with the .mise/tasks/ forwarders in
-# EXC-989, alongside the files that need them.
+# Shell, for scripts/bootstrap.sh and the extensionless .mise/tasks/* forwarders.
+# The forwarders carry no extension; hk's builtins select them by shebang rather
+# than by glob — see the Shell(Format)/Shell(Lint) steps in hk.pkl.
+shellcheck = "0.11" # shell lint
+shfmt      = "3.13" # shell format (indent width comes from .editorconfig)
+
+# yamlfmt is still deliberately absent: this repo has no YAML. It arrives with
+# the first file that needs it.
 
 # (Re)register git hooks whenever tools are installed or updated.
 [hooks]
 postinstall = "hk install --mise"
+
+# Tasks are file tasks in .mise/tasks/, not [tasks] entries here. Each is a thin
+# bash forwarder that execs `bun scripts/tasks/cli.ts <name> "$@"`, so commander
+# owns every flag, default and --help while the task file stays one line. Each
+# one sources scripts/bootstrap.sh first, the dep-free guard that makes a task
+# work on a fresh clone; test/tasks.test.ts is what keeps that true.
