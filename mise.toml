@@ -27,10 +27,10 @@ taplo = "0.10" # TOML format + lint (config in taplo.toml)
 # The forwarders carry no extension; hk's builtins select them by shebang rather
 # than by glob — see the Shell(Format)/Shell(Lint) steps in hk.pkl.
 shellcheck = "0.11" # shell lint
-shfmt      = "3.13" # shell format (indent width comes from .editorconfig)
+shfmt      = "3.13" # shell format (tabs, shfmt's own default)
 
-# yamlfmt is still deliberately absent: this repo has no YAML. It arrives with
-# the first file that needs it.
+# yamlfmt is deliberately absent: this repo has no YAML. It arrives with the
+# first file that needs it.
 
 # (Re)register git hooks whenever tools are installed or updated.
 [hooks]

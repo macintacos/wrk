@@ -40,7 +40,7 @@ const realActions: TaskActions = {
   lint: runLint,
   typecheck: runTypecheck,
   test: runTest,
-  setup: () => runSetup(),
+  setup: runSetup,
 };
 
 /**
@@ -49,24 +49,33 @@ const realActions: TaskActions = {
  *
  * Each description is also the `#MISE description=` a forwarder carries, so
  * `mise tasks` and `cli.ts --help` agree.
+ *
+ * Keyed by `keyof TaskActions` rather than listed as pairs so that adding a task
+ * to {@link TaskActions} without describing it here is a compile error instead of
+ * a subcommand that silently does not exist. `Object.entries` preserves the
+ * insertion order above.
  */
-const TASKS: ReadonlyArray<readonly [keyof TaskActions, string]> = [
-  ["format", "Format every file in the repo, without staging the changes"],
-  ["lint", "Report every formatter and linter finding"],
-  ["typecheck", "Type-check the whole workspace"],
-  ["test", "Run the test suite"],
-  ["setup", "Install the toolchain and dependencies"],
-];
+const TASKS: Record<keyof TaskActions, string> = {
+  format: "Format every file in the repo, without staging the changes",
+  lint: "Report every formatter and linter finding",
+  typecheck: "Type-check the whole workspace",
+  test: "Run the test suite",
+  setup: "Install the toolchain and dependencies",
+};
 
 /**
  * Assembles the commander tree.
  *
- * Every subcommand takes a variadic `[args...]` and sets `allowUnknownOption()`
- * plus `passThroughOptions()`, so a flag meant for the underlying tool — `--bail`
- * for `bun test`, `--pretty` for `tsc` — is forwarded rather than rejected by
- * commander as unknown. `enablePositionalOptions()` on the parent is what makes
- * that pass-through legal: without it commander keeps claiming options after the
- * subcommand name.
+ * The two option settings do different jobs, and both are needed.
+ * `allowUnknownOption()` stops commander *rejecting* a flag it does not know,
+ * like `--bail` for `bun test`. `passThroughOptions()` stops it *claiming* one it
+ * does know: once a positional has been seen, even `--help` is forwarded, so
+ * `mise run test foo.test.ts --help` reaches the test runner. Commander throws at
+ * build time unless the parent sets `enablePositionalOptions()`, hence that call.
+ *
+ * The consequence worth knowing: a *bare* `mise run test --help`, with no
+ * positional before it, is still answered by commander. That is deliberate — it
+ * is what makes `--help` describe the task rather than the tool.
  *
  * @param overrides - Actions replacing the real ones, for tests.
  * @returns The configured program, not yet parsed.
@@ -79,7 +88,7 @@ export function buildProgram(overrides: Partial<TaskActions> = {}): Command {
     .description("Developer tasks for this repo, invoked as `mise run <task>`.")
     .enablePositionalOptions();
 
-  for (const [name, description] of TASKS) {
+  for (const [name, description] of Object.entries(TASKS) as Array<[keyof TaskActions, string]>) {
     program
       .command(name)
       .description(description)

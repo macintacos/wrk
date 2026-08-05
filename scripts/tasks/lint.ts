@@ -1,6 +1,6 @@
 /** The `lint` task: report every formatter and linter finding without fixing any. */
 
-import { type Argv, execAndExit } from "./lib/exec";
+import { execAndExit } from "./lib/exec";
 
 /**
  * Builds the argv for `lint`.
@@ -11,7 +11,7 @@ import { type Argv, execAndExit } from "./lib/exec";
  *
  * @param args - Extra arguments forwarded to hk.
  */
-export function lintCommand(args: string[]): Argv {
+export function lintCommand(args: string[]): string[] {
   return ["hk", "check", "--all", ...args];
 }
 

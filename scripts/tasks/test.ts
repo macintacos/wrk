@@ -1,6 +1,6 @@
 /** The `test` task: run the workspace's test suite. */
 
-import { type Argv, execAndExit } from "./lib/exec";
+import { execAndExit } from "./lib/exec";
 
 /**
  * Builds the argv for `test`.
@@ -12,7 +12,7 @@ import { type Argv, execAndExit } from "./lib/exec";
  *
  * @param args - Extra arguments forwarded to the test runner: paths, `-t`, `--bail`.
  */
-export function testCommand(args: string[]): Argv {
+export function testCommand(args: string[]): string[] {
   return ["bun", "test", ...args];
 }
 

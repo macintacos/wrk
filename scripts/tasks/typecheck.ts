@@ -1,6 +1,6 @@
 /** The `typecheck` task: type-check the whole workspace in one program. */
 
-import { type Argv, execAndExit } from "./lib/exec";
+import { execAndExit } from "./lib/exec";
 
 /**
  * Builds the argv for `typecheck`.
@@ -12,7 +12,7 @@ import { type Argv, execAndExit } from "./lib/exec";
  *
  * @param args - Extra arguments forwarded to tsc.
  */
-export function typecheckCommand(args: string[]): Argv {
+export function typecheckCommand(args: string[]): string[] {
   return ["bun", "x", "tsc", "--noEmit", "-p", "tsconfig.json", ...args];
 }
 

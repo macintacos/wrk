@@ -1,6 +1,6 @@
 /** The `format` task: rewrite every file in the repo to its formatter's output. */
 
-import { type Argv, execAndExit } from "./lib/exec";
+import { execAndExit } from "./lib/exec";
 
 /**
  * Builds the argv for `format`.
@@ -10,7 +10,7 @@ import { type Argv, execAndExit } from "./lib/exec";
  *
  * @param args - Extra arguments forwarded to hk.
  */
-export function formatCommand(args: string[]): Argv {
+export function formatCommand(args: string[]): string[] {
   return ["hk", "fix", "--all", "--no-stage", ...args];
 }
 

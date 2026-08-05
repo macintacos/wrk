@@ -19,29 +19,36 @@ Tool versions are pinned by [mise](https://mise.jdx.dev) and checksum-locked in
 
 ```bash
 mise trust      # approve this repo's mise.toml
-mise install    # install pinned tools; registers git hooks via `hk install --mise`
-bun install     # install workspace dependencies
+mise run setup  # install pinned tools, then workspace dependencies
 ```
 
 `mise install` runs `hk install --mise` as a postinstall hook, so the pre-commit and
 pre-push hooks are registered as a side effect of a normal setup.
 
-## Toolchain
+Running any task on a fresh clone bootstraps it first, so `mise run setup` is only needed
+to reconcile a checkout after a lockfile change.
 
-Four lanes, all defined in `hk.pkl`:
+## Tasks
 
-| Lane      | Command                   | What it does                                   |
-| --------- | ------------------------- | ---------------------------------------------- |
-| format    | `hk fix --all --no-stage` | Rewrites files into canonical form.            |
-| lint      | `hk check --all`          | Read-only: formatter diffs, lint rules, types. |
-| typecheck | `hk run typecheck --all`  | `tsc --noEmit` across the workspace.           |
-| test      | `hk run test --all`       | `bun test`.                                    |
+Every entry point is a `mise run <task>`. Each is a thin `.mise/tasks/` forwarder into one
+commander tree in `scripts/tasks/cli.ts`, so `mise run <task> --help` documents the task
+and any further arguments reach the underlying tool.
 
-Run the last two as `hk run <lane>`, never `hk <lane>` — `hk test` is hk's own fixture
-runner and `hk typecheck` is not a subcommand. Shorter `mise run` aliases arrive with the
-task runner in EXC-989.
+| Task      | What it runs                          | What it does                                   |
+| --------- | ------------------------------------- | ---------------------------------------------- |
+| format    | `hk fix --all --no-stage`             | Rewrites files into canonical form.            |
+| lint      | `hk check --all`                      | Read-only: formatter diffs, lint rules, types. |
+| typecheck | `bun x tsc --noEmit -p tsconfig.json` | Types across the workspace.                    |
+| test      | `bun test`                            | The test suite.                                |
+| setup     | `mise install`, `bun install`         | Toolchain, then dependencies.                  |
 
-`pre-commit` runs the format and lint lanes in fix mode; `pre-push` runs the test lane.
+`typecheck` and `test` reach their tool directly so a path or filter can be forwarded —
+`mise run test test/tasks.test.ts` and `mise run test -t "some name"` both work.
+
+The same checks exist as hk lanes, which is what the git hooks run: `pre-commit` runs the
+format and lint lanes in fix mode, `pre-push` runs the test lane. Invoke a lane directly
+as `hk run <lane>`, never `hk <lane>` — `hk test` is hk's own fixture runner and
+`hk typecheck` is not a subcommand.
 
 Biome owns JS/TS formatting and linting, `tsc` owns types, rumdl owns Markdown, and taplo
 owns TOML.

@@ -31,12 +31,10 @@ import "package://github.com/jdx/hk/releases/download/v1.54.0/hk@1.54.0#/Builtin
 //      lane. The lane is `hk run test`; likewise `hk run typecheck`, since
 //      `hk typecheck` is not a subcommand at all.
 //
-// Both were revisited once the `.mise/tasks/` forwarders landed and both are
-// still accepted. `mise run typecheck` and `mise run test` do call tsc and bun
-// directly rather than routing through these lanes — hk adds nothing to a
-// whole-program command, and `hk run test` has nowhere to put a forwarded test
-// path — but the lanes themselves stay, because the pre-commit and pre-push
-// hooks below are what actually run them.
+// `mise run typecheck` and `mise run test` call tsc and bun directly rather than
+// routing through these lanes: hk adds nothing to a whole-program command, and
+// `hk run test` has nowhere to put a forwarded test path. The lanes stay because
+// the pre-commit and pre-push hooks below are what run them.
 
 // tsc is a dev dependency rather than a mise tool, so it runs through bun. It is
 // a whole-program check: no `{{ files }}` argument, so a matching staged file
@@ -91,8 +89,8 @@ local formatters = new Mapping<String, Step> {
   // shebang-based `types` selector, so it reaches the extensionless
   // .mise/tasks/* forwarders without a glob override — and in hk 1.54 adding one
   // is not merely redundant but rejected, since `match_any` and a top-level
-  // `glob` cannot be combined. It runs `shfmt --apply-ignore` with no -i, so
-  // indent width comes from .editorconfig.
+  // `glob` cannot be combined. It runs `shfmt --apply-ignore` with no -i, and no
+  // .editorconfig section matches shell, so indentation is shfmt's default: tabs.
   ["Shell(Format)     [[builtins.shfmt]]"] = Builtins.shfmt
 
   ["Pkl(Format)       [[builtins.pkl_format]]"] = Builtins.pkl_format

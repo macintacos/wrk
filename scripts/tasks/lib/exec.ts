@@ -2,42 +2,39 @@
  * The one primitive every task bottoms out in: run a tool, show the user what it
  * says, exit with what it returned.
  *
- * Deliberately *not* built on `packages/wrk/src/proc.ts`. That helper captures
- * stdout and stderr into strings because its callers parse `git` output; a task
- * runner needs the opposite — inherited stdio, so `tsc` and `bun test` stream
- * their progress live and keep the colours they only emit to a TTY. Buffering
- * that until exit would be a worse task runner, not a shared one.
+ * Deliberately *not* built on `packages/wrk/src/proc.ts`, for two reasons. That
+ * helper captures stdout and stderr into strings because its callers parse `git`
+ * output; a task runner needs the opposite — inherited stdio, so `tsc` and
+ * `bun test` stream their progress live and keep the colours they only emit to a
+ * TTY. Adding a `stdio` option to `run()` would make its `RunResult.stdout`
+ * conditionally meaningless for every existing caller. It is also the wrong side
+ * of a boundary: `packages/wrk` is source that ships in a published artifact,
+ * `scripts/` is workspace tooling, and importing across that line to save ten
+ * lines is coupling worth refusing.
+ *
+ * `proc.ts` avoids `Bun.spawn` because the published artifact targets Node.
+ * Nothing here ever runs outside bun, so this file uses it freely.
  *
  * @packageDocumentation
  */
 
 /**
- * A command as an argv array: the executable, then its arguments.
- *
- * A non-empty tuple rather than `string[]` so the executable is statically known
- * to exist — under `noUncheckedIndexedAccess` a plain array would make every
- * spawn site assert on `cmd[0]`.
- */
-export type Argv = [string, ...string[]];
-
-/**
  * Runs `cmd` with this process's stdio and resolves with its exit code.
  *
  * A nonzero exit is a value, not a throw: the caller decides whether to stop.
- * `env` is passed explicitly because `Bun.spawn` otherwise uses the environment
- * snapshotted at startup, which drops anything the bootstrap guard exported into
- * `process.env` on its way through.
+ * Bun reports a signal death as `128 + signum`, so a plain `code !== 0` check
+ * stays correct for a killed child too.
  *
  * @param cmd - The executable and its arguments.
  * @returns The child's exit code.
  */
-export async function runForward(cmd: Argv): Promise<number> {
-  const [bin, ...args] = cmd;
-
-  const child = Bun.spawn([bin, ...args], {
+export async function runForward(cmd: string[]): Promise<number> {
+  const child = Bun.spawn(cmd, {
     stdin: "inherit",
     stdout: "inherit",
     stderr: "inherit",
+    // Passed explicitly so a variable set at runtime is not lost to the
+    // environment Bun snapshotted at startup.
     env: process.env,
   });
 
@@ -54,7 +51,7 @@ export async function runForward(cmd: Argv): Promise<number> {
  * @param cmds - Commands to run in order.
  * @returns Never — the process exits.
  */
-export async function execAndExit(cmds: Argv[]): Promise<never> {
+export async function execAndExit(cmds: string[][]): Promise<never> {
   for (const cmd of cmds) {
     const code = await runForward(cmd);
 

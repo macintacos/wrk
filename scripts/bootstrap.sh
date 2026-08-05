@@ -6,6 +6,11 @@
 # through a return status, and it lets the PATH repair below survive into the
 # `exec bun ...` that follows; a subshell would discard both.
 #
+# The caller's `set -e` does NOT apply inside this file: sourcing it as the left
+# operand of `||` disables errexit for everything it runs. Every fallible command
+# here must therefore carry its own `|| return` — without one, a failed install
+# is skipped silently and the guard reports success.
+#
 # Dependency-free by construction: this runs before `bun install` has, so it
 # cannot import anything the task itself would import. A task that skipped this
 # on a clean checkout would not fail with a useful message, it would fail during
@@ -14,12 +19,10 @@
 # Returns 0 when the checkout is ready, nonzero when it could not be made ready.
 
 wrk_bootstrap() {
-	# Resolve the repo root without moving the caller's cwd. MISE_PROJECT_ROOT is
-	# set for every mise task; the fallback keeps this sourceable by hand.
-	local root="${MISE_PROJECT_ROOT:-}"
-	if [[ -z ${root} ]]; then
-		root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
-	fi
+	# Located from this file rather than from cwd or MISE_PROJECT_ROOT, so the
+	# `cd`s below are correct however the caller was invoked.
+	local root
+	root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)" || return 1
 
 	# Warm path: dependencies present and a runtime to run them with. Two builtins,
 	# no subprocess, so the common case costs nothing.

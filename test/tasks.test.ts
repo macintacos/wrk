@@ -12,11 +12,13 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { readdir } from "node:fs/promises";
+import { chmod, copyFile, mkdir, mkdtemp, readdir, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
 import { buildProgram } from "../scripts/tasks/cli";
 import { formatCommand } from "../scripts/tasks/format";
+import { runForward } from "../scripts/tasks/lib/exec";
 import { lintCommand } from "../scripts/tasks/lint";
 import { setupCommands } from "../scripts/tasks/setup";
 import { testCommand } from "../scripts/tasks/test";
@@ -108,10 +110,122 @@ describe("the commander tree", () => {
     expect((await capture(["test", "--bail"])).args).toEqual(["--bail"]);
   });
 
-  test("a flag that collides with commander's own is still forwarded", async () => {
-    // `-p` is commander-shaped and tsc-meaningful. If passThroughOptions ever
-    // regresses, this is the case that breaks first.
-    expect((await capture(["typecheck", "--pretty", "false"])).args).toEqual(["--pretty", "false"]);
+  test("a flag commander owns is forwarded once a positional has been seen", async () => {
+    // The one case that actually discriminates passThroughOptions: allowUnknownOption
+    // alone already forwards flags commander does not know, so only a flag it *does*
+    // own — `--help` — can tell the two settings apart. Without passThroughOptions
+    // commander prints its own help here and never calls the action.
+    expect((await capture(["test", "foo.test.ts", "--help"])).args).toEqual([
+      "foo.test.ts",
+      "--help",
+    ]);
+  });
+});
+
+describe("forwarding a tool's outcome", () => {
+  test("runForward resolves the child's exit code", async () => {
+    expect(await runForward([process.execPath, "-e", "process.exit(3)"])).toBe(3);
+    expect(await runForward([process.execPath, "-e", "process.exit(0)"])).toBe(0);
+  });
+
+  test("execAndExit stops at the first failure and exits with its code", async () => {
+    // Run in a child because execAndExit ends the process it runs in. The second
+    // command writes a marker; if sequencing regresses to run-everything, the
+    // marker appears and this fails.
+    const child = Bun.spawn(
+      [
+        process.execPath,
+        "-e",
+        'import { execAndExit } from "./scripts/tasks/lib/exec";' +
+          `await execAndExit([["${process.execPath}", "-e", "process.exit(3)"],` +
+          ` ["${process.execPath}", "-e", "console.log('SECOND')"]]);`,
+      ],
+      { cwd: repoRoot, stdout: "pipe", stderr: "pipe" },
+    );
+
+    const [code, stdout] = await Promise.all([child.exited, new Response(child.stdout).text()]);
+
+    expect(code).toBe(3);
+    expect(stdout).not.toContain("SECOND");
+  });
+});
+
+describe("the bootstrap guard", () => {
+  /**
+   * Runs the real `scripts/bootstrap.sh` against stub tools on a scrubbed PATH.
+   *
+   * The guard's whole purpose is a checkout where the toolchain is absent, which
+   * is unreproducible in this repo — so the tools are stubs and PATH is emptied
+   * of everything else. Sourced exactly as a forwarder sources it, `|| exit 1`
+   * included, since that is what disables errexit inside the file.
+   */
+  async function runGuard(stubs: Record<string, string>): Promise<{ code: number; out: string }> {
+    const dir = await mkdtemp(join(tmpdir(), "wrk-guard-"));
+    const bin = join(dir, "bin");
+    await mkdir(join(dir, "repo", "scripts"), { recursive: true });
+    await mkdir(bin, { recursive: true });
+    await copyFile(
+      join(repoRoot, "scripts", "bootstrap.sh"),
+      join(dir, "repo/scripts/bootstrap.sh"),
+    );
+
+    for (const [name, body] of Object.entries(stubs)) {
+      await writeFile(join(bin, name), `#!/usr/bin/env bash\n${body}\n`);
+      await chmod(join(bin, name), 0o755);
+    }
+
+    const child = Bun.spawn(
+      [
+        "bash",
+        "-c",
+        // `command -v bun` afterwards proves the PATH repair reached the caller,
+        // which is what the forwarder's own `exec bun` depends on.
+        'source repo/scripts/bootstrap.sh || exit 1; echo "GUARD_OK"; command -v bun >/dev/null && echo "BUN_ON_PATH"',
+      ],
+      {
+        cwd: dir,
+        env: { PATH: `${bin}:/usr/bin:/bin`, HOME: dir },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+
+    const [code, stdout, stderr] = await Promise.all([
+      child.exited,
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+    ]);
+
+    return { code, out: stdout + stderr };
+  }
+
+  test("a cold checkout is installed, and the repaired PATH reaches the caller", async () => {
+    const result = await runGuard({
+      // `bun` exists only inside the directory mise reports, so it is reachable
+      // afterwards only if the guard actually prepended that directory to PATH.
+      mise: 'if [[ $1 == "bin-paths" ]]; then echo "$HOME/toolbin"; else mkdir -p "$HOME/toolbin"; printf "#!/usr/bin/env bash\\nmkdir -p node_modules\\n" > "$HOME/toolbin/bun"; chmod +x "$HOME/toolbin/bun"; fi',
+    });
+
+    expect(result.out).toContain("GUARD_OK");
+    expect(result.out).toContain("BUN_ON_PATH");
+    expect(result.code).toBe(0);
+  });
+
+  test("a missing mise fails loudly instead of dying later on an import", async () => {
+    const result = await runGuard({});
+
+    expect(result.code).toBe(1);
+    expect(result.out).toContain("mise is not installed");
+    expect(result.out).not.toContain("GUARD_OK");
+  });
+
+  test("a failed install stops the task rather than reporting success", async () => {
+    // The errexit trap the header warns about: sourced under `||`, a bare failing
+    // command would be ignored. This fails unless the `|| return 1` is present.
+    const result = await runGuard({ mise: "exit 1" });
+
+    expect(result.code).toBe(1);
+    expect(result.out).not.toContain("GUARD_OK");
   });
 });
 
@@ -126,8 +240,13 @@ describe(".mise/tasks forwarders", () => {
 
   test("there is a forwarder for every task the CLI defines", async () => {
     const names = (await forwarders()).map((path) => basename(path)).sort();
+    // Compared against the real tree rather than a literal, so this holds in both
+    // directions as tasks come and go. Building the program spawns nothing.
+    const defined = buildProgram()
+      .commands.map((command) => command.name())
+      .sort();
 
-    expect(names).toEqual(["format", "lint", "setup", "test", "typecheck"]);
+    expect(names).toEqual(defined);
   });
 
   test("every forwarder sources the bootstrap guard before exec'ing the CLI", async () => {
