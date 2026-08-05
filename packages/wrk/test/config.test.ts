@@ -31,6 +31,8 @@ async function withTemp(body: (dir: string) => Promise<void>): Promise<void> {
   try {
     await body(dir);
   } finally {
+    // Uncaught deliberately: the directory is this case's own `mkdtemp`, so nothing else
+    // can be racing the call and hitting the Bun `EFAULT` that `cache.ts` documents.
     await rm(dir, { recursive: true, force: true });
   }
 }

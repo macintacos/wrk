@@ -286,7 +286,10 @@ export async function writeCache(key: CacheKey, value: string): Promise<void> {
     await writeFile(staging, value, "utf8");
     await rename(staging, path);
   } catch (error) {
-    await rm(staging, { force: true });
+    // Swallowed so a failed cleanup cannot replace the write error the caller needs — the
+    // same hazard the `finally` in `cached` documents, which also carries why `force: true`
+    // is not enough on its own.
+    await rm(staging, { force: true }).catch(() => undefined);
     throw error;
   }
 }
@@ -389,9 +392,13 @@ export async function cached(
 
     return value;
   } finally {
-    // Swallowed for the reason `touch`'s failures are, and one more: a throw from a
+    // Swallowed for the reason `touch`'s failures are, and two more. A throw from a
     // `finally` replaces whatever the block was returning, so a cleanup that failed would
-    // discard a refresh that had already succeeded and reached disk.
+    // discard a refresh that had already succeeded and reached disk. And `force: true` does
+    // not make this infallible on Bun: concurrent `rm` of one directory rejects `EFAULT`
+    // there — measured at 917 of 8000 calls, against 0 of 8000 on Node — which an abandoned
+    // lock produces by design, since every caller in that burst releases it on the way out.
+    // https://github.com/oven-sh/bun/issues/36984
     if (claimed !== null) {
       await rm(lock, { recursive: true, force: true }).catch(() => undefined);
     }

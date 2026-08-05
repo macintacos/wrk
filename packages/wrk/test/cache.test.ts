@@ -56,6 +56,8 @@ async function withRoot(body: (root: string) => Promise<void>): Promise<void> {
   try {
     await body(root);
   } finally {
+    // Uncaught deliberately: the root is this case's own `mkdtemp`, so nothing else can be
+    // racing the call and hitting the Bun `EFAULT` that `cached`'s lock release documents.
     await rm(root, { recursive: true, force: true });
   }
 }
