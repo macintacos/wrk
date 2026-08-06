@@ -67,13 +67,14 @@ The envelope **never omits a key**. A value the run did not reach is `null`, not
 key, so `.reason` can be read unconditionally rather than guarded. Keys come out in the
 order the result type declares them, so two runs of the same command diff cleanly.
 
-Three exit rules, and the first is the one to know:
+Four exit rules, and the first is the one to know:
 
 | Outcome                                   | Exit        | Shape                                      |
 | ----------------------------------------- | ----------- | ------------------------------------------ |
 | A verdict — **including one saying stop** | `0`         | The envelope, on stdout.                   |
 | A refusal                                 | `1`         | One `wrk: …` line on stderr. Nothing else. |
 | A command `wrk` ran failed                | the child's | Its argv, status and stderr, on stderr.    |
+| A picker the user dismissed               | `130`       | Nothing on stdout, and no `wrk: …` line.   |
 
 A well-formed "blocked" answer is a **successful run**: callers branch on the payload's
 verdict field, never on the exit status. An exit status that is not `0` means `wrk` has no
@@ -87,6 +88,54 @@ the whole contract rests on: a run that fails writes **nothing** to stdout and e
 nonzero. Callers pipe through `jq -er`, which exits `0` on empty input, so a run that
 failed while still exiting `0` would be read as a success carrying no path, and one that
 printed a partial answer before failing would be read as a success outright.
+
+### The cd protocol
+
+A picker cannot move the shell that launched it: `cd` changes a process's own working
+directory, and `wrk` is a child. So the pickers take the route `fzf` took before them —
+**`--print-path` writes the chosen path to stdout, alone, and a four-line shell function
+does the `cd`**. The interface itself renders to stderr, so `wrk wt --print-path` is still
+a usable picker with its stdout redirected, and the picker is testable without a shell at
+all.
+
+Cancelling is neither an answer nor a failure, so it gets neither shape: a dismissed
+picker leaves stdout **empty**, adds no `wrk: …` line to stderr — the interface has
+already torn its own render down — and exits `130`. That is `128 + SIGINT`, the shell's
+own convention for "the user aborted" and what `fzf` exits with on `ESC`, so a keybinding
+already written against `fzf` tells a dismissal from a broken `wrk` without being
+re-taught. The three statuses a caller must separate are therefore `0` with a path, `130`
+with nothing, and anything else with a `wrk: …` line on stderr.
+
+The shell function is the whole of the caller's side. In fish:
+
+```fish
+function wt --description "Pick a worktree and cd into it"
+    set -l target (wrk wt --print-path $argv)
+    or return $status
+    cd -- $target
+end
+```
+
+In bash or zsh:
+
+```bash
+wt() {
+  local target
+  target=$(wrk wt --print-path "$@") || return $?
+  cd -- "$target"
+}
+```
+
+Both forward the status rather than swallowing it, which is what makes a cancelled pick
+distinguishable at the call site — fish propagates a command substitution's status through
+`set`, so `or return $status` really does carry `130` out. A guard on emptiness
+(`test -n "$target"`) would also avoid the bad `cd`, but it reports every outcome as the
+same nonzero and throws that distinction away.
+
+`wrk wt` and `wrk pr` themselves arrive in
+[EXC-1016](https://linear.app/macintacos/issue/EXC-1016) and
+[EXC-1018](https://linear.app/macintacos/issue/EXC-1018); the shim above and the
+keybindings that call it live in the dotfiles repo rather than here.
 
 ## Agent commands
 

@@ -36,8 +36,9 @@
  * successful run. A **refusal** ({@link Refusal}) exits `1` with a prefixed one-line
  * message and no stack trace. A failed subprocess ({@link CommandFailed}) exits with
  * **that command's own status**, so `git`'s 128 reaches the caller as 128. A
- * **cancellation** ({@link Cancelled}) exits `130` and writes nothing at all, which is what
- * lets a shell function tell a picker the user dismissed from a `wrk` that broke.
+ * **cancellation** ({@link Cancelled}) exits `130` and writes nothing of its own — no path
+ * on stdout, and no message on stderr, a user who just pressed escape needing neither —
+ * which is what lets a shell function tell a dismissed picker from a `wrk` that broke.
  * {@link reportFailure} is where those rules live, and anything it does not recognise is
  * rethrown rather than mapped: an unexpected error is a bug in `wrk`, and its stack is the
  * only useful thing about it.
