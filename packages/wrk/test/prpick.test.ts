@@ -43,11 +43,11 @@ import {
   cleanupFixtures,
   driveCli,
   fixtureGit,
-  ghlessWith,
   makeContainer,
   makeUnconverted,
   quit,
   runCli,
+  shedGh,
   status,
   tempDir,
 } from "./fixtures/repo";
@@ -207,8 +207,14 @@ function fakeGh(checkoutExit = 0): { bin: string; log: string } {
     "",
   ].join("\n");
 
-  return { bin: ghlessWith(script), log };
+  const bin = shedGh();
+  writeFileSync(join(bin, "gh"), script, { mode: 0o755 });
+
+  return { bin, log };
 }
+
+/** Whether the confirmation's prompt has been drawn — what the first Enter is waited on. */
+const drawnPrompt = (capture: string): boolean => capture.includes(PRUNE_PROMPT);
 
 /** Every argv the fake `gh` was called with, cwd first. Absent log means it was never run. */
 function ghCalls(log: string): string[] {
@@ -253,13 +259,11 @@ function drivePr(
   args: string[],
   drive: (session: PtySession) => Promise<void>,
 ): ReturnType<typeof driveCli> {
-  return driveCli(
-    fixture.checkout,
-    ["pr", ...args],
-    drive,
-    childEnv(fixture.cacheHome, fixture.bin),
-    ROWS,
-  );
+  return driveCli(fixture.checkout, ["pr", ...args], drive, {
+    cacheHome: fixture.cacheHome,
+    path: fixture.bin,
+    rows: ROWS,
+  });
 }
 
 /** `runCli`, with the same fixture-private cache, config and `PATH` the driven cases use. */
@@ -453,7 +457,7 @@ describe("wrk pr — a worktree record whose directory is gone", () => {
 
     const { capture, stdout } = await drivePr(fixture, ["--print-path"], async (session) => {
       await session.waitFor("#9");
-      await typeUntil(session, KEY.enter, (text) => text.includes(PRUNE_PROMPT));
+      await typeUntil(session, KEY.enter, drawnPrompt, "asked about pruning");
       confirm = frameLines(session.capture());
       await quit(session, KEY.escape);
     });
@@ -471,7 +475,7 @@ describe("wrk pr — a worktree record whose directory is gone", () => {
 
     await drivePr(fixture, ["--print-path"], async (session) => {
       await session.waitFor("#9");
-      await typeUntil(session, KEY.enter, (text) => text.includes(PRUNE_PROMPT));
+      await typeUntil(session, KEY.enter, drawnPrompt, "asked about pruning");
       await quit(session, KEY.escape);
     });
 
@@ -504,8 +508,7 @@ describe("wrk pr — a worktree record whose directory is gone", () => {
         await session.waitFor("#9");
         await quit(session, KEY.enter);
       },
-      childEnv(cacheHome, bin),
-      ROWS,
+      { cacheHome, path: bin, rows: ROWS },
     );
 
     expect(status(capture)).toBe(1);
@@ -520,11 +523,18 @@ describe("wrk pr — a worktree record whose directory is gone", () => {
 
     const { capture, stdout } = await drivePr(fixture, ["--print-path"], async (session) => {
       await session.waitFor("#9");
-      await typeUntil(session, KEY.enter, (text) => text.includes(PRUNE_PROMPT));
+      await typeUntil(session, KEY.enter, drawnPrompt, "asked about pruning");
       // The gutter is the only cue that the cursor moved, and it survives `frameLines`'
       // escape-stripping because it is a character rather than a code.
-      await typeUntil(session, KEY.down, (text) =>
-        frameLines(text).some((line) => line.includes("▌ prune")),
+      // `prune` is the **last** row, which is what makes a re-typed arrow safe: the reducer
+      // clamps a repeat into a no-op there, where aiming at a row with another below it would
+      // let a duplicate carry the cursor past the target and never come back. That precondition
+      // is `typeUntil`'s, and it is the reason `cancel` is first rather than an accident.
+      await typeUntil(
+        session,
+        KEY.down,
+        (text) => frameLines(text).some((line) => line.startsWith("▌ prune")),
+        "moved to prune",
       );
       await quit(session, KEY.enter);
     });

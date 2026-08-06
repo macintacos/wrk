@@ -25,7 +25,7 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import {
@@ -34,7 +34,6 @@ import {
   KEY,
   maxCursorRise,
   type PtySession,
-  runInPty,
   SHOW_CURSOR,
   typeUntil,
 } from "../../picker/test/fixtures/pty";
@@ -48,9 +47,9 @@ import {
   childEnv,
   cleanupFixtures,
   driveCli,
+  ENDED,
   fixtureGit,
   makeContainer,
-  ENDED,
   quit,
   runCli,
   shedGh,
