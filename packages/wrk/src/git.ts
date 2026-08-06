@@ -22,7 +22,9 @@
  * rather than return an empty result a caller would read as real — the status being what
  * lets `wrk` exit with the code of the command that failed underneath it.
  * {@link listWorktrees} has one further failure of its own: a record it cannot read, which
- * is a plain `Error` carrying the record rather than any stderr.
+ * is a plain `Error` carrying the record rather than any stderr. {@link gitOk} is that half's
+ * escape hatch — {@link git}'s throwing twin, for the one-off command that has not earned a
+ * wrapper of its own.
  *
  * **Output is fully buffered**, since {@link run} has no `maxBuffer` equivalent. That is a
  * deliberate call rather than an oversight: no wrapper here runs `git log` or `git diff`, so
@@ -100,8 +102,12 @@ export function git(args: string[], cwd?: string): Promise<RunResult> {
  * The failure is a {@link CommandFailed} rather than a plain `Error`, which is what lets
  * `wrk` exit with git's own status: this is the one place every throwing wrapper in the
  * module routes through, so the code survives as a value here or it survives nowhere.
+ *
+ * Exported as {@link git}'s throwing twin, for a mutation whose single caller does not earn a
+ * wrapper of its own — a `fetch`, a `switch`, a `pull`. A command that gains a second caller
+ * earns its wrapper then, and moves in here.
  */
-async function gitOk(args: string[], cwd?: string): Promise<string> {
+export async function gitOk(args: string[], cwd?: string): Promise<string> {
   const { stdout, stderr, code } = await git(args, cwd);
   if (code !== 0) {
     throw new CommandFailed(["git", ...args], code, stderr);
@@ -202,6 +208,18 @@ export async function forEachRef(
   return lines(await gitOk(["for-each-ref", `--format=${format}`, ...patterns], cwd));
 }
 
+/** Options for {@link statusPorcelain}. */
+export interface StatusOptions {
+  /**
+   * Whether untracked files count as changes. Defaults to `true`, git's own default.
+   *
+   * `false` passes `--untracked-files=no`, which is the question "would a `switch` or a
+   * fast-forward `pull` be blocked?" — scratch files and build output are normal in a working
+   * checkout and block neither.
+   */
+  untracked?: boolean;
+}
+
 /**
  * Porcelain status entries, one per line — empty exactly when the work tree is clean.
  *
@@ -214,12 +232,18 @@ export async function forEachRef(
  * plain `git status` rewrites the refreshed index, so surveying several worktrees — or
  * running while an editor does its own background `status` — turns into an intermittent
  * "Unable to create index.lock" failure. The reported entries are unchanged; only the
- * cache write is skipped.
+ * cache write is skipped. It is also what lets a caller that must not touch the repository at
+ * all — one deciding whether it is allowed to — ask this question safely.
  *
  * @throws If git failed.
  */
-export async function statusPorcelain(cwd?: string): Promise<string[]> {
-  return lines(await gitOk(["--no-optional-locks", "status", "--porcelain"], cwd));
+export async function statusPorcelain(
+  cwd?: string,
+  options: StatusOptions = {},
+): Promise<string[]> {
+  const args = ["--no-optional-locks", "status", "--porcelain"];
+  if (options.untracked === false) args.push("--untracked-files=no");
+  return lines(await gitOk(args, cwd));
 }
 
 /**

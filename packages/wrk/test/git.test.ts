@@ -22,6 +22,7 @@ import {
   forEachRef,
   git,
   gitCommonDir,
+  gitOk,
   isInsideWorkTree,
   listWorktrees,
   parseWorktree,
@@ -79,12 +80,14 @@ function tempDir(): string {
   return dir;
 }
 
+/** Identity for fixture commits, so the suite does not depend on the machine's git config. */
+const IDENTITY = ["-c", "user.email=t@example.com", "-c", "user.name=T"];
+
 /** A repository on branch `main` with exactly one commit. */
 function makeRepo(): string {
   const dir = tempDir();
   fixtureGit(["init", "-q", "-b", "main", dir]);
-  const identity = ["-c", "user.email=t@example.com", "-c", "user.name=T"];
-  fixtureGit([...identity, "commit", "-q", "--allow-empty", "-m", "init"], dir);
+  fixtureGit([...IDENTITY, "commit", "-q", "--allow-empty", "-m", "init"], dir);
   return dir;
 }
 
@@ -267,6 +270,23 @@ describe("statusPorcelain", () => {
 
     expect(await statusPorcelain(dirty)).toEqual(["?? untracked.txt"]);
   });
+
+  test("omits untracked files under { untracked: false } while still reporting tracked ones", async () => {
+    // The distinction `preflight`'s dirty check is built on: scratch files and build output
+    // block neither a `switch` nor a fast-forward `pull`, so they are not "dirty". Filtering
+    // `??` at a call site would pass this too — passing the flag is what keeps porcelain-format
+    // knowledge inside this module.
+    const dirty = makeRepo();
+    writeFileSync(join(dirty, "tracked.txt"), "before");
+    fixtureGit(["add", "tracked.txt"], dirty);
+    fixtureGit([...IDENTITY, "commit", "-q", "-m", "add"], dirty);
+
+    writeFileSync(join(dirty, "untracked.txt"), "x");
+    expect(await statusPorcelain(dirty, { untracked: false })).toEqual([]);
+
+    writeFileSync(join(dirty, "tracked.txt"), "after");
+    expect(await statusPorcelain(dirty, { untracked: false })).toEqual([" M tracked.txt"]);
+  });
 });
 
 describe("symbolicRef", () => {
@@ -293,6 +313,20 @@ describe("the throwing half of the contract", () => {
     await expect(listWorktrees(notARepo)).rejects.toThrow(/worktree list/);
     await expect(statusPorcelain(notARepo)).rejects.toThrow(/status/);
     await expect(forEachRef(["refs/heads"], notARepo)).rejects.toThrow(/for-each-ref/);
+  });
+
+  test("gitOk is exported for a one-off command, and throws the same way", async () => {
+    // The escape hatch's throwing twin. `preflight` needs `fetch`, `switch` and `pull` to
+    // fail loudly, and this module's own rule is that one caller does not earn a wrapper —
+    // so the helper every throwing wrapper here already routes through is the one it uses.
+    expect((await gitOk(["rev-parse", "--abbrev-ref", "HEAD"], repo)).trim()).toBe("main");
+
+    const failure: unknown = await gitOk(["rev-parse", "--git-dir"], notARepo).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(CommandFailed);
+    expect((failure as CommandFailed).code).toBe(128);
   });
 
   test("what it throws carries git's own exit status", async () => {
