@@ -11,22 +11,41 @@
  * but that value is `stdin.isTTY`, which Node leaves **`undefined`** on a pipe rather than
  * `false`, while Ink's own opt-out is the strict `options.isActive === false`. So
  * `useInput(fn, { isActive: isRawModeSupported })` type-checks (the field is declared
- * `boolean`), reads as a guard, and crashes exactly where it was written to protect.
- * `Boolean(isRawModeSupported)` is the whole fix, and the two cases are asserted
- * separately below so the distinction cannot be lost.
+ * `boolean`), reads as a guard, and crashes in the place it was written to protect.
+ * `Boolean(isRawModeSupported)` is what makes it hold, and the two are asserted separately
+ * below so the distinction cannot be lost.
+ *
+ * **The coercion is necessary but not sufficient, and EXC-1011 must not stop there.** It
+ * turns the crash into an `isActive: false` — a picker that renders, accepts no key, and
+ * waits forever. Silence is not better than a crash. Whatever the picker does about piped
+ * stdin, it has to be a *decision*: refuse with a clear message, fall back to a
+ * non-interactive path, or open `/dev/tty` for input while stdin carries data. This file
+ * settles that the guard is needed and how to write one that works; it does not settle
+ * which of those three the picker should choose.
  *
  * **2. `NO_COLOR` does nothing; `FORCE_COLOR=0` works.** Ink colours through chalk, and
  * under Bun a run with `NO_COLOR=1` in a terminal still emits SGR sequences. A picker that
  * means to honour [no-color.org](https://no-color.org) has to read the variable itself and
- * turn its own styling off — inheriting the convention from the library is not an option
- * on this runtime.
+ * turn its own styling off — inheriting the convention from the library is not an option on
+ * this runtime.
  *
- * **3. A fixed-width child wraps rather than clips.** Give a `<Box width={n}>` a longer
- * label and the frame silently gains rows. That is a height-budget bug, not a cosmetic
- * one: the picker's whole safety margin is staying strictly under the viewport (see
- * `inline-rendering.test.ts`), and a row that grows under some input is how a frame crosses
- * that line on someone else's terminal and in nobody's tests. `flexShrink={0}` on the box
- * plus `wrap="truncate"` on the text is what makes the height a constant.
+ * **3. A fixed-width child wraps rather than clips, and `wrap="truncate"` is the setting
+ * that stops it.** Measured at width 20 with a 57-character label, in a pty:
+ *
+ * | `flexShrink={0}` | `wrap="truncate"` | Rows |
+ * | --- | --- | --- |
+ * | no | no | 3 |
+ * | yes | no | 3 |
+ * | no | yes | 1 |
+ * | yes | yes | 1 |
+ *
+ * So the pair is not a pair: `wrap="truncate"` does the clipping and `flexShrink={0}` alone
+ * changes nothing at this shape. (It still earns its place on a real picker row, where the
+ * column competes with siblings for width — but it is not what keeps the row one row tall,
+ * and a row that relies on it for that will wrap.) This is a height-budget bug, not a
+ * cosmetic one: the picker's whole safety margin is staying strictly under the viewport
+ * (see `inline-rendering.test.ts`), and a row that grows under some input is how a frame
+ * crosses that line on someone else's terminal and in nobody's tests.
  *
  * **4. Bundling Ink fails on a dependency the runtime never loads.** `reconciler.js`
  * reaches its devtools through `await import('./devtools.js')` behind an
@@ -34,7 +53,8 @@
  * A bundler follows the dynamic import statically anyway and dies on `devtools.js`'s
  * `react-devtools-core` import. `--external react-devtools-core` clears it without adding a
  * React devtools package to a CLI's dependency tree — for EXC-986 and EXC-1014, which are
- * the issues that will actually ship a bundle.
+ * the issues that will actually ship a bundle. Only that one module needs excluding: `ws`,
+ * the other import in `devtools.js`, is a real dependency of Ink and resolves.
  *
  * @packageDocumentation
  */
@@ -45,7 +65,7 @@ import { frameHeight, hasColour, runInPty } from "./fixtures/pty";
 
 /** A probe invocation, with the given environment prefixed and the given shell suffix. */
 function probe(env: string, suffix = ""): string {
-  return `${env} ${process.execPath} ${import.meta.dir}/fixtures/inline-probe.tsx ${suffix}`;
+  return `${env} "${process.execPath}" "${import.meta.dir}/fixtures/inline-probe.tsx" ${suffix}`;
 }
 
 describe("useInput throws when stdin is not a TTY", () => {
@@ -74,11 +94,14 @@ describe("useInput throws when stdin is not a TTY", () => {
   });
 
   test("coercing it to a real boolean is what makes the guard hold", async () => {
-    const { exitCode } = await runInPty(probe("PROBE_MODE=input-guarded", "< /dev/null"), {
+    const { capture, exitCode } = await runInPty(probe("PROBE_MODE=input-guarded", "< /dev/null"), {
       rows: 24,
     });
 
     expect(exitCode).toBe(0);
+    // Surviving is not the claim — rendering is. Without this the test would pass on a
+    // picker that guarded itself by never drawing anything.
+    expect(capture).toContain("item 0");
   });
 });
 
@@ -102,22 +125,42 @@ describe("colour is switched off by FORCE_COLOR, not by NO_COLOR", () => {
   });
 });
 
-describe("a fixed-width child wraps unless told to clip", () => {
-  test("by default the overflowing label costs extra rows", async () => {
-    const { capture } = await runInPty(probe("PROBE_MODE=fixed-width"), { rows: 24 });
+describe("a fixed-width child wraps unless the text is told to truncate", () => {
+  /** Rows the fixed-width scenario occupies under the given settings. */
+  async function rows(settings: string): Promise<number> {
+    const { capture } = await runInPty(probe(`PROBE_MODE=fixed-width ${settings}`), { rows: 24 });
 
-    expect(frameHeight(capture)).toBeGreaterThan(1);
+    return frameHeight(capture);
+  }
+
+  test("by default the overflowing label costs extra rows", async () => {
+    expect(await rows("")).toBe(3);
   });
 
-  test("with no-shrink and truncate it stays one row", async () => {
-    const { capture } = await runInPty(probe("PROBE_MODE=fixed-width PROBE_CLIP=1"), { rows: 24 });
+  test("no-shrink alone changes nothing", async () => {
+    // The half of the remedy that does not do the work. Asserted so nobody reaches for it
+    // on its own and concludes the row is now a fixed height.
+    expect(await rows("PROBE_SHRINK=1")).toBe(3);
+  });
 
-    expect(frameHeight(capture)).toBe(1);
+  test("truncate alone is what clips", async () => {
+    expect(await rows("PROBE_TRUNCATE=1")).toBe(1);
+  });
+
+  test("and the two together behave as truncate alone", async () => {
+    expect(await rows("PROBE_SHRINK=1 PROBE_TRUNCATE=1")).toBe(1);
   });
 });
 
 describe("bundling Ink pulls in a devtools dependency nobody installed", () => {
-  /** Bundles the probe, optionally excluding modules, and answers what the build did. */
+  /**
+   * Bundles the probe, optionally excluding modules, and answers what the build did.
+   *
+   * `--target=node` because that is what the published artifact is — `packages/wrk`'s
+   * output module says so, and Bun's default target is `browser`, which fails over
+   * unrelated built-ins and would make this finding unreadable. `--outfile=/dev/null`
+   * because only the exit status is being measured; nothing here wants the bundle.
+   */
   async function build(...external: string[]): Promise<{ exitCode: number; stderr: string }> {
     const proc = Bun.spawn(
       [
@@ -147,9 +190,9 @@ describe("bundling Ink pulls in a devtools dependency nobody installed", () => {
   });
 
   test("marking it external is enough — the dependency need not be installed", async () => {
-    // The remedy for EXC-986 and EXC-1014, and the cheaper of the two: the alternative is
-    // adding a React devtools package to a CLI's dependency tree to satisfy a code path it
-    // will never run.
+    // The remedy for EXC-986 and EXC-1014, and the cheaper of the two the issue named: the
+    // alternative is adding a React devtools package to a CLI's dependency tree to satisfy
+    // a code path it will never run.
     const { exitCode } = await build("react-devtools-core");
 
     expect(exitCode).toBe(0);

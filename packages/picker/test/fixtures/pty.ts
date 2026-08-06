@@ -14,6 +14,13 @@
  * rather than a transcript someone eyeballed once. The size is set by the caller, because
  * the whole question is how a frame behaves relative to the viewport it sits in.
  *
+ * **A capture is a log of bytes, not a screen.** Nothing here emulates a terminal, so no
+ * measurement below can say what a viewer would see — only what was written. That is
+ * enough for every claim these tests make, because each one is a statement about the
+ * sequences Ink emits, but it is the reason there is no "the prompt is still visible"
+ * helper: erasing the screen does not un-write the bytes that put the prompt there, so
+ * such a helper could only ever return true.
+ *
  * The capture is returned with its escape sequences **intact**. They are the evidence, not
  * noise to be stripped.
  *
@@ -30,8 +37,14 @@
  */
 const ESC = "\u001B";
 
-/** What `ansi-escapes` writes to wipe the screen and scrollback — Ink's fullscreen path. */
-export const CLEAR_TERMINAL = `${ESC}[2J`;
+/**
+ * Erase-screen — the recognisable head of Ink's fullscreen path.
+ *
+ * `ansi-escapes` spells `clearTerminal` as erase-screen, erase-scrollback and cursor-home
+ * together; this is the first of the three, and matching it alone is what keeps the
+ * assertions independent of the other two ever changing.
+ */
+export const ERASE_SCREEN = `${ESC}[2J`;
 
 /** Cursor hide, written once when a frame first renders. */
 export const HIDE_CURSOR = `${ESC}[?25l`;
@@ -39,8 +52,17 @@ export const HIDE_CURSOR = `${ESC}[?25l`;
 /** Cursor show, written when Ink unmounts. */
 export const SHOW_CURSOR = `${ESC}[?25h`;
 
-/** Erase-line and column-move escapes, which sit between the cursor-up steps of an erase. */
-const ERASE_NOISE = new RegExp(`${ESC}\\[(?:2K|K|G)`, "g");
+/**
+ * Erase-line and column-move escapes, which sit between the cursor-up steps of an erase.
+ *
+ * `\d*[KG]` rather than the three literals, so it covers `2K`, `K`, `G` **and** `1G` — the
+ * last being what Ink's incremental renderer writes, and the one that would otherwise
+ * split a single walk into two shorter ones and understate {@link maxCursorRise}.
+ */
+const ERASE_NOISE = new RegExp(`${ESC}\\[\\d*[KG]`, "g");
+
+/** The tail of an erase preamble, after which the frame's own text begins. */
+const ERASE_PREAMBLE_END = `${ESC}[G`;
 
 /** One cursor-up step: `ESC [ n A`, where an omitted `n` means one row. */
 const CURSOR_UP = new RegExp(`${ESC}\\[(\\d*)A`, "g");
@@ -51,8 +73,37 @@ const CURSOR_UP_RUN = new RegExp(`(?:${ESC}\\[\\d*A)+`, "g");
 /** `ESC [ row ; col H` — the cursor sent to a fixed cell rather than moved relatively. */
 const ABSOLUTE_ADDRESSING = new RegExp(`${ESC}\\[\\d*(?:;\\d*)?H`);
 
-/** Any SGR sequence — the colours and attributes a `NO_COLOR` run should not contain. */
+/** Any SGR sequence — the colours and attributes a `FORCE_COLOR=0` run should not contain. */
 const SGR = new RegExp(`${ESC}\\[\\d+(?:;\\d+)*m`);
+
+/** Every escape sequence, for the one measurement that wants the text rather than the codes. */
+const ANY_ESCAPE = new RegExp(`${ESC}\\[[\\d;?]*[a-zA-Z]`, "g");
+
+/**
+ * The environment a probe starts from: this process's, minus everything that would decide
+ * the answer before the probe runs.
+ *
+ * Shedding these is not tidiness, it is the difference between a suite that measures Ink
+ * and one that measures the shell it was launched from. `CI` is the sharp one: Ink's own
+ * `interactive` default is `!isInCi && Boolean(stdout.isTTY)`, so a single exported `CI`
+ * turns interactive rendering off entirely — and the control assertion in
+ * [`../inline-rendering.test.ts`](../inline-rendering.test.ts), the one the whole file's
+ * falsifiability rests on, silently stops detecting the failure it exists to detect.
+ * `TERM=dumb` and an inherited `NO_COLOR` / `FORCE_COLOR` each break the colour cases the
+ * same way. Agent shells and CI runners set all of these routinely.
+ *
+ * `TERM` is pinned rather than merely dropped, because Ink's colour support is derived from
+ * it and an unset `TERM` is as much a decision as a wrong one. The same shape, and the same
+ * reasoning, as `FIXTURE_ENV` in
+ * [`../../../wrk/test/fixtures/repo.ts`](../../../wrk/test/fixtures/repo.ts).
+ */
+const BASE_ENV: Record<string, string | undefined> = {
+  ...process.env,
+  CI: undefined,
+  NO_COLOR: undefined,
+  FORCE_COLOR: undefined,
+  TERM: "xterm-256color",
+};
 
 /** Options for {@link runInPty}. */
 export interface PtyOptions {
@@ -60,7 +111,7 @@ export interface PtyOptions {
   rows: number;
   /** Viewport width. Defaults to 80. */
   cols?: number;
-  /** Extra environment for the shell. */
+  /** Variables layered over {@link BASE_ENV}, which has already shed the ambient ones. */
   env?: Record<string, string>;
 }
 
@@ -87,7 +138,7 @@ export async function runInPty(script: string, options: PtyOptions): Promise<Pty
   const chunks: Uint8Array[] = [];
 
   const proc = Bun.spawn(["bash", "-c", script], {
-    env: { ...process.env, ...options.env },
+    env: { ...BASE_ENV, ...options.env },
     terminal: {
       rows: options.rows,
       cols: options.cols ?? 80,
@@ -117,7 +168,9 @@ export async function runInPty(script: string, options: PtyOptions): Promise<Pty
  * series of unrelated one-row moves.
  *
  * @param capture - A pty capture from {@link runInPty}.
- * @returns The largest total rise, in rows. `0` when the cursor never moved up.
+ * @returns The largest total rise, in rows. `0` when the cursor never moved up — which a
+ *   caller must not read as "stayed inline": a frame that clears the screen instead of
+ *   redrawing relatively also never moves up.
  */
 export function maxCursorRise(capture: string): number {
   let deepest = 0;
@@ -153,20 +206,31 @@ export function hasColour(capture: string): boolean {
 }
 
 /**
- * The frame's height, in rows, as the terminal would show it.
+ * The height, in rows, of the **last** frame the capture contains.
  *
- * Everything the shell wrote before the probe started is dropped by taking only what
- * follows the last cursor-hide, and the remaining escape sequences are removed so what is
- * left is the text of the final frame.
+ * Finding where the last frame starts is the whole of this function. The cursor is hidden
+ * exactly once, at first paint, so slicing from it keeps every frame ever drawn and counts
+ * their sum. Each redraw instead opens with an erase preamble that ends in the column-move
+ * `ESC [ G`, so the text after the *last* of those is the final frame and nothing before
+ * it — and on a single-frame run, where no redraw ever happened, the hide is the later of
+ * the two markers and wins.
+ *
+ * Blank rows are not counted: a frame is measured by its non-empty lines, so a component
+ * that deliberately renders a spacer row reads one short here. No probe scenario has one,
+ * and a caller that grows one should count differently rather than work around this.
  *
  * @param capture - A pty capture from {@link runInPty}.
  * @returns The number of non-empty lines in the last frame.
  */
 export function frameHeight(capture: string): number {
-  const lastFrame = capture.slice(capture.lastIndexOf(HIDE_CURSOR) + HIDE_CURSOR.length);
+  const start = Math.max(
+    capture.lastIndexOf(ERASE_PREAMBLE_END) + ERASE_PREAMBLE_END.length,
+    capture.lastIndexOf(HIDE_CURSOR) + HIDE_CURSOR.length,
+  );
 
-  return lastFrame
-    .replace(new RegExp(`${ESC}\\[[\\d;?]*[a-zA-Z]`, "g"), "")
+  return capture
+    .slice(start)
+    .replace(ANY_ESCAPE, "")
     .split(/\r?\n/)
     .filter((line) => line.trim() !== "").length;
 }

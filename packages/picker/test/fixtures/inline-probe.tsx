@@ -14,11 +14,12 @@
  *
  * | Variable | Default | What it does |
  * | --- | --- | --- |
- * | `PROBE_MODE` | `list` | `list`, `input-unguarded`, `input-guarded`, or `fixed-width`. |
+ * | `PROBE_MODE` | `list` | `list`, `input-unguarded`, `input-guard-uncoerced`, `input-guarded`, or `fixed-width`. |
  * | `PROBE_ROWS` | `19` | Rows the frame occupies — ~80% of a 24-row viewport. |
  * | `PROBE_ITEMS` | `200` | List length, deliberately far longer than the window. |
- * | `PROBE_FRAMES` | `4` | Redraws before unmounting, so relative addressing is used in anger. |
- * | `PROBE_CLIP` | unset | In `fixed-width` mode, apply the no-shrink and truncate settings. |
+ * | `PROBE_FRAMES` | `4` | Timer ticks before unmounting. The last one exits rather than advancing, and Ink's 30 fps throttle can coalesce adjacent advances into one write — so this is an upper bound on redraws, not a count of them. |
+ * | `PROBE_SHRINK` | unset | In `fixed-width` mode, set `flexShrink={0}` on the column. |
+ * | `PROBE_TRUNCATE` | unset | In `fixed-width` mode, set `wrap="truncate"` on the text. |
  *
  * **Rendering goes to stderr in every mode.** `packages/wrk/src/output.ts` promises stdout
  * is one JSON document per run, so an interactive component that takes Ink's default
@@ -30,44 +31,60 @@
  */
 
 import { Box, render, Text, useApp, useInput, useStdin } from "ink";
-import { useEffect, useState } from "react";
+import type { ReactElement } from "react";
+import { useCallback, useEffect, useState } from "react";
 
 const MODE = process.env.PROBE_MODE ?? "list";
 const ROWS = Number(process.env.PROBE_ROWS ?? 19);
 const ITEMS = Number(process.env.PROBE_ITEMS ?? 200);
 const FRAMES = Number(process.env.PROBE_FRAMES ?? 4);
-const CLIP = process.env.PROBE_CLIP !== undefined;
+const SHRINK = process.env.PROBE_SHRINK !== undefined;
+const TRUNCATE = process.env.PROBE_TRUNCATE !== undefined;
 
 /** Every item the list could show, of which only {@link ROWS} ever fit. */
 const items = Array.from({ length: ITEMS }, (_index, i) => `item ${i}`);
 
 /**
- * Advances a cursor over the list a fixed number of times, then unmounts.
+ * Ticks {@link FRAMES} times, calling `onTick` for all but the last, then unmounts.
  *
- * The redraws are the point. A first paint proves nothing about relative addressing —
- * it is the second and every later frame, each erasing the last one by walking the cursor
+ * Split from {@link useScroll} so the scenario that wants only the unmount — `fixed-width`,
+ * which has nothing to scroll — can say so, instead of calling a hook named for scrolling
+ * and discarding what it returns.
+ *
+ * @param onTick - Run on every tick but the final one, which exits instead.
+ */
+function useAutoExit(onTick: () => void): void {
+  const { exit } = useApp();
+
+  useEffect(() => {
+    let tick = 0;
+    const timer = setInterval(() => {
+      tick += 1;
+      if (tick >= FRAMES) {
+        clearInterval(timer);
+        exit();
+        return;
+      }
+      onTick();
+    }, 30);
+
+    return () => clearInterval(timer);
+  }, [exit, onTick]);
+}
+
+/**
+ * Advances a cursor over the list until {@link useAutoExit} unmounts.
+ *
+ * The redraws are the point. A first paint proves nothing about relative addressing — it
+ * is the second and every later frame, each erasing the last one by walking the cursor
  * back up, that either stays inside the frame or eats the terminal above it.
  *
  * @returns The index of the highlighted row.
  */
 function useScroll(): number {
-  const { exit } = useApp();
   const [selected, setSelected] = useState(0);
 
-  useEffect(() => {
-    let frame = 0;
-    const timer = setInterval(() => {
-      frame += 1;
-      if (frame >= FRAMES) {
-        clearInterval(timer);
-        exit();
-        return;
-      }
-      setSelected((previous) => previous + 1);
-    }, 30);
-
-    return () => clearInterval(timer);
-  }, [exit]);
+  useAutoExit(useCallback(() => setSelected((previous) => previous + 1), []));
 
   return selected;
 }
@@ -75,7 +92,9 @@ function useScroll(): number {
 /** The window of the list that fits, drawn one row per line. */
 function List() {
   const selected = useScroll();
-  const start = Math.min(selected, items.length - ROWS);
+  // A window that would start past the end of the list is a mis-set knob, not a scenario:
+  // `slice` would answer a short frame and every height assertion would quietly measure it.
+  const start = Math.max(0, Math.min(selected, items.length - ROWS));
 
   return (
     <Box flexDirection="column">
@@ -127,26 +146,30 @@ function UncoercedGuardInput() {
 }
 
 /**
- * A fixed-width column beside an over-long label.
+ * A fixed-width column holding an over-long label.
  *
  * The height of the frame is the assertion: a label that wraps costs a row the height
  * budget did not allow for, and a picker whose rows silently grow is a picker that crosses
  * the fullscreen threshold on someone else's terminal.
+ *
+ * The two settings are separate knobs rather than one, because which of them does the work
+ * is exactly the question — see the third group of
+ * [`../ink-gotchas.test.ts`](../ink-gotchas.test.ts).
  */
 function FixedWidth() {
-  useScroll();
+  useAutoExit(useCallback(() => {}, []));
   const label = "a label far wider than the column it was given to live in";
 
   return (
     <Box flexDirection="column">
-      <Box width={20} flexShrink={CLIP ? 0 : undefined}>
-        <Text wrap={CLIP ? "truncate" : undefined}>{label}</Text>
+      <Box width={20} flexShrink={SHRINK ? 0 : undefined}>
+        <Text wrap={TRUNCATE ? "truncate" : undefined}>{label}</Text>
       </Box>
     </Box>
   );
 }
 
-const scenarios: Record<string, () => React.ReactElement> = {
+const scenarios: Record<string, () => ReactElement> = {
   list: List,
   "input-unguarded": UnguardedInput,
   "input-guard-uncoerced": UncoercedGuardInput,
