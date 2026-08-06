@@ -31,6 +31,7 @@ import {
   maxCursorRise,
   type PtySession,
   runInPty,
+  SHOW_CURSOR,
 } from "../../picker/test/fixtures/pty";
 import { cachePath } from "../src/cache";
 import { DEFAULTS } from "../src/config";
@@ -273,8 +274,56 @@ const GHLESS: string = (() => {
  * reason that has nothing to do with the code. `config.test.ts` shields the same variable for
  * the same reason.
  */
-function childEnv(cacheHome: string = tempDir()): Record<string, string> {
-  return { PATH: GHLESS, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: tempDir() };
+function childEnv(cacheHome: string = tempDir(), path: string = GHLESS): Record<string, string> {
+  return { PATH: path, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: tempDir() };
+}
+
+/**
+ * A `PATH` whose `gh` answers `rows` — but not until the returned `open` is called.
+ *
+ * The cases below are about *ordering*: a frame on screen while `gh` has not answered is the
+ * whole claim, and a `gh` that merely sleeps would make that claim a bet on how long the
+ * picker takes to draw. A gate makes it a fact — nothing is racing, so nothing is flaky, which
+ * is `fixtures/pty.ts`'s condition-over-interval rule applied to the child instead of the
+ * keyboard.
+ *
+ * The script is deliberately its own binary rather than a stub inside the CLI: the seam this
+ * issue moves is `gh` on the critical path, and a fixture that replaced the call rather than
+ * the process would not exercise it. No network is touched either way — the rows are handed
+ * over from disk, per the suite's standing rule that `gh` is never really run.
+ *
+ * `sleep` and `cat` are absolute paths because the child's own `PATH` is this directory, which
+ * holds `git` and `gh` and nothing else.
+ *
+ * @param rows - What the `--state open` query answers with. The merged query answers `[]`,
+ *   which is `gh` saying "none" rather than "could not answer" — the distinction `gh.ts`
+ *   documents, and the one that lets the entry be written at all.
+ * @returns The directory to run with as `PATH`, and the call that lets `gh` answer.
+ */
+function gatedGh(rows: readonly PullRequest[]): { path: string; open: () => void } {
+  const dir = tempDir();
+  const git = Bun.which("git");
+  if (git === null) throw new Error("git is not on PATH, so no fixture can shed gh from it");
+  symlinkSync(git, join(dir, "git"));
+
+  const gate = join(dir, "gate");
+  const answer = join(dir, "open.json");
+  writeFileSync(answer, JSON.stringify(rows));
+  writeFileSync(
+    join(dir, "gh"),
+    [
+      "#!/bin/sh",
+      `while [ ! -f "${gate}" ]; do /bin/sleep 0.02; done`,
+      'case "$*" in',
+      `  *"--state open"*) /bin/cat "${answer}" ;;`,
+      "  *) echo '[]' ;;",
+      "esac",
+      "",
+    ].join("\n"),
+    { mode: 0o755 },
+  );
+
+  return { path: dir, open: () => writeFileSync(gate, "") };
 }
 
 /** Height of the pty every driven case runs in, matching `picker.test.ts`'s. */
@@ -286,10 +335,10 @@ const CLI = join(import.meta.dir, "../src/cli.ts");
 /** What the driving script echoes once the CLI has exited, whatever its status. */
 const ENDED = "EXIT:";
 
-/** How long one {@link quit} attempt waits for the run to end before typing again. */
+/** How long one {@link typeUntil} attempt waits for the picker to react before typing again. */
 const REACT_MS = 200;
 
-/** How many times {@link quit} will re-type before calling the picker unresponsive. */
+/** How many times {@link typeUntil} will re-type before calling the picker unresponsive. */
 const ATTEMPTS = 12;
 
 /**
@@ -307,10 +356,11 @@ async function driveWt(
   args: string[],
   drive: (session: PtySession) => Promise<void>,
   cacheHome?: string,
+  path?: string,
 ): Promise<{ capture: string; exitCode: number; stdout: string }> {
   const out = join(tempDir(), "stdout");
   const argv = args.map((argument) => `"${argument}"`).join(" ");
-  const env = childEnv(cacheHome);
+  const env = childEnv(cacheHome, path);
   const exports = Object.entries(env)
     .map(([name, value]) => `${name}="${value}"`)
     .join(" ");
@@ -333,18 +383,28 @@ async function driveWt(
  *
  * Re-typing closes it, and does so on a *condition* rather than on the fixed settle the
  * sibling suite sleeps for — which is what `fixtures/pty.ts` warns a guessed interval costs on
- * a loaded machine. The condition is the run *ending*, which both keys this is used with cause
- * and which the driving script says out loud, so nothing here has to know whether the key
- * chose a row or dismissed the list. A key arriving after the run has already ended lands on
- * `bash`, which is running a `-c` script and never reads its stdin.
+ * a loaded machine. What the condition *is* belongs to the caller, because the two things a
+ * key here causes are observed in different places: the run ending is announced by the driving
+ * script, while the cursor moving is only visible in the frame.
  *
- * @throws If the run never ended, which is the genuine hang this is not allowed to hide.
+ * A key arriving after the condition already holds is harmless in both cases — an extra
+ * keystroke lands on `bash`, which is running a `-c` script and never reads its stdin, or on a
+ * picker that treats a second arrow as a second arrow at the end of the list.
+ *
+ * @param ready - What the capture looks like once the key has landed.
+ * @param what - How the failure reads: "the picker never `<what>` after N keystrokes".
+ * @throws If `ready` never held, which is the genuine hang this is not allowed to hide.
  */
-async function quit(session: PtySession, key: string): Promise<void> {
+async function typeUntil(
+  session: PtySession,
+  key: string,
+  ready: (capture: string) => boolean,
+  what: string,
+): Promise<void> {
   for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
     session.write(key);
     try {
-      await session.waitUntil((text) => text.includes(ENDED), REACT_MS);
+      await session.waitUntil(ready, REACT_MS);
 
       return;
     } catch {
@@ -352,7 +412,28 @@ async function quit(session: PtySession, key: string): Promise<void> {
     }
   }
 
-  throw new Error(`the picker never ended after ${ATTEMPTS} keystrokes`);
+  throw new Error(`the picker never ${what} after ${ATTEMPTS} keystrokes`);
+}
+
+/** {@link typeUntil} for a key that ends the run, which the driving script says out loud. */
+function quit(session: PtySession, key: string): Promise<void> {
+  return typeUntil(session, key, (text) => text.includes(ENDED), "ended");
+}
+
+/**
+ * Whether the gutter marks the row beginning with `label`.
+ *
+ * Over `frameLines` rather than the raw capture, because the gutter and the row it marks are
+ * separated by the escape sequences that colour them — the same reading `picker.test.ts` makes
+ * of the same glyph.
+ */
+function selects(label: string): (capture: string) => boolean {
+  return (capture) => frameLines(capture).some((line) => line.startsWith(`▌ ${label}`));
+}
+
+/** Whether the last frame carries `text`, which a cumulative capture cannot be asked. */
+function drawn(text: string): (capture: string) => boolean {
+  return (capture) => frameLines(capture).join("\n").includes(text);
 }
 
 /**
@@ -508,6 +589,111 @@ describe("wrk wt — the stack annotation, end to end", () => {
     const rendered = lines.join("\n");
     expect(rendered).toContain(`${DEFAULTS.glyphs.bottom} #11 1/2 the EXC-1/thing-1 change`);
     expect(rendered).toContain(`${DEFAULTS.glyphs.top} #12 2/2 the EXC-2/thing-2 change`);
+  });
+});
+
+describe("wrk wt — the annotation arrives behind the draw", () => {
+  /** A two-layer stack, one pull request per worktree, so both markers and both positions draw. */
+  const stacked = [
+    pull(11, "EXC-1/thing-1"),
+    pull(12, "EXC-2/thing-2", { baseRefName: "EXC-1/thing-1" }),
+  ];
+
+  test("the rows are on screen before gh answers, and take the annotation once it does", async () => {
+    // A cold cache and a `gh` that has not answered: a frame here is the claim in full, and the
+    // one this issue exists for. Before EXC-1017 the annotation was awaited in front of `pick`,
+    // so this wait timed out with nothing ever drawn.
+    const { checkout } = repoWith(2);
+    const gh = gatedGh(stacked);
+    let opening: string[] = [];
+    let annotated: string[] = [];
+
+    await driveWt(
+      checkout,
+      ["--print-path"],
+      async (session) => {
+        await session.waitFor("EXC-2/thing-2");
+        opening = frameLines(session.capture());
+
+        gh.open();
+        await session.waitUntil(drawn("#11"));
+        annotated = frameLines(session.capture());
+        await quit(session, KEY.escape);
+      },
+      undefined,
+      gh.path,
+    );
+
+    // Drawn from the worktrees alone: every branch, and not one pull-request column.
+    expect(opening.some((line) => line.includes("EXC-1/thing-1"))).toBe(true);
+    expect(opening.join("\n")).not.toContain("#");
+
+    // The same frame, replaced in place rather than a second picker appearing — which is what
+    // reading the *last* frame is worth, since the capture still holds the un-annotated one.
+    const rendered = annotated.join("\n");
+    expect(rendered).toContain(`${DEFAULTS.glyphs.bottom} #11 1/2 the EXC-1/thing-1 change`);
+    expect(rendered).toContain(`${DEFAULTS.glyphs.top} #12 2/2 the EXC-2/thing-2 change`);
+  });
+
+  test("the selection stays on the worktree it was on when the annotation lands", async () => {
+    // The criterion `PickerRow.payload` is a path for: the cursor is restored by matching the
+    // payload with `===`, so a row set rebuilt around the same worktrees keeps it, even though
+    // every row grew four columns underneath it.
+    const { checkout, worktrees } = repoWith(3);
+    const gh = gatedGh([...stacked, pull(13, "EXC-3/thing-3", { baseRefName: "EXC-2/thing-2" })]);
+    let beforeSwap: string[] = [];
+    let afterSwap: string[] = [];
+
+    const { capture, stdout } = await driveWt(
+      checkout,
+      ["--print-path"],
+      async (session) => {
+        await session.waitFor("EXC-3/thing-3");
+        await typeUntil(session, KEY.down, selects("EXC-2/thing-2"), "moved");
+        beforeSwap = frameLines(session.capture());
+
+        gh.open();
+        await session.waitUntil(drawn("#13"));
+        afterSwap = frameLines(session.capture());
+        await quit(session, KEY.enter);
+      },
+      undefined,
+      gh.path,
+    );
+
+    // The move really did happen while the rows were still bare, so the swap this asserts about
+    // is a swap rather than a redraw of something already annotated.
+    expect(beforeSwap.join("\n")).not.toContain("#");
+    expect(afterSwap.some((line) => line.startsWith("▌ EXC-2/thing-2 "))).toBe(true);
+    expect(status(capture)).toBe(0);
+    expect(stdout).toBe(`${worktrees[1]}\n`);
+  });
+
+  test("a refresh still running when the picker closes is not an error", async () => {
+    // Dismissed with `gh` still blocked, so the replacement lands on a picker that has already
+    // unmounted. React makes that dispatch a no-op; nothing here may report it as a fault.
+    const { checkout } = repoWith(2);
+    const gh = gatedGh(stacked);
+
+    const { capture, stdout } = await driveWt(
+      checkout,
+      ["--print-path"],
+      async (session) => {
+        await session.waitFor("EXC-2/thing-2");
+        // The run cannot end while `gh` is blocked, so the condition is the picker letting the
+        // cursor back — Ink's unmount — rather than the script's own exit line.
+        await typeUntil(session, KEY.escape, (text) => text.includes(SHOW_CURSOR), "closed");
+        gh.open();
+        await session.waitFor(ENDED);
+      },
+      undefined,
+      gh.path,
+    );
+
+    expect(status(capture)).toBe(130);
+    expect(stdout).toBe("");
+    expect(capture).not.toContain("wrk: ");
+    expect(capture).not.toMatch(/^\s+at /m);
   });
 });
 

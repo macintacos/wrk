@@ -23,6 +23,14 @@
  * which {@link annotations} catches and reports through {@link debug}: a picker that cannot
  * find a pull request still has worktrees to show, and stderr belongs to the frame.
  *
+ * **Annotation is also always behind the draw.** The list is what the user asked for and `git`
+ * already has it, so the rows go up from the worktrees alone and the pull requests arrive
+ * afterwards, through the picker's `onOpen` — never in front of the first frame. A warm cache
+ * makes that a frame apart and a cold one makes it a `gh` round trip apart, and the difference
+ * between the two is now how long the annotation takes to show up rather than how long the
+ * terminal stays blank. The cursor rides across the replacement because the payload is a path;
+ * {@link worktreeRows} states that obligation from the row's end.
+ *
  * **An un-annotated row carries one column, not five empty ones.** The picker sizes each
  * column across the whole row set and tolerates rows holding fewer of them, so a branch with
  * no pull request emits `[branch]` and renders identically to a picker that never looked —
@@ -207,9 +215,10 @@ export function candidates(worktrees: readonly Worktree[], here: string | null):
  * row carrying it unreachable — and git guarantees that by never listing two worktrees at one
  * path, where a `{ worktree_path, branch }` object would rely on nobody rebuilding it. That
  * second half is not idle: the same contract requires a payload to still compare `===` after a
- * row-set replacement, which is how EXC-1017 will push annotations in behind the draw. A
- * string satisfies it today and will still satisfy it then. {@link chooseWorktree} maps the
- * path back to the answer it emits.
+ * row-set replacement, and {@link chooseWorktree} replaces the whole set the moment the
+ * annotation arrives. A path comes back equal from a fresh `git worktree list`, so the cursor
+ * stays on the worktree the user was reading while every row grows four columns underneath it.
+ * {@link chooseWorktree} maps the path back to the answer it emits.
  *
  * @param offered - The worktrees to draw, as {@link candidates} answered.
  * @param prs - Pull requests by head ref, as `pullRequests` returns them. An empty map is the
@@ -237,7 +246,10 @@ export function worktreeRows(
  * The repository's pull requests, or an empty map if they could not be read at all.
  *
  * `background` because this draws on a keystroke: a stale graph now beats a fresh one in three
- * seconds, and `pr.ts` names a picker as the caller that option exists for.
+ * seconds, and `pr.ts` names a picker as the caller that option exists for. It is nonetheless
+ * never awaited *in front of* a frame — {@link chooseWorktree} calls this from the picker's
+ * `onOpen`, so the one case `background` cannot cover, a cold cache falling through to `gh` in
+ * the foreground, costs the annotation its arrival time rather than the list its draw.
  *
  * The `catch` covers the one failure `pullRequests` documents as its own — an unreadable cache
  * directory — and deliberately not `gh` being unable to answer, which never reaches here.
@@ -320,7 +332,26 @@ export async function chooseWorktree(cwd: string): Promise<Chosen | null> {
 
   try {
     const path = await pick({
-      rows: worktreeRows(offered, await annotations(container, config), config),
+      // Drawn from the worktrees alone, and annotated from `onOpen` once the graph answers.
+      // The list is what the user came for and `git` already has it, so nothing about a pull
+      // request may stand in front of the first frame — not `gh` on a cold cache, and not the
+      // cache read either. The replacement keeps the cursor because the payload is a path,
+      // unchanged across the swap; `worktreeRows` records that obligation from its end.
+      //
+      // The `if` skips a replacement that would say nothing — an absent, logged-out, offline
+      // or rate-limited `gh`, which is the un-annotated case the module header describes — and
+      // one that would say nothing still costs a re-measure of every column and a redraw.
+      rows: worktreeRows(offered, new Map(), config),
+      onOpen: (replace) => {
+        // `annotations` absorbs its own failures, so there is nothing here to reject. It is
+        // deliberately not awaited: this callback fires from the picker's first effect, and
+        // awaiting it there is the very wait being removed. A refresh that outlives the pick
+        // dispatches into an unmounted component, which React makes a no-op — `pick` promises
+        // that, and it is the only stopping cue it offers; see EXC-1014.
+        void annotations(container, config).then((prs) => {
+          if (prs.size > 0) replace(worktreeRows(offered, prs, config));
+        });
+      },
     });
 
     // The `??` is unreachable — every payload came out of a row built from `offered` on the
