@@ -281,7 +281,8 @@ export function sanitizePreview(text: string): string {
  * [`./picker`](./picker) for why that setting cannot be left to chalk.
  *
  * Not exported from the package. It is the internal half of a pair whose public half is
- * {@link sanitize}, and EXC-1014 has a smaller surface to bless for it.
+ * {@link sanitize}: a caller sanitizes text it did not write, and has no reason to
+ * un-colour text it did.
  *
  * @param text - Text that has already been through {@link sanitize}.
  * @returns The text with its SGR sequences removed.

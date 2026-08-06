@@ -5,10 +5,10 @@ that currently lives as fish functions and a standalone Python script.
 
 The repository is a [Bun](https://bun.sh) workspace holding two packages:
 
-| Package                  | Path              | What it is                           |
-| ------------------------ | ----------------- | ------------------------------------ |
-| `@macintacos/wrk`        | `packages/wrk`    | The CLI.                             |
-| `@macintacos/wrk-picker` | `packages/picker` | The reusable inline terminal picker. |
+| Package                  | Path              | What it is                                                                    |
+| ------------------------ | ----------------- | ----------------------------------------------------------------------------- |
+| `@macintacos/wrk`        | `packages/wrk`    | The CLI.                                                                      |
+| `@macintacos/wrk-picker` | `packages/picker` | The reusable inline terminal picker — [its own README](packages/picker/README.md) has the API, the payload-identity contract and the semver policy. |
 
 The bare npm name `wrk` is taken, so both packages publish under the `@macintacos` scope.
 

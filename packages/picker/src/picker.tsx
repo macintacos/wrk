@@ -184,8 +184,8 @@ const CONTROL = /\p{Cc}/u;
  * There is deliberately no `width`. A column is sized to its widest cell across **all**
  * rows — all, not the filtered ones, so a column cannot change width as the user types —
  * and a caller who wants a wider one pads its text. A per-column width declared on a
- * per-row type has no coherent meaning when two rows disagree, and this is public surface
- * EXC-1014 has to bless; the smallest surface that answers the need wins.
+ * per-row type has no coherent meaning when two rows disagree, and this is published
+ * surface; the smallest surface that answers the need wins.
  */
 export interface PickerColumn {
   /**
@@ -248,8 +248,13 @@ export interface PickOptions<T> {
    *
    * A `replace` that arrives after the user has chosen is ignored, so a refresh losing its
    * race is not an error to guard against — but *stopping* that refresh is the caller's job,
-   * and the cue is {@link pick}'s promise resolving. There is deliberately no cancellation
-   * channel here yet; see EXC-1014, which settles this surface before the first publish.
+   * and the cue is {@link pick}'s promise settling. There is deliberately no cancellation
+   * channel here: a caller that needs one holds its own `AbortController`, passes the signal
+   * into whatever this starts, and aborts in a `finally` — which is a few lines on the side
+   * that owns the work and none on this one. [`../README.md`](../README.md) carries the
+   * snippet. Handing the signal *out* instead would be an additive second parameter, which a
+   * callback ignoring it keeps compiling through, so it stays a minor-version change for
+   * whenever a consumer shows it is worth having.
    */
   readonly onOpen?: (replace: (rows: readonly PickerRow<T>[]) => void) => void;
 
