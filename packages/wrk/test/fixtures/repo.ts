@@ -17,7 +17,7 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -137,10 +137,15 @@ export interface Container {
  * nested directory that is not the layout at all. `setup.ts` folds here too.
  *
  * @param branch - The default branch to build on.
+ * @param at - Where to build it, created if absent. Defaults to a fresh {@link tempDir}. For
+ *   the one caller that needs a container at a *chosen* path rather than at an arbitrary one:
+ *   a directory scan is defined by how far below a root a container sits, so a fixture placed
+ *   wherever `mkdtemp` felt like putting it cannot express the thing under test.
  * @returns The container and its default-branch checkout — see {@link Container}.
  */
-export function makeContainer(branch = "main"): Container {
-  const container = tempDir();
+export function makeContainer(branch = "main", at?: string): Container {
+  const container = at ?? tempDir();
+  mkdirSync(container, { recursive: true });
   const checkout = join(container, worktreeDirName(branch));
   fixtureGit(["clone", "-q", "--bare", makeSeed(branch), join(container, ".bare")]);
   writeFileSync(join(container, ".git"), "gitdir: ./.bare\n");
