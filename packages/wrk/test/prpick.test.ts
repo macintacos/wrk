@@ -45,6 +45,7 @@ import {
   fixtureGit,
   ghlessWith,
   makeContainer,
+  makeUnconverted,
   quit,
   runCli,
   status,
@@ -481,6 +482,37 @@ describe("wrk pr — a worktree record whose directory is gone", () => {
         cwd: fixture.container,
       }).stdout.toString(),
     ).toContain(gone);
+  });
+
+  test("an unconverted repository refuses before asking to prune, not after", async () => {
+    // The prune is repo-wide and irreversible-ish; the refusal that follows it is certain.
+    // Asking first would spend the user's consent on a run that could never have succeeded, so
+    // the layout is settled ahead of the question rather than inside the step after it.
+    const clone = makeUnconverted("trunk");
+    const cacheHome = tempDir();
+    const { bin, log } = fakeGh();
+    seed(clone, cacheHome, [pull(9, "feat/gone")]);
+
+    const gone = join(clone, "feat+gone");
+    fixtureGit(["worktree", "add", "-q", "-b", "feat/gone", gone], clone);
+    rmSync(gone, { recursive: true, force: true });
+
+    const { capture, stdout } = await driveCli(
+      clone,
+      ["pr", "--print-path"],
+      async (session) => {
+        await session.waitFor("#9");
+        await quit(session, KEY.enter);
+      },
+      childEnv(cacheHome, bin),
+      ROWS,
+    );
+
+    expect(status(capture)).toBe(1);
+    expect(stdout).toBe("");
+    expect(capture).toContain("not a bare-repo container");
+    expect(capture).not.toContain(PRUNE_PROMPT);
+    expect(ghCalls(log).some((line) => line.includes("pr checkout"))).toBe(false);
   });
 
   test("accepting prunes, then creates the worktree and checks the pull request out", async () => {
