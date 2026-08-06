@@ -25,16 +25,26 @@ import { type RunResult, run } from "../src/proc";
 const ERRORS_MODULE = join(import.meta.dir, "../src/errors");
 const OUTPUT_MODULE = join(import.meta.dir, "../src/output");
 
-/** Runs `script` in a child with the output and error modules bound to their names. */
-function inChild(script: string): Promise<RunResult> {
-  return run(process.execPath, [
-    "-e",
+/**
+ * Runs `script` in a child with the output and error modules bound to their names.
+ *
+ * `env` is layered onto the child's inherited environment by {@link run}. The `debug` cases
+ * below are the reason it exists: what they pin is a variable being read at all, which is not
+ * observable from a process that already inherited whatever the developer happens to export.
+ */
+function inChild(script: string, env?: Record<string, string | undefined>): Promise<RunResult> {
+  return run(
+    process.execPath,
     [
-      `import * as errors from ${JSON.stringify(ERRORS_MODULE)};`,
-      `import * as output from ${JSON.stringify(OUTPUT_MODULE)};`,
-      script,
-    ].join("\n"),
-  ]);
+      "-e",
+      [
+        `import * as errors from ${JSON.stringify(ERRORS_MODULE)};`,
+        `import * as output from ${JSON.stringify(OUTPUT_MODULE)};`,
+        script,
+      ].join("\n"),
+    ],
+    { env },
+  );
 }
 
 describe("envelope", () => {
@@ -93,6 +103,28 @@ describe("the two channels", () => {
     const result = await inChild('output.emit({ verdict: "blocked", reason: "container-cwd" });');
 
     expect(result.code).toBe(0);
+  });
+});
+
+describe("debug", () => {
+  test("says nothing at all unless WRK_DEBUG is set", async () => {
+    const result = await inChild('output.debug("refreshing in the background");', {
+      WRK_DEBUG: undefined,
+    });
+
+    // Both channels, because silence on the wrong one is not silence: a diagnostic that
+    // reached stdout would break the `jq` callers this whole module exists to protect.
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+  });
+
+  test("writes to stderr with the tool's prefix when WRK_DEBUG is set", async () => {
+    const result = await inChild('output.debug("refreshing in the background");', {
+      WRK_DEBUG: "1",
+    });
+
+    expect(result.stderr).toBe("wrk: refreshing in the background\n");
+    expect(result.stdout).toBe("");
   });
 });
 

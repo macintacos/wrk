@@ -26,8 +26,7 @@
  * therefore has to be measured rather than asserted: the fake sleeps for seconds and the
  * caller has to come back in milliseconds. It goes through
  * [`./fixtures/background-caller.ts`](./fixtures/background-caller.ts) rather than calling
- * `pullRequests` here, because half of what it measures — that the detached refresh holds no
- * descriptor of the caller's — exists only at the process boundary. See that fixture's header.
+ * `pullRequests` here, for the reason that fixture's header gives.
  */
 
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
@@ -128,8 +127,8 @@ interface GhScript {
  *
  * By absolute path because {@link withGh} replaces `PATH` with the fake's directory alone, so
  * a bare `sleep` inside the fake would not resolve — the same reason the fake carries its
- * payloads inline instead of reading them with `cat`. The fallback is `noUncheckedIndexedAccess`
- * in spirit rather than a case expected to fire: `sleep` is in POSIX.
+ * payloads inline instead of reading them with `cat`. The fallback exists because `Bun.which`
+ * is nullable, not because it is expected to fire: `sleep` is in POSIX.
  */
 const SLEEP = Bun.which("sleep") ?? "/bin/sleep";
 
@@ -461,6 +460,11 @@ describe("background refresh", () => {
       {
         env: {
           ...process.env,
+          // Pinned empty, not inherited: the stderr assertion below is what catches a fixture
+          // that threw, and it can only mean that against a channel nothing else writes to.
+          // A developer working on this feature is exactly the person who has `WRK_DEBUG`
+          // exported, and inheriting theirs would fail the case for the wrong reason.
+          WRK_DEBUG: "",
           WRK_CONTAINER: CONTAINER,
           WRK_CACHE_ROOT: root,
           WRK_TTL: "60000",
@@ -503,4 +507,17 @@ describe("background refresh", () => {
 
     expect(numbers).toEqual([22, 23]);
   }, 30_000);
+
+  test("waits for the first answer when nothing is stored", async () => {
+    const { bin, root } = withGh({ open: [ghRow()] });
+
+    const prs = await pullRequests(CONTAINER, 600_000, { root, background: true });
+
+    // A cold cache has nothing to draw, so the flag has nothing to serve and the call pays for
+    // the first answer. Returning an empty map instead would be indistinguishable, to every
+    // consumer, from a repository that genuinely has no open pull requests. The recorded
+    // invocations are what separate the two: an implementation that answered empty ran no `gh`.
+    expect(prs.get("EXC-1031/readme")?.number).toBe(22);
+    expect(recorded(bin)).toHaveLength(2);
+  });
 });

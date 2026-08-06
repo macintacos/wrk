@@ -184,6 +184,19 @@ async function touch(path: string): Promise<void> {
 }
 
 /**
+ * Whether `entry` is younger than `ttl`, and the only place in this module that decides it.
+ *
+ * One definition because there are two read-throughs — {@link cached} and
+ * {@link cachedBehind} — and a second copy of this comparison would be free to drift from the
+ * first while both kept compiling. The consequence of that drift is silent in exactly one
+ * direction: a read-through that wrongly believes an entry is fresh simply never refreshes it,
+ * and every consumer downstream draws the stale answer without complaint.
+ */
+function fresh(entry: CacheEntry, ttl: number): boolean {
+  return Date.now() - entry.mtimeMs < ttl;
+}
+
+/**
  * Reads an entry regardless of its age.
  *
  * Staleness is {@link cached}'s concern, not this function's — a caller reaching for this
@@ -302,7 +315,7 @@ export async function cached(
   const path = cachePath(key);
   const entry = await readEntry(path);
 
-  if (entry && Date.now() - entry.mtimeMs < ttl) {
+  if (entry && fresh(entry, ttl)) {
     return entry.text;
   }
 
@@ -359,14 +372,21 @@ export async function cached(
  * worked. A caller drawing something a user is looking at spends microseconds here rather
  * than however long the upstream takes.
  *
- * **The touch is what makes it a debounce, and it lands before `spawn` runs.** Stamping the
- * entry's mtime is what stops the *next* invocation from starting a second refresh while the
- * first is still in flight, and it is the same mechanism {@link cached} uses for the same
- * reason. Ordering it after the spawn would leave the window it exists to close open for as
- * long as starting a process takes, which — for a shell prompt redrawing three times a second
- * — is long enough to matter. It is deliberately spent on a refresh that goes on to *fail*,
- * exactly as `cached`'s is: an upstream that cannot answer is not retried until the entry
- * goes stale again.
+ * **The touch is the debounce, and it lands before `spawn` runs.** Stamping the entry's mtime
+ * is what stops the *next* invocation from starting a second refresh while the first is still
+ * in flight, and it is the same mechanism {@link cached} uses for the same reason. Ordering it
+ * after the spawn would leave the window it exists to close open for as long as starting a
+ * process takes, which — for a shell prompt redrawing three times a second — is long enough to
+ * matter. It is deliberately spent on a refresh that goes on to *fail*, exactly as `cached`'s
+ * is: an upstream that cannot answer is not retried until the entry goes stale again.
+ *
+ * It is also, being one `utimes`, only as good as that call. Two configurations get no
+ * debounce at all: a `ttl` of `0`, where the stamp cannot make anything fresh and every call
+ * therefore spawns; and an entry this process cannot stamp — one owned by another user, or on
+ * a read-only mount — where {@link touch} swallows the failure by design. Both are bounded
+ * where it matters rather than here: whatever `spawn` starts is expected to go through
+ * {@link cached}, whose lock lets one of them do the work while the rest serve stale text and
+ * exit. So the cost is a process start per call, not an upstream call per call.
  *
  * No lock is taken. There is nothing to serialise here, because this function does no work
  * worth serialising — whatever `spawn` starts is expected to go through {@link cached}
@@ -392,6 +412,10 @@ export async function cached(
  * const stored = await cachedBehind(key, ttl, () => detach(process.execPath, [worker, container]));
  * ```
  */
+// ponytail: the touch is the only thing bounding how often this spawns, so the two cases it
+// cannot cover — `ttl: 0`, and an entry that cannot be stamped — spawn once per call. Gate the
+// spawn on a `touch` that reports success if a caller is ever seen starting a process per
+// redraw; note that gating alone does not cover the `ttl: 0` case, which needs its own floor.
 export async function cachedBehind(
   key: CacheKey,
   ttl: number,
@@ -401,7 +425,7 @@ export async function cachedBehind(
   const entry = await readEntry(path);
 
   if (entry === null) return null;
-  if (Date.now() - entry.mtimeMs < ttl) return entry.text;
+  if (fresh(entry, ttl)) return entry.text;
 
   await touch(path);
   spawn();

@@ -128,24 +128,27 @@ describe("detach", () => {
     const directory = mkdtempSync(join(tmpdir(), "wrk-detach-"));
     const marker = join(directory, "done");
 
-    const pid = detach(process.execPath, [
-      "-e",
-      `setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, ""), 300)`,
-    ]);
+    try {
+      const pid = detach(process.execPath, [
+        "-e",
+        `setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, ""), 300)`,
+      ]);
 
-    // Both halves of "detached" in one pair of assertions: the call is already back while the
-    // child is still working, and the child gets to finish regardless. Were `detach` awaiting
-    // anything at all, the marker would already exist by the time this line ran.
-    expect(pid).toBeGreaterThan(0);
-    expect(existsSync(marker)).toBe(false);
+      // Both halves of "detached" in one pair of assertions: the call is already back while
+      // the child is still working, and the child gets to finish regardless. Were `detach`
+      // awaiting anything at all, the marker would already exist by the time this line ran.
+      expect(pid).toBeGreaterThan(0);
+      expect(existsSync(marker)).toBe(false);
 
-    const deadline = Date.now() + 10_000;
-    while (!existsSync(marker) && Date.now() < deadline) {
-      await Bun.sleep(25);
+      const deadline = Date.now() + 10_000;
+      while (!existsSync(marker) && Date.now() < deadline) {
+        await Bun.sleep(25);
+      }
+
+      expect(existsSync(marker)).toBe(true);
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
     }
-
-    expect(existsSync(marker)).toBe(true);
-    rmSync(directory, { recursive: true, force: true });
   }, 15_000);
 
   test("survives a command that cannot be spawned at all", async () => {

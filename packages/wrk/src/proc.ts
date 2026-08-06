@@ -18,7 +18,7 @@
  * @packageDocumentation
  */
 
-import { spawn } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { constants } from "node:os";
 
 /** Options for {@link run}. */
@@ -166,23 +166,36 @@ function toExitStatus(code: number | null, signal: NodeJS.Signals | null): numbe
  *   exits rather than lingering until the child is done.
  *
  * A child that could not be started is **swallowed**, which is the one judgement here rather
- * than a mechanism. `spawn` reports that asynchronously as an `error` event, and an `error`
- * event with no listener is rethrown as an uncaught exception — so a background job that
- * could not start would take down the invocation that merely asked for one. There is nothing
- * a caller could do about it either: the work was optional, which is why it was detached.
+ * than a mechanism: a background job nobody is waiting on must not be able to take down the
+ * invocation that merely asked for one, and there is nothing a caller could do about it
+ * anyway — the work was optional, which is why it was detached.
+ *
+ * That takes **both** halves, because `spawn` reports a failed start two different ways.
+ * `ENOENT` and the other errors libuv defers arrive as an `error` event, which is rethrown as
+ * an uncaught exception when nothing is listening; `ENOMEM`, `E2BIG` and anything else
+ * `posix_spawn` refuses outright are thrown straight out of the call. Handling only the event
+ * leaves the guarantee true of the likely failure and false of the rare one — which is the
+ * shape of bug that survives every test and fires on the day the machine is under pressure.
  *
  * @param cmd - Executable to run, resolved against `PATH`.
  * @param args - Arguments passed verbatim, one array element per argv entry.
- * @returns The child's process id, or `undefined` when it could not be started — useful for
- *   a diagnostic, and the only evidence this function leaves behind.
+ * @returns The child's process id, or `undefined` when the spawn failed outright. A pid means
+ *   a process was created — not that it went on to run successfully, since nothing here
+ *   observes what became of it. It is a diagnostic, and the only evidence this leaves behind.
  *
  * @example
  * ```ts
  * detach(process.execPath, [fileURLToPath(import.meta.url), container]);
  * ```
  */
-export function detach(cmd: string, args: string[] = []): number | undefined {
-  const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+export function detach(cmd: string, args: string[]): number | undefined {
+  let child: ChildProcess;
+  try {
+    child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+  } catch {
+    return undefined;
+  }
+
   child.on("error", () => undefined);
   child.unref();
 

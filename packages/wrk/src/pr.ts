@@ -253,8 +253,9 @@ function spawnRefresh(container: string, root?: string): void {
  * @returns One pull request per head ref. Empty when `gh` could not answer and nothing was
  * cached, and empty when the stored entry cannot be read — both are "nothing to draw" rather
  * than failures, per this module's header.
- * @throws Whatever {@link cached} threw. `gh` being unable to answer is not one of those: it
- * is either absorbed here or served from the previous entry.
+ * @throws Whatever {@link cached} or {@link cachedBehind} threw — an unreadable cache
+ * directory, either way. `gh` being unable to answer is not one of those: it is either
+ * absorbed here or served from the previous entry.
  *
  * @example
  * ```ts
@@ -289,10 +290,17 @@ export async function pullRequests(
 // The worker `spawnRefresh` starts, guarded so that importing this module runs nothing —
 // `cli.ts`'s idiom. `FORCED` rather than the caller's TTL because the caller has just stamped
 // the entry to debounce its siblings, and this process is the refresh that stamp was promising.
+//
+// ponytail: unlike `cli.ts`'s, this guard sits in a module other entry points import, so it
+// assumes the package keeps being loaded as files by a runtime that defines `import.meta.main`.
+// Bundle it and the guard is inlined into whichever entry pulled this module in, firing on
+// every invocation of that entry; run it where the flag is undefined and the worker silently
+// does nothing while its parent keeps stamping the entry fresh. If a build step arrives, split
+// the worker into an entry point of its own rather than deleting the guard.
 if (import.meta.main) {
   const [container, root] = process.argv.slice(2);
   if (container === undefined) {
-    throw new Error("usage: pr.ts <container> [cache-root]");
+    throw new Error("usage: <container> [cache-root]");
   }
 
   await pullRequests(container, FORCED, { root });
