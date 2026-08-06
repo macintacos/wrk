@@ -28,11 +28,12 @@
 import { Command } from "@commander-js/extra-typings";
 
 import { renderConversion, resolveConversion } from "./convert";
-import { Refusal } from "./errors";
+import { Cancelled, Refusal } from "./errors";
 import { emit, emitLine, note, reportFailure } from "./output";
 import { preflight } from "./preflight";
 import { repoSetup } from "./setup";
 import { createWorktree } from "./worktree";
+import { chooseWorktree } from "./wt";
 
 /**
  * Assembles the commander tree.
@@ -89,6 +90,30 @@ export function buildProgram(): Command {
       // own insertion order, and `Conversion` is built as one literal, so this preserves it.
       if (wantsJson(command)) emit({ ...conversion, recipe });
       else note(recipe);
+    });
+
+  program
+    .command("wt")
+    .description("Pick one of this repository's worktrees and say where to go")
+    .option("--print-path", "Print the chosen path alone, for the cd shim")
+    // Commander renders help on stdout, and [`./output`](./output)'s header calls that right —
+    // a caller asking for help is a human. It is wrong for exactly this command: under the
+    // documented shim this stdout is fed straight to `cd`, so a usage block there is a
+    // directory name rather than a document. Scoped to `wt` alone, because `configureOutput`
+    // replaces this command's inherited configuration object rather than mutating the shared
+    // one, so `wrk --help` and every `agent` command keep stdout. The cost is cosmetic and
+    // accepted: commander still derives help width and colour support from `process.stdout`,
+    // so help written here while stdout is a pipe wraps at 80 columns and renders unstyled.
+    .configureOutput({ writeOut: (text: string) => process.stderr.write(text) })
+    .action(async ({ printPath }) => {
+      const chosen = await chooseWorktree(process.cwd());
+      // Thrown rather than returned, because throwing unwinds: the whole of what the cd
+      // protocol promises is that a dismissed picker leaves stdout empty, and control flow
+      // enforces that where a checked sentinel would only ask for it. See `./errors`.
+      if (chosen === null) throw new Cancelled("the worktree picker was dismissed");
+
+      if (printPath === true) emitLine(chosen.worktree_path);
+      else emit(chosen);
     });
 
   // Bound rather than chained straight into a subcommand: `.command()` answers the *sub*
