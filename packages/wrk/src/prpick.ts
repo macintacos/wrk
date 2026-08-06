@@ -223,9 +223,9 @@ export function holderFor(worktrees: readonly Worktree[], headRef: string): Work
  * Asks whether to prune, having first said which worktree provoked the question.
  *
  * A two-row picker rather than a hand-rolled `y/N` read, because `pick` already owns raw mode,
- * the non-terminal refusal, and erasing its own frame on the way out — a bespoke reader would
- * reimplement all three and get one of them wrong. `cancel` is the first row so the cursor
- * starts on the answer that changes nothing.
+ * the non-terminal refusal, and erasing its own frame once the pick resolves — a bespoke reader
+ * would reimplement all three and get one of them wrong. `cancel` is the first row so the
+ * cursor starts on the answer that changes nothing.
  *
  * @param stale - The recorded worktree whose directory is gone.
  * @returns `true` only if the user chose to prune. Escape, `Ctrl-C` and `cancel` alike answer
