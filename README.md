@@ -43,23 +43,30 @@ repository root:
 bun packages/wrk/src/cli.ts --help
 ```
 
-That prints the usage block: the global `--json` flag, and the two command groups, `repo`
-and `agent`. `--help` works at every level, so
+That prints the usage block: the global `--json` flag, the `wt` picker, and the two
+command groups, `repo` and `agent`. `--help` works at every level, so
 `bun packages/wrk/src/cli.ts agent create --help` is the quickest way to see one command's
 flags.
 
 ## The commands
 
-| Command                      | What it does                                                |
-| ---------------------------- | ----------------------------------------------------------- |
-| `wrk repo convert`           | Prints, and never runs, the bare-repo conversion recipe.     |
-| `wrk agent repo-setup <url>` | Clones a repository into the bare-repo layout, in the cwd.   |
-| `wrk agent preflight`        | Says whether an agent may cut a worktree here, and why not.  |
-| `wrk agent create`           | Creates a branch and its worktree together.                  |
+| Command                      | What it does                                                   |
+| ---------------------------- | -------------------------------------------------------------- |
+| `wrk wt`                     | Picks one of this repository's worktrees and says where to go.  |
+| `wrk repo convert`           | Prints, and never runs, the bare-repo conversion recipe.        |
+| `wrk agent repo-setup <url>` | Clones a repository into the bare-repo layout, in the cwd.      |
+| `wrk agent preflight`        | Says whether an agent may cut a worktree here, and why not.     |
+| `wrk agent create`           | Creates a branch and its worktree together.                     |
 
 `wrk` is driven by an agent as much as by a person, so the `agent` commands print JSON
 whatever you ask for. `--json` puts a command that would otherwise print for a human onto
 the same shape, and may go anywhere in the argument list.
+
+`wrk wt` is the one you type by hand. It lists every worktree in the repository except the
+one you are standing in, annotated with where each branch sits in the PR stack, and
+filters as you type. No child process can move the shell that launched it, so it prints
+where to go and a three-line shell function does the `cd` —
+[doc/ADVANCED.md](doc/ADVANCED.md#the-cd-protocol) has both shims and the rest of it.
 
 ## Configuration
 
