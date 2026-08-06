@@ -1,9 +1,7 @@
 # Advanced
 
-The reference half of `wrk`'s documentation: the git version floor in detail, the
-repository's own dev workflow, the output contract its callers parse, the agent commands
-in full, and the configuration layers. [README.md](../README.md) is the front door — start
-there if you have not run the CLI yet.
+The reference half of `wrk`'s documentation. [README.md](../README.md) is the front door —
+start there if you have not run the CLI yet.
 
 Commands below are written as `wrk …`, which is the shape they will take once the binary
 is wired up. Until then, substitute `bun packages/wrk/src/cli.ts …` from the repository

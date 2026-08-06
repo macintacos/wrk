@@ -3,7 +3,7 @@
 A TypeScript CLI that consolidates the git-worktree, PR-stack and agent-workflow tooling
 that currently lives as fish functions and a standalone Python script.
 
-The repository is a [Bun](https://bun.sh) workspace holding two published packages:
+The repository is a [Bun](https://bun.sh) workspace holding two packages:
 
 | Package                  | Path              | What it is                           |
 | ------------------------ | ----------------- | ------------------------------------ |
@@ -17,9 +17,9 @@ The bare npm name `wrk` is taken, so both packages publish under the `@macintaco
 - [mise](https://mise.jdx.dev). It installs and pins every other tool the repository
   needs, Bun included, so nothing else has to be on your machine first.
 - **git 2.36 or newer.** This is the one exception: `wrk` shells out to the system `git`
-  rather than pinning its own. Run `git --version` before anything else — an older git
-  does not fail cleanly, and [doc/ADVANCED.md](doc/ADVANCED.md#the-git-version-floor)
-  explains why.
+  rather than pinning its own. Run `git --version` before anything else — an old enough
+  git fails silently rather than loudly, and
+  [doc/ADVANCED.md](doc/ADVANCED.md#the-git-version-floor) explains how.
 
 ## Setup
 
@@ -43,27 +43,26 @@ repository root:
 bun packages/wrk/src/cli.ts --help
 ```
 
-That prints the usage block: the global `--json` flag, and the two command groups the next
-section covers, `repo` and `agent`. `--help` works at every level, so
+That prints the usage block: the global `--json` flag, and the two command groups, `repo`
+and `agent`. `--help` works at every level, so
 `bun packages/wrk/src/cli.ts agent create --help` is the quickest way to see one command's
 flags.
 
 ## The commands
 
-| Command                      | What it does                                                  |
-| ---------------------------- | ------------------------------------------------------------- |
-| `wrk repo convert`           | Prints — and does not run — the recipe for converting this repository to the bare-repo layout. |
-| `wrk agent repo-setup <url>` | Clones a repository into the bare-repo layout, in the cwd.     |
-| `wrk agent preflight`        | Says whether an agent may cut a worktree here, and why not.    |
-| `wrk agent create`           | Creates a branch and its worktree together.                    |
+| Command                      | What it does                                                |
+| ---------------------------- | ----------------------------------------------------------- |
+| `wrk repo convert`           | Prints, and never runs, the bare-repo conversion recipe.     |
+| `wrk agent repo-setup <url>` | Clones a repository into the bare-repo layout, in the cwd.   |
+| `wrk agent preflight`        | Says whether an agent may cut a worktree here, and why not.  |
+| `wrk agent create`           | Creates a branch and its worktree together.                  |
 
-`wrk` exists to be driven by an agent as much as by a person, so every command can emit
-JSON instead of prose: pass `--json` anywhere in the argument list. The `agent` commands
-emit JSON regardless, because their callers parse them either way.
+`wrk` is driven by an agent as much as by a person, so the `agent` commands print JSON
+whatever you ask for. `--json` puts a command that would otherwise print for a human onto
+the same shape, and may go anywhere in the argument list.
 
 ## Going further
 
-[doc/ADVANCED.md](doc/ADVANCED.md) carries the rest: the output contract callers parse and
-its exit rules, each `agent` command in full with its verdicts and envelope, the
-configuration layers, the git version floor in detail, and the repository's own dev
-workflow.
+[doc/ADVANCED.md](doc/ADVANCED.md) carries the rest: the git version floor in detail, the
+repository's own dev workflow, the output contract callers parse and its exit rules, each
+`agent` command in full, and the configuration layers.
