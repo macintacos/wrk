@@ -1,10 +1,16 @@
 /**
- * What a freshly-created worktree lacks, and the four best-effort steps that supply it.
+ * What a checkout git has just created lacks, and the best-effort steps that supply it.
  *
  * A worktree is a clean checkout, so nothing git does not track comes along: a project's
  * `.env` holds secrets that were never committed, its `.codegraph` index was built in the
  * checkout it sits in, and its toolchain is installed per-directory. Until this module has
  * run, git has produced a directory rather than somewhere work can happen.
+ *
+ * Two entry points, for the two ways a checkout comes into existence. {@link provision} serves
+ * `create`, which has a source checkout beside it to copy context from. {@link provisionCheckout}
+ * serves `repo-setup`, which does not: the repository was cloned from a remote, so an index has
+ * to be built rather than copied and there is no `.env` anywhere to bring across. Everything
+ * below the two is shared.
  *
  * **The order is the contract, and it is load-bearing at both ends.** The refresh must
  * precede the copy, or it updates the index the copy has already left behind. The sync must
@@ -163,6 +169,21 @@ function echo({ stdout, stderr }: RunResult): void {
 }
 
 /**
+ * Runs one `codegraph` command, forwarding whatever it said.
+ *
+ * The index precondition is the caller's: {@link codegraph} needs one to exist and
+ * {@link initCodegraph} needs one not to, so only the invocation is shared and each gate lives
+ * at its own call site.
+ *
+ * @param checkout - Directory to run in; a no-op unless `codegraph` is installed.
+ * @param args - Subcommand and arguments, excluding the program name.
+ */
+async function runCodegraph(checkout: string, ...args: string[]): Promise<void> {
+  const result = await tool("codegraph", args, checkout, CODEGRAPH_TIMEOUT_MS);
+  if (result !== null) echo(result);
+}
+
+/**
  * Runs one `codegraph` command against a checkout that already has an index.
  *
  * Two gates, and both are required: the index has to exist, because every subcommand used
@@ -174,8 +195,27 @@ function echo({ stdout, stderr }: RunResult): void {
 async function codegraph(checkout: string, ...args: string[]): Promise<void> {
   if ((await statOf(join(checkout, CODEGRAPH_DIR)))?.isDirectory() !== true) return;
 
-  const result = await tool("codegraph", args, checkout, CODEGRAPH_TIMEOUT_MS);
-  if (result !== null) echo(result);
+  await runCodegraph(checkout, ...args);
+}
+
+/**
+ * Builds an index in a checkout that has none — {@link codegraph}'s inverse gate.
+ *
+ * **This is the one step that does not stat a path inside `cwd` first**, which {@link tool}
+ * names as the precondition for reading its `ENOENT` as "the tool is not installed": `init`
+ * needs nothing to be there, so there is nothing to stat. The reading stays safe anyway,
+ * because the alternative is not a *different* outcome. A `cwd` that does not exist makes the
+ * spawn fail whether or not this checked for it, and `bestEffort` is the only thing above
+ * either way — so a guard here would buy silence in place of a warning, which is the wrong
+ * direction. The sole caller is {@link provisionCheckout}, which is handed a checkout `git
+ * worktree add` has just created.
+ *
+ * @param checkout - Freshly-cloned checkout to index; a no-op if it already has an index.
+ */
+async function initCodegraph(checkout: string): Promise<void> {
+  if ((await statOf(join(checkout, CODEGRAPH_DIR)))?.isDirectory() === true) return;
+
+  await runCodegraph(checkout, "init");
 }
 
 /**
@@ -350,4 +390,31 @@ export async function provision(source: string, worktree: string): Promise<void>
   await bestEffort("context copy", () => copyContext(source, worktree));
   await bestEffort("codegraph sync", () => codegraph(worktree, "sync"));
   await bestEffort("mise install", () => installMiseTooling(worktree));
+}
+
+/**
+ * Brings a freshly-cloned default-branch checkout up to a workable state.
+ *
+ * {@link provision}'s counterpart for `repo-setup`, which has no source checkout to copy from:
+ * an index has to be built rather than copied, and there is no `.env` anywhere to bring across.
+ * The install goes last because it is the step that can take a minute, and nothing before it
+ * needs the tools.
+ *
+ * **Indexing here is deliberate, and narrower than it looks.** The standing rule that indexing
+ * is the user's decision governs an agent deciding mid-session to index a repository it happens
+ * to be reading; this runs only because the user invoked `repo-setup`, whose whole contract is
+ * a checkout that is ready to work in. Do not delete the step on the strength of that rule
+ * alone — drop the command instead.
+ *
+ * Each step is best-effort for {@link provision}'s reason, which is sharper here: git has
+ * already built the whole container by the time this runs, and `repo-setup` discards the
+ * container on failure, so a provisioning error that propagated would delete a repository over
+ * a missing toolchain.
+ *
+ * @param checkout - The default-branch checkout inside the new container.
+ * @returns Once every step has been attempted. Never rejects.
+ */
+export async function provisionCheckout(checkout: string): Promise<void> {
+  await bestEffort("codegraph init", () => initCodegraph(checkout));
+  await bestEffort("mise install", () => installMiseTooling(checkout));
 }

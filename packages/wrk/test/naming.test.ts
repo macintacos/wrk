@@ -13,6 +13,7 @@
 
 import { describe, expect, test } from "bun:test";
 
+import { Refusal } from "../src/errors";
 import {
   branchBelongsToIssue,
   cacheSlug,
@@ -22,7 +23,6 @@ import {
   mintBranch,
   worktreeDirName,
 } from "../src/naming";
-import { Refusal } from "../src/output";
 
 describe("fold", () => {
   test("replaces every slash, not just the first", () => {

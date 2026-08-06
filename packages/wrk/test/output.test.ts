@@ -17,17 +17,23 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { CommandFailed, envelope, Refusal, reportFailure } from "../src/output";
+import { CommandFailed, Refusal } from "../src/errors";
+import { envelope, reportFailure } from "../src/output";
 import { type RunResult, run } from "../src/proc";
 
-/** Absolute, so the child resolves the module regardless of where the suite was started. */
+/** Absolute, so the child resolves each module regardless of where the suite was started. */
+const ERRORS_MODULE = join(import.meta.dir, "../src/errors");
 const OUTPUT_MODULE = join(import.meta.dir, "../src/output");
 
-/** Runs `script` in a child with the output module bound to `output`. */
+/** Runs `script` in a child with the output and error modules bound to their names. */
 function inChild(script: string): Promise<RunResult> {
   return run(process.execPath, [
     "-e",
-    `import * as output from ${JSON.stringify(OUTPUT_MODULE)};\n${script}`,
+    [
+      `import * as errors from ${JSON.stringify(ERRORS_MODULE)};`,
+      `import * as output from ${JSON.stringify(OUTPUT_MODULE)};`,
+      script,
+    ].join("\n"),
   ]);
 }
 
@@ -93,7 +99,7 @@ describe("the two channels", () => {
 describe("reportFailure", () => {
   test("answers 1 for a refusal, on stderr, with no stack and nothing on stdout", async () => {
     const result = await inChild(
-      'process.exitCode = output.reportFailure(new output.Refusal("cwd is not empty"));',
+      'process.exitCode = output.reportFailure(new errors.Refusal("cwd is not empty"));',
     );
 
     expect(result.code).toBe(1);
@@ -106,7 +112,7 @@ describe("reportFailure", () => {
   test("answers the underlying command's own exit status, and names what it said", async () => {
     const result = await inChild(
       "process.exitCode = output.reportFailure(" +
-        'new output.CommandFailed(["git", "rev-parse", "--git-dir"], 128, "fatal: not a repository\\n"));',
+        'new errors.CommandFailed(["git", "rev-parse", "--git-dir"], 128, "fatal: not a repository\\n"));',
     );
 
     // Exact for the same reason the refusal case is exact: two `toContain`s would still
@@ -123,7 +129,7 @@ describe("reportFailure", () => {
     // code of 0 here would report a failed run as a successful one — the one outcome this
     // module exists to prevent.
     const result = await inChild(
-      'process.exitCode = output.reportFailure(new output.CommandFailed(["git", "status"], 0, ""));',
+      'process.exitCode = output.reportFailure(new errors.CommandFailed(["git", "status"], 0, ""));',
     );
 
     expect(result.code).toBe(1);

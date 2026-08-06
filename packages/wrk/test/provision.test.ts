@@ -40,7 +40,7 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import { provision } from "../src/provision";
+import { provision, provisionCheckout } from "../src/provision";
 
 /** Temp roots to delete once the suite finishes. */
 const roots: string[] = [];
@@ -477,5 +477,47 @@ describe("provision", () => {
     writeFileSync(join(worktree, ".codegraph"), "not a directory\n");
 
     expect(await provision(makeSource(), worktree).then(() => "resolved")).toBe("resolved");
+  });
+});
+
+describe("provisionCheckout", () => {
+  test("builds an index where there is none, then installs the tooling", async () => {
+    // `repo-setup`'s counterpart to `provision`: nothing to copy from, so the index is *built*
+    // rather than seeded, and the install still comes last because it is the slow step.
+    const bin = makeBin();
+    process.env.PATH = bin;
+    const checkout = makeWorktree({ mise: true });
+
+    await provisionCheckout(checkout);
+
+    expect(recorded(bin)).toEqual([
+      `${checkout}\tcodegraph init`,
+      `${checkout}\tmise trust --quiet`,
+      `${checkout}\tmise tasks info setup`,
+      `${checkout}\tmise run setup`,
+    ]);
+  });
+
+  test("leaves an existing index alone rather than re-initialising it", async () => {
+    // The inverse of `provision`'s gate, and the reason the spawn is shared rather than the
+    // whole helper: `init` is the one subcommand that must not run where an index exists.
+    const bin = makeBin();
+    process.env.PATH = bin;
+    const checkout = makeWorktree();
+    mkdirSync(join(checkout, ".codegraph"));
+
+    await provisionCheckout(checkout);
+
+    expect(recorded(bin)).toEqual([]);
+  });
+
+  test("never rejects, whatever a step does", async () => {
+    // `repo-setup` discards the container when a step throws, so a provisioning error that
+    // propagated would delete a repository git had already finished building.
+    const bin = makeBin({ installExit: 3 });
+    process.env.PATH = bin;
+    const checkout = makeWorktree({ mise: true });
+
+    expect(await provisionCheckout(checkout).then(() => "resolved")).toBe("resolved");
   });
 });

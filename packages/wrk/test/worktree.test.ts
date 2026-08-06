@@ -40,7 +40,7 @@ import {
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 
-import { CommandFailed, Refusal } from "../src/output";
+import { CommandFailed, Refusal } from "../src/errors";
 import { type RunResult, run } from "../src/proc";
 import { createWorktree } from "../src/worktree";
 

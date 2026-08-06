@@ -38,7 +38,7 @@
 
 import { z } from "zod";
 
-import { CommandFailed } from "./output";
+import { CommandFailed } from "./errors";
 import { type RunResult, run } from "./proc";
 
 /**
@@ -87,9 +87,19 @@ const LOCAL_REPO_ENV: Record<string, undefined> = Object.fromEntries(
  *
  * @param args - Arguments after `git`, one array element per argv entry.
  * @param cwd - Directory to run in. Defaults to this process's cwd.
+ * @param env - Variables for this call alone, for the settings git reads from the environment
+ *   and nowhere else — `GIT_TERMINAL_PROMPT` being the one this exists for. {@link
+ *   LOCAL_REPO_ENV} is spread *after* it and therefore wins, so this parameter can add to the
+ *   environment but cannot re-bind the repository: `cwd` stays the only thing that decides which
+ *   repository answers, which is what the module header promises without qualification. A caller
+ *   wanting a different repository has `cwd`.
  */
-export function git(args: string[], cwd?: string): Promise<RunResult> {
-  return run("git", args, { cwd, env: LOCAL_REPO_ENV });
+export function git(
+  args: string[],
+  cwd?: string,
+  env?: Record<string, string | undefined>,
+): Promise<RunResult> {
+  return run("git", args, { cwd, env: { ...env, ...LOCAL_REPO_ENV } });
 }
 
 /**
@@ -106,9 +116,17 @@ export function git(args: string[], cwd?: string): Promise<RunResult> {
  * Exported as {@link git}'s throwing twin, for a mutation whose single caller does not earn a
  * wrapper of its own — a `fetch`, a `switch`, a `pull`. A command that gains a second caller
  * earns its wrapper then, and moves in here.
+ *
+ * @param args - Arguments after `git`, one array element per argv entry.
+ * @param cwd - Directory to run in. Defaults to this process's cwd.
+ * @param env - Per-call environment, exactly as {@link git} takes it.
  */
-export async function gitOk(args: string[], cwd?: string): Promise<string> {
-  const { stdout, stderr, code } = await git(args, cwd);
+export async function gitOk(
+  args: string[],
+  cwd?: string,
+  env?: Record<string, string | undefined>,
+): Promise<string> {
+  const { stdout, stderr, code } = await git(args, cwd, env);
   if (code !== 0) {
     throw new CommandFailed(["git", ...args], code, stderr);
   }

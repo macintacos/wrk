@@ -13,16 +13,16 @@
  * discovering it. That is what makes the rules cheap enough to pin exhaustively in tests,
  * which is precisely what the previous implementations lacked while they drifted. The
  * layers that own git state supply the inputs. Its two imports leave the claim intact:
- * `node:crypto`, for {@link cacheSlug}'s digest, and `./output`, for the {@link Refusal}
+ * `node:crypto`, for {@link cacheSlug}'s digest, and `./errors`, for the {@link Refusal}
  * {@link mintBranch} throws — neither performs I/O at import nor reads the environment, and
- * `output.ts` itself imports nothing at all.
+ * `errors.ts` itself imports nothing at all.
  *
  * @packageDocumentation
  */
 
 import { createHash } from "node:crypto";
 
-import { Refusal } from "./output";
+import { Refusal } from "./errors";
 
 /**
  * The project-key-and-number shape, written once and anchored differently below.
