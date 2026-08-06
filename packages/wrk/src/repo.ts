@@ -67,6 +67,18 @@ const ORIGIN_HEAD_REF = `${ORIGIN_PREFIX}HEAD`;
 const BRANCH_PREFIX = "refs/heads/";
 
 /**
+ * What a command that places a sibling worktree refuses with when {@link isBareLayout} is false.
+ *
+ * Here rather than at either call site because it is one sentence with two speakers —
+ * `worktree.ts`'s `createWorktree` and `prpick.ts`'s `landIn` — and it names a skill the user is
+ * then expected to run. `output.ts` exports `PREFIX` on exactly this reasoning: a second literal
+ * is the shape that drifts, and a drifted instruction is worse than a drifted prefix. It lives
+ * beside {@link isBareLayout} because that is the predicate it is the negative answer to.
+ */
+export const UNCONVERTED =
+  "not a bare-repo container, so there is nowhere to place a sibling worktree; convert it first with the repo-setup skill";
+
+/**
  * Where a directory sits relative to the repository — the three-state "where am I?".
  *
  * The states are distinguished by which of the two `rev-parse` probes answer: a work tree

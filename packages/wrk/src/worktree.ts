@@ -25,7 +25,7 @@ import { Refusal } from "./errors";
 import { addWorktree } from "./git";
 import { worktreeDirName } from "./naming";
 import { provision } from "./provision";
-import { checkoutFor, containerFor, isBareLayout, resolveDefaultBranch } from "./repo";
+import { checkoutFor, containerFor, isBareLayout, resolveDefaultBranch, UNCONVERTED } from "./repo";
 
 /**
  * What `create` produced: the worktree that now exists, and the branch checked out in it.
@@ -134,9 +134,7 @@ export async function createWorktree(cwd: string, options: CreateOptions): Promi
   }
 
   if (!(await isBareLayout(from))) {
-    throw new Refusal(
-      "not a bare-repo container, so there is nowhere to place a sibling worktree; convert it first with the repo-setup skill",
-    );
+    throw new Refusal(UNCONVERTED);
   }
 
   const path = join(container, worktreeDirName(branch));

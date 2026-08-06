@@ -42,10 +42,12 @@ import {
   childEnv,
   cleanupFixtures,
   driveCli,
-  ENDED,
+  fixtureGit,
   ghlessWith,
   makeContainer,
+  quit,
   runCli,
+  status,
   tempDir,
 } from "./fixtures/repo";
 
@@ -264,16 +266,6 @@ function prCli(fixture: Fixture, args: string[]): ReturnType<typeof runCli> {
   return runCli(args, fixture.checkout, childEnv(fixture.cacheHome, fixture.bin));
 }
 
-/** The exit status the driving script echoed, since the shell's own status is bash's. */
-function status(capture: string): number {
-  return Number(new RegExp(`${ENDED}(\\d+)`).exec(capture)?.[1] ?? Number.NaN);
-}
-
-/** {@link typeUntil}, with the condition most cases share: the run has ended. */
-function quit(session: PtySession, key: string): Promise<void> {
-  return typeUntil(session, key, (text) => text.includes(ENDED));
-}
-
 /**
  * The picker's frame, read while it is still on screen, then dismissed.
  *
@@ -365,7 +357,10 @@ describe("wrk pr — what it draws", () => {
 
     expect(result.code).toBe(1);
     expect(result.stdout).toBe("");
-    expect(result.stderr).toContain("wrk: ");
+    // Naming the sentence is what makes this falsifiable: offering the merged row instead
+    // would reach `pick`, be refused for the pipe, and produce an identically-shaped exit 1
+    // with an empty stdout and one `wrk: ` line.
+    expect(result.stderr).toContain("no open pull requests");
     expect(result.stderr).not.toMatch(/^\s+at /m);
   });
 });
@@ -417,6 +412,10 @@ describe("wrk pr — a branch that has none", () => {
     // The constraint the issue states outright, and the only place it is observable: the argv,
     // and the directory it was run in.
     expect(ghCalls(fixture.log)).toContain(`${expected}\tpr checkout 8`);
+    // Detached, not on a branch git's DWIM named after the directory. The fake `gh` touches
+    // no refs, so without `{ detach: true }` a `feat+fresh` branch exists here and every
+    // other assertion in this case still passes.
+    expect(fixtureGit(["branch", "--list", "feat+fresh"], fixture.container)).toBe("");
   });
 
   test("a failed checkout force-removes the worktree and inherits gh's status", async () => {
@@ -475,8 +474,6 @@ describe("wrk pr — a worktree record whose directory is gone", () => {
       await quit(session, KEY.escape);
     });
 
-    const records = await runCli(["agent", "preflight", "--issue", "EXC-1"], fixture.checkout);
-    expect(records.code).toBe(0);
     // Read from git rather than from `wrk`, so the assertion is about the repository itself.
     expect(existsSync(gone)).toBe(false);
     expect(

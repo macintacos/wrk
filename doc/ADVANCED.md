@@ -57,9 +57,9 @@ owns TOML.
 jobs. **stdout is the machine channel**: every answer a command produces goes there, as
 one JSON object per run. **stderr is the human channel**: progress, warnings and failure
 messages, whatever the run's outcome. `--help` is the exception that proves it — a caller
-asking for help is a human, so it renders on stdout and no envelope is involved. The one
-command that takes that back is `wrk wt`, whose stdout is a path being fed to `cd`; see
-[The cd protocol](#the-cd-protocol).
+asking for help is a human, so it renders on stdout and no envelope is involved. The two
+commands that take that back are `wrk wt` and `wrk pr`, whose stdout is a path being fed
+to `cd`; see [The cd protocol](#the-cd-protocol).
 
 A global `--json` flag puts a command that would otherwise print for a human onto the same
 envelope. The agent-facing commands are JSON either way, because their callers parse them
@@ -148,8 +148,9 @@ directory name. `wrk wt` and `wrk pr` are carved out and nothing else is: `wrk -
 every `agent` command keep stdout. What a shim sees is therefore an empty stdout, which
 its emptiness guard turns into a `1` while the help itself lands on the terminal.
 
-The shims above and the keybindings that call them live in the dotfiles repo rather than
-here.
+`wrk pr` takes the same shim with `pr` in place of `wt` — the protocol belongs to the
+command, not to `wt`. The shims and the keybindings that call them live in the dotfiles
+repo rather than here.
 
 ## The worktree picker
 
@@ -246,6 +247,12 @@ leave behind as a ref nobody asked for.
 **If the checkout fails, the worktree is force-removed** and `gh`'s own exit status
 becomes `wrk`'s. Nothing reaches stdout, so the shim's guards leave you exactly where you
 were.
+
+**A created worktree is provisioned before the path is printed**, exactly as
+`wrk agent create`'s is: the codegraph index and the untracked `.env` are copied across
+and the mise toolchain is installed. That is a pause of seconds to minutes on the first
+checkout of a large repository, with those tools' own output on stderr. Every step is
+best-effort, so none of it can fail the checkout that preceded it.
 
 **With no open pull requests it refuses**: exit `1`, nothing on stdout. Unlike `wrk wt`, a
 single candidate does **not** skip the picker — choosing it may create a worktree and run

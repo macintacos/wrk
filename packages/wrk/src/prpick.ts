@@ -3,6 +3,11 @@
  * rendering beside them, whose answer is a worktree to `cd` into — created and checked out if
  * there is not one already.
  *
+ * Named for the command it implements, one letter short of it: [`./pr`](./pr) is the cache this
+ * reads through, and it was there first. A reader looking for `wrk pr`'s engine finds that file
+ * first and this one second, which is the wrong way round and the price of not renaming a
+ * module three landed branches already import.
+ *
  * The second command to consume [`@macintacos/wrk-picker`](../../picker/src/index.ts), and
  * like [`./wt`](./wt) it is a composition rather than an implementation: [`./pr`](./pr)
  * supplies the pull requests, [`./preview`](./preview) supplies the pane, [`./git`](./git)
@@ -17,16 +22,19 @@
  * draw — `pr.ts` documents why an empty map cannot stand in for that, and moving even that
  * wait behind the draw is EXC-1017's.
  *
- * **Merged pull requests are not offered.** `pr.ts` stores both states because the stack walk
- * and the `wt` annotation both need the merged ones; a picker whose answer is "go there and
- * review it" does not. That leaves {@link openPullRequests} as the only place the two
+ * **Merged pull requests are not offered.** `pr.ts` stores both states because `wt`'s merged
+ * marker needs them — `stack.ts` builds its edges from open rows alone, so merged layers drop
+ * out of the walk by construction — and a picker whose answer is "go there and review it" has
+ * no use for one either. That leaves {@link openPullRequests} as the only place the two
  * consumers of one cache disagree, and it disagrees explicitly.
  *
- * **Order is imposed here rather than inherited.** `gh` is asked for `sort:updated-desc`, but
- * that order does not survive the trip: the rows are stored as JSON and rebuilt through
- * `pr.ts`'s `dedupe`, which is a fold into a `Map` keyed by head ref. So the acceptance
- * criterion is met by sorting, and the tie-break on number is what makes the ordering total —
- * without it two rows sharing a timestamp are separated by nothing but which one the fold saw
+ * **Order is imposed here rather than inherited.** `gh` is asked for `sort:updated-desc` and
+ * that order does, as it happens, survive the trip today — `dedupe` folds into a `Map`, whose
+ * insertion order a re-`set` does not disturb, and JSON preserves an array. Depending on it
+ * would mean depending on all three of those at once, plus on `collect` concatenating the two
+ * state queries rather than interleaving them, none of which is this module's to hold still. So
+ * the criterion is met by sorting, and the tie-break on number is what makes the ordering total
+ * — without it two rows sharing a timestamp are separated by nothing but which one the fold saw
  * first, and the same repository draws in a different order run to run.
  *
  * **The destination is one of three, and only the third runs `gh`.** A live worktree on the
@@ -62,7 +70,7 @@ import { join } from "node:path";
 import { NotATerminal, type PickerRow, pick } from "@macintacos/wrk-picker";
 
 import { loadConfig } from "./config";
-import { type Cancelled, Refusal } from "./errors";
+import { type Cancelled, type CommandFailed, Refusal } from "./errors";
 import { checkoutPullRequest, type PullRequest } from "./gh";
 import { addWorktree, listWorktrees, pruneWorktrees, removeWorktree, type Worktree } from "./git";
 import { worktreeDirName } from "./naming";
@@ -70,7 +78,7 @@ import { note, PREFIX } from "./output";
 import { pullRequests } from "./pr";
 import { previewPullRequest } from "./preview";
 import { provision } from "./provision";
-import { checkoutFor, containerFor, isBareLayout } from "./repo";
+import { checkoutFor, containerFor, isBareLayout, UNCONVERTED } from "./repo";
 
 /** The prefix `listWorktrees` reports branch refs with, and `gh` reports head refs without. */
 const BRANCH_PREFIX = "refs/heads/";
@@ -107,10 +115,14 @@ const PRUNE_PROMPT = "prune every stale worktree record in this repository? ";
  * run's JSON envelope, so the property name is the field name. The properties are declared in
  * the order the envelope emits them.
  *
+ * Spelled out rather than named `Chosen` like `wt.ts`'s, which is the same word for a different
+ * shape. Nothing collides today, `index.ts` exporting nothing — but EXC-1014 settles that
+ * surface, and two `Chosen`s arriving at it is a rename under time pressure rather than now.
+ *
  * Deliberately **not** the picker's payload, which is the number alone — see
  * {@link pullRequestRows}.
  */
-export interface Chosen {
+export interface ChosenPullRequest {
   /** Absolute path of the worktree to move to. */
   worktree_path: string;
 
@@ -124,10 +136,11 @@ export interface Chosen {
  * Merged rows are dropped and the order is imposed rather than inherited — this module's
  * header has both reasons.
  *
- * `updatedAt` is compared as a string, which is exact rather than convenient:
- * {@link PullRequest.updatedAt} is pinned to second-precision UTC by `gh.ts`'s schema, so byte
- * order is chronological order and no date is parsed to find that out. The same comparison
- * `pr.ts`'s `beats` makes, and for the same reason.
+ * `updatedAt` is compared with `<` rather than through `localeCompare`, which is exact rather
+ * than convenient: {@link PullRequest.updatedAt} is pinned to second-precision UTC by `gh.ts`'s
+ * schema, so code-unit order *is* chronological order and no date is parsed and no collation
+ * table consulted to find that out. The same comparison `pr.ts`'s `beats` makes, and for the
+ * same reason.
  *
  * @param prs - Pull requests by head ref, as `pullRequests` returns them.
  * @returns The open ones, newest first, ties broken by the higher number. Empty when there are
@@ -139,7 +152,9 @@ export function openPullRequests(prs: ReadonlyMap<string, PullRequest>): PullReq
     .sort((left, right) =>
       left.updatedAt === right.updatedAt
         ? right.number - left.number
-        : right.updatedAt.localeCompare(left.updatedAt),
+        : right.updatedAt > left.updatedAt
+          ? 1
+          : -1,
     );
 }
 
@@ -189,6 +204,15 @@ export function pullRequestRows(open: readonly PullRequest[]): PickerRow<string>
  * @returns The record holding that branch. A detached worktree never matches, having no branch
  *   to join on.
  */
+// ponytail: the join is head-ref-only, which is not an identity across repositories. `gh`
+// reports `headRefName` as the branch name in the *head* repository, so a pull request opened
+// from a fork's `main` matches this repository's own `main` worktree and is answered as though
+// the pull request were already checked out there — a wrong destination, and no `gh pr checkout`
+// runs. The whole `pr-graph` cache is keyed this way (`pr.ts`), where the cost is a misplaced
+// marker; this is the first consumer that turns it into somewhere the user is sent. The fix is
+// `isCrossRepository` in `gh.ts`'s `PULL_REQUEST` — one more key in `FIELDS`, derived from the
+// schema — and declining the join for a cross-repo row. It is deferred because it invalidates
+// every stored entry once, which `pr.ts` already degrades to "no data" for.
 export function holderFor(worktrees: readonly Worktree[], headRef: string): Worktree | undefined {
   const ref = `${BRANCH_PREFIX}${headRef}`;
 
@@ -233,23 +257,17 @@ async function confirmPrune(stale: string): Promise<boolean> {
  * neither reject nor alter the path returned — `gh` has already succeeded by then, and a
  * missing `.env` is not a reason to report a worktree that exists as one that does not.
  *
+ * The layout this needs is checked by its **caller**, before the prune that may precede it —
+ * see {@link choosePullRequest}.
+ *
  * @param pull - The pull request to land.
  * @param from - The checkout to create from and provision from.
  * @param container - Where the worktree is placed, as a flat sibling.
  * @returns The absolute path of the worktree the pull request is now checked out in.
- * @throws {@link Refusal} if the repository is not a bare-repo container, so there is nowhere
- *   to put a sibling — the same refusal `createWorktree` raises, checked here rather than up
- *   front because the two destinations above it need no such layout.
  * @throws {@link CommandFailed} if `git worktree add` or `gh pr checkout` refused, carrying
  *   that command's own exit status, which becomes `wrk`'s.
  */
 async function landIn(pull: PullRequest, from: string, container: string): Promise<string> {
-  if (!(await isBareLayout(from))) {
-    throw new Refusal(
-      "not a bare-repo container, so there is nowhere to place a sibling worktree; convert it first with the repo-setup skill",
-    );
-  }
-
   const path = join(container, worktreeDirName(pull.headRefName));
   await addWorktree(path, from, { detach: true });
 
@@ -291,6 +309,10 @@ async function landIn(pull: PullRequest, from: string, container: string): Promi
  * @throws {@link Refusal} if `cwd` is in no repository, if there are no open pull requests, if
  *   a worktree has to be created in a repository that is not a bare-repo container, or if
  *   there is no terminal to draw in.
+ * @throws {@link CommandFailed} if any of the git or `gh` commands the chosen destination needs
+ *   refused — listing the worktrees, pruning them, adding one, or checking the pull request out.
+ *   Each carries that command's own exit status, which becomes `wrk`'s, and the checkout's is
+ *   the one a caller is most likely to see.
  * @throws Whatever `pullRequests` threw — an unreadable cache directory, which is left to
  *   surface with its stack rather than mapped. Unlike `wt`, where the graph is an annotation
  *   and an empty one merely draws less, here it *is* the rows: reporting it as "no open pull
@@ -304,13 +326,25 @@ async function landIn(pull: PullRequest, from: string, container: string): Promi
  * emitLine(chosen.worktree_path);
  * ```
  */
-export async function choosePullRequest(cwd: string): Promise<Chosen | null> {
+export async function choosePullRequest(cwd: string): Promise<ChosenPullRequest | null> {
   const container = await containerFor(cwd);
   if (container === null) {
     throw new Refusal("not a git repository; run this from inside the repository to look around");
   }
 
-  const config = await loadConfig({ container });
+  // Concurrent because neither depends on the other, and both sit ahead of the first frame on a
+  // command whose whole design is not to make the user wait for one — `checkoutFor` is several
+  // git spawns and `loadConfig` two file reads. Not folded in with `containerFor` above them,
+  // which has to have answered first: it supplies `loadConfig`'s container, and `checkoutFor`
+  // has nothing to resolve outside a repository. The same ordering, for the same reason, as
+  // `wt.ts`'s and `repo.ts`'s.
+  //
+  // `from` is resolved before the picker rather than after it because the preview pane renders
+  // from it on the very first frame: `gh` has to run somewhere that resolves this repository,
+  // and the container qualifies but a caller standing in it has no work tree.
+  const [config, resolved] = await Promise.all([loadConfig({ container }), checkoutFor(cwd)]);
+  const from = resolved ?? cwd;
+
   // The `??` is `noUncheckedIndexedAccess` demanding a total lookup, not a real absence:
   // `loadConfig` seeds every key `DEFAULTS` carries and this is one of them. `0` is the honest
   // value for the branch that cannot fire — refresh on every read, which is correct and merely
@@ -322,10 +356,6 @@ export async function choosePullRequest(cwd: string): Promise<Chosen | null> {
     throw new Refusal("no open pull requests to go to");
   }
 
-  // Resolved before the picker rather than after it, because the preview pane renders from it
-  // on the very first frame: `gh` has to be run somewhere that resolves this repository, and
-  // the container qualifies but a caller standing in it has no work tree.
-  const from = (await checkoutFor(cwd)) ?? cwd;
   const answers = new Map(open.map((pull) => [String(pull.number), pull]));
 
   const chosen = await picked(open, (payload, width) =>
@@ -342,6 +372,15 @@ export async function choosePullRequest(cwd: string): Promise<Chosen | null> {
     return { worktree_path: holder.path, number: pull.number };
   }
 
+  // Both remaining destinations end in a created worktree, so the layout that makes one
+  // possible is settled **before** the prune the other asks consent for. Checked inside
+  // `landIn` it would run after: the user would be asked to approve a repo-wide prune, the
+  // prune would happen, and the run would then refuse — consent spent on a run that could
+  // never have succeeded.
+  if (!(await isBareLayout(from))) {
+    throw new Refusal(UNCONVERTED);
+  }
+
   if (holder !== undefined) {
     if (!(await confirmPrune(holder.path))) return null;
     await pruneWorktrees(cwd);
@@ -353,9 +392,9 @@ export async function choosePullRequest(cwd: string): Promise<Chosen | null> {
 /**
  * Draws the list, in `wrk`'s vocabulary rather than the picker's.
  *
- * Split out so the {@link NotATerminal} translation is stated once and covers the confirmation
- * picker too — {@link confirmPrune} is reached only after this one has already drawn, so a
- * terminal that was not there has been refused before it can be asked a second time.
+ * {@link confirmPrune} needs no translation of its own, and that is an ordering property rather
+ * than anything this split buys: it is reached only once this pick has already drawn, so a
+ * stream that was not a terminal has been refused before there is a second picker to ask.
  */
 async function picked(
   open: readonly PullRequest[],
