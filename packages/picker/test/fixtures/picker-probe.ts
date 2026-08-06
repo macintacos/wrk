@@ -11,6 +11,7 @@
  * | --- | --- | --- |
  * | `PROBE_ROWS_FILE` | unset | A JSON file holding the rows verbatim. Set it when the scenario is about *what a row contains* — hostile escapes, colour, a payload distinct from the text. |
  * | `PROBE_COUNT` | `200` | Rows to generate when no file is given, deliberately far longer than any window. |
+ * | `PROBE_REPLACE_FILE` | unset | A JSON file of replacement rows, handed to `onOpen`'s `replace` the moment the file appears. |
  *
  * **The chosen payload goes to stdout, as JSON.** That is the channel `packages/wrk`
  * reserves for answers, and it is also what makes "Enter yields the payload, not the row
@@ -23,6 +24,8 @@
  * @packageDocumentation
  */
 
+import { existsSync } from "node:fs";
+
 import { NotATerminal, type PickerRow, pick } from "../../src/index";
 
 /** Synthetic rows: a short first column and a long second one, both varying in width. */
@@ -33,13 +36,37 @@ function generated(count: number): PickerRow<string>[] {
   }));
 }
 
+/**
+ * Waits for the file the driving test will drop, then answers the rows inside it.
+ *
+ * A file rather than a delay inside this process, so the *test* decides when the
+ * replacement lands relative to the keys it has already typed. A probe that swapped its
+ * rows after a fixed interval could only be raced against, and the whole point of the
+ * cases this serves is the ordering.
+ */
+async function landed(path: string): Promise<PickerRow<string>[]> {
+  while (!existsSync(path)) await Bun.sleep(25);
+  return JSON.parse(await Bun.file(path).text());
+}
+
 const file = process.env.PROBE_ROWS_FILE;
 const rows: PickerRow<string>[] = file
   ? JSON.parse(await Bun.file(file).text())
   : generated(Number(process.env.PROBE_COUNT ?? 200));
 
+const replaceFile = process.env.PROBE_REPLACE_FILE;
+
 try {
-  process.stdout.write(JSON.stringify(await pick({ rows })));
+  const chosen = await pick({
+    rows,
+    onOpen: replaceFile
+      ? (replace) => {
+          landed(replaceFile).then(replace);
+        }
+      : undefined,
+  });
+
+  process.stdout.write(JSON.stringify(chosen));
 } catch (error) {
   if (!(error instanceof NotATerminal)) throw error;
   process.stderr.write(`refused: ${error.message}\n`);

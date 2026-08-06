@@ -67,12 +67,28 @@
  * setting while breaking it. The selected row is marked with a gutter bar rather than with
  * an inverse or a colour, so the selection survives all of that with nothing else needed.
  *
+ * ## The rows can change underneath the user
+ *
+ * {@link PickOptions.onOpen} hands the caller a `replace`, so a picker can open on a stale
+ * cache and take the fresh rows when they arrive. That makes the keyboard the *second*
+ * writer into this component's state rather than the only one, which is why every piece of
+ * that state lives in the one reducer: two writers on one queue are applied in order,
+ * whereas two `useState`s let a keystroke be computed from a row set that has already been
+ * superseded.
+ *
+ * The selection survives a replacement because it is stored as the **payload**, not as an
+ * index — see {@link State.selected}. An index means nothing across a swap: rows appear
+ * above the one the user is on, and the annotations that arrive with them change every
+ * haystack, so the filter's answer moves as well. The cursor's index is derived from the
+ * payload on each render, and a payload that has left the list takes its selection with it,
+ * putting the cursor back at the top.
+ *
  * ## What is not here
  *
- * The preview pane (EXC-1012), replacing the row set while the picker is open (EXC-1013),
- * and the latency budget (EXC-1020) each belong to their own issue. The filter loop calls
- * {@link fuzzyMatch} once per row per keystroke and does not pre-compile the query; see the
- * `ponytail:` note on {@link useMatches} for when that stops being the right call.
+ * The preview pane (EXC-1012) and the latency budget (EXC-1020) each belong to their own
+ * issue. The filter loop calls {@link fuzzyMatch} once per row per keystroke and does not
+ * pre-compile the query; see the `ponytail:` note on {@link useMatches} for when that stops
+ * being the right call.
  *
  * @packageDocumentation
  */
@@ -80,7 +96,7 @@
 import chalk, { chalkStderr } from "chalk";
 import { Box, render, Text, useApp, useInput, useWindowSize } from "ink";
 import type { ReactElement } from "react";
-import { useMemo, useReducer } from "react";
+import { useEffect, useMemo, useReducer } from "react";
 import stringWidth from "string-width";
 
 import { fuzzyMatch } from "./fuzzy";
@@ -146,8 +162,11 @@ export interface PickerRow<T> {
    * What choosing this row resolves to — and deliberately not what it displays.
    *
    * A worktree path or a pull-request number, carried beside the columns rather than parsed
-   * back out of them. EXC-1013 restores a selection by this value across a row-set
-   * replacement, which is only possible because it is not the text.
+   * back out of them. It is also the row's **identity**: a replacement through
+   * {@link PickOptions.onOpen} restores the selection by matching this value with `===`,
+   * which is only possible because it is not the text. A payload therefore has to be
+   * something that comes back equal from a fresh fetch — a string or a number does, an
+   * object rebuilt from the same fields does not.
    */
   readonly payload: T;
   /** The row's columns, left to right. */
@@ -156,7 +175,7 @@ export interface PickerRow<T> {
 
 /** Everything {@link pick} needs. */
 export interface PickOptions<T> {
-  /** The rows, in the order they will be shown. Filtering never reorders them. */
+  /** The rows the picker opens on, in the order they will be shown. Filtering never reorders them. */
   readonly rows: readonly PickerRow<T>[];
   /**
    * What precedes the query on the first line. Defaults to `"❯ "`.
@@ -166,6 +185,21 @@ export interface PickOptions<T> {
    * and one shared rule is easier to keep than two.
    */
   readonly prompt?: string;
+  /**
+   * Called once, when the picker opens, with a function that replaces the whole row set.
+   *
+   * The channel for rows that are not ready when the picker has to be — `wrk wt` draws
+   * worktrees from a stale cache immediately and annotates them from the stack graph a
+   * moment later. `replace` may be called any number of times, from anywhere, and takes
+   * effect on the next frame; the user's query, and the row their cursor is on, both
+   * survive it. See {@link PickerRow.payload} for what "the row they are on" is matched by.
+   *
+   * A handle passed out rather than an async iterable of row sets: {@link pick} already
+   * returns the answer, so it cannot also return a handle, and a generator is a lot of
+   * ceremony for something that happens once or twice per run. Calling `replace` after the
+   * user has chosen is safe and does nothing.
+   */
+  readonly onOpen?: (replace: (rows: readonly PickerRow<T>[]) => void) => void;
 }
 
 /**
@@ -286,6 +320,9 @@ function prepare<T>(rows: readonly PickerRow<T>[]): Prepared<T>[] {
 // time — roughly 4–6 ms per keystroke at 5,000 rows, two orders of magnitude above what
 // this component's callers list. The fix, when EXC-1020's budget says it is needed, is
 // `compileQuery(query) -> (textCodePoints) => match` with each row's code points cached.
+// A replacement is the second trigger, and the more expensive one: it re-runs `prepare`
+// over every cell as well as this pass. It is also far rarer — one or two per run against
+// dozens of keystrokes — so EXC-1020 should measure the keystroke first.
 function useMatches<T>(rows: readonly Prepared<T>[], query: string): Match<T>[] {
   return useMemo(() => {
     if (query === "") return rows.map((row) => ({ row, positions: [] }));
@@ -409,18 +446,30 @@ function Row<T>({
   );
 }
 
-/** Everything a keystroke can change. */
-interface State {
+/** Everything the picker's two writers — the keyboard and {@link PickOptions.onOpen} — can change. */
+interface State<T> {
   readonly query: string;
-  readonly cursor: number;
+  /**
+   * The payload under the cursor, or `undefined` when nothing has been selected.
+   *
+   * The **payload**, never the index. An index is only meaningful against the filtered list
+   * it was taken from, and a replacement produces a different list: new rows shift the ones
+   * that stayed, and the annotations that arrive with them change every haystack, so the
+   * filter's answer moves too. Keeping the identity and deriving the index each render is
+   * what makes "the cursor stays where the user put it" true by construction rather than by
+   * a reconciliation step that would render one wrong frame on its way.
+   */
+  readonly selected: T | undefined;
   /** The first visible row, as a hint — {@link Picker} re-derives the real one each render. */
   readonly top: number;
+  /** The rows, as they stand. Replaced wholesale by {@link Action}'s `replace`. */
+  readonly rows: readonly PickerRow<T>[];
 }
 
 /**
- * A keystroke's effect, expressed so it can be applied to a state it has not seen yet.
+ * One writer's effect, expressed so it can be applied to a state it has not seen yet.
  *
- * This indirection is the whole reason there is a reducer here rather than three
+ * This indirection is the whole reason there is a reducer here rather than four
  * `useState`s. Ink parses a stdin *chunk* into however many events it holds and calls the
  * `useInput` handler for each one **synchronously, in a loop** — its own parser splits
  * repeated bytes precisely because a held-down key arrives that way. React does not
@@ -429,33 +478,67 @@ interface State {
  * character, three arrows move one row. A reducer applies each action to the result of the
  * last, which is the only shape that cannot regress into that.
  *
- * `last` and `listRows` ride along on a move because the reducer cannot derive them: the
- * match count depends on the filter and the row budget on the viewport. Both are constant
- * across a batch, since neither changes without a re-render.
+ * `replace` arrives from outside the keyboard entirely, and holding the rows here rather
+ * than in a second `useState` is what keeps the two writers on one queue: a refresh landing
+ * in the same batch as a keystroke is applied in order against the accumulated state, so
+ * neither can be computed from a version of the other that has already been superseded.
+ *
+ * `payloads` and `listRows` ride along on a move because the reducer cannot derive them:
+ * the filtered list depends on the matcher and the row budget on the viewport. Both are
+ * constant across a batch, since neither changes without a re-render.
  */
-type Action =
+type Action<T> =
   | { readonly type: "retype"; readonly edit: (query: string) => string }
   | {
       readonly type: "move";
       readonly delta: number;
-      readonly last: number;
+      readonly payloads: readonly T[];
       readonly listRows: number;
-    };
+    }
+  | { readonly type: "replace"; readonly rows: readonly PickerRow<T>[] };
 
-/** Applies one keystroke. See {@link Action} for why this is a reducer. */
-function reduce(state: State, action: Action): State {
+/**
+ * Where `selected` sits in the list currently on screen.
+ *
+ * Nothing selected, or a selected payload that is no longer in the list, answers the top
+ * row. That is the whole fallback: a payload that has left takes its selection with it, and
+ * the top is where a picker with no selection already puts the cursor. Carrying the old
+ * *index* across instead would leave the cursor on a row the user never moved onto, with no
+ * cue that anything had happened.
+ *
+ * Identity is `===`, so a payload has to be a value that survives a refetch — the worktree
+ * path or the pull-request number, per {@link PickerRow.payload}, rather than an object
+ * rebuilt from the same fields.
+ */
+function indexOf<T>(payloads: readonly T[], selected: T | undefined): number {
+  if (selected === undefined) return 0;
+
+  return Math.max(payloads.indexOf(selected), 0);
+}
+
+/** Applies one action. See {@link Action} for why this is a reducer. */
+function reduce<T>(state: State<T>, action: Action<T>): State<T> {
+  // Only the rows change. Leaving `query`, `selected` and `top` alone is the feature: the
+  // user keeps what they typed and the row they were on, wherever it has moved to.
+  if (action.type === "replace") return { ...state, rows: action.rows };
+
   if (action.type === "retype") {
     // A changed query invalidates the selection: the row under the cursor is probably not
     // in the new result set, and "wherever the cursor happened to be" is not a selection a
     // user made.
-    return { query: action.edit(state.query), cursor: 0, top: 0 };
+    return { ...state, query: action.edit(state.query), selected: undefined, top: 0 };
   }
 
-  const cursor = Math.min(Math.max(state.cursor + action.delta, 0), Math.max(action.last, 0));
+  const last = Math.max(action.payloads.length - 1, 0);
+  const cursor = Math.min(
+    Math.max(indexOf(action.payloads, state.selected) + action.delta, 0),
+    last,
+  );
 
   return {
     ...state,
-    cursor,
+    // `undefined` on an empty list, which is exactly right: there is nothing to select.
+    selected: action.payloads[cursor],
     top: Math.min(Math.max(state.top, cursor - action.listRows + 1, 0), cursor),
   };
 }
@@ -470,13 +553,28 @@ interface PickerProps<T> extends PickOptions<T> {
 }
 
 /** The component itself. */
-function Picker<T>({ rows, prompt, onDone }: PickerProps<T>): ReactElement {
+function Picker<T>({ rows, prompt, onOpen, onDone }: PickerProps<T>): ReactElement {
   const { exit } = useApp();
   const { rows: viewportRows } = useWindowSize();
-  const [{ query, cursor, top }, dispatch] = useReducer(reduce, { query: "", cursor: 0, top: 0 });
+  const [{ query, selected, top, rows: current }, dispatch] = useReducer(reduce<T>, {
+    query: "",
+    selected: undefined,
+    top: 0,
+    rows,
+  });
 
-  const prepared = useMemo(() => prepare(rows), [rows]);
+  const prepared = useMemo(() => prepare(current), [current]);
   const matches = useMatches(prepared, query);
+
+  // Handed out once, after the first frame. A `replace` that arrives after the user has
+  // chosen dispatches into an unmounted component, which React makes a no-op — the caller's
+  // refresh losing its race is not an error it should have to guard against.
+  useEffect(() => {
+    onOpen?.((next) => dispatch({ type: "replace", rows: next }));
+  }, [onOpen]);
+
+  const payloads = useMemo(() => matches.map((match) => match.row.payload), [matches]);
+  const cursor = indexOf(payloads, selected);
 
   // One line for the query, and the rest of the budget for rows. `floor` of a fraction
   // below one is strictly under `viewportRows` for any viewport worth rendering in, which
@@ -484,7 +582,8 @@ function Picker<T>({ rows, prompt, onDone }: PickerProps<T>): ReactElement {
   const listRows = Math.max(1, Math.floor(viewportRows * HEIGHT_BUDGET) - 1);
 
   // Derived rather than taken from state, so the cursor stays visible even when a resize has
-  // changed `listRows` under a `top` that was correct for the old one.
+  // changed `listRows` under a `top` that was correct for the old one — and, now, when a
+  // replacement has moved the selected row somewhere the old window does not reach.
   const windowTop = Math.min(Math.max(top, cursor - listRows + 1, 0), cursor);
 
   const finish = (payload: T | null) => {
@@ -497,7 +596,7 @@ function Picker<T>({ rows, prompt, onDone }: PickerProps<T>): ReactElement {
     if (key.return) return finish(matches[cursor]?.row.payload ?? null);
 
     if (key.upArrow || key.downArrow) {
-      dispatch({ type: "move", delta: key.upArrow ? -1 : 1, last: matches.length - 1, listRows });
+      dispatch({ type: "move", delta: key.upArrow ? -1 : 1, payloads, listRows });
       return;
     }
 
@@ -577,6 +676,7 @@ export async function pick<T>(options: PickOptions<T>): Promise<T | null> {
       <Picker
         rows={options.rows}
         prompt={options.prompt}
+        onOpen={options.onOpen}
         onDone={(payload) => {
           picked = payload;
           control.clear();
