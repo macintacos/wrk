@@ -35,8 +35,17 @@
  * choosing, and choosing does not stop it. `cli.ts` sets `process.exitCode` rather than calling
  * `process.exit` — `output.ts` says why — and `proc.ts`'s `run` does not `unref` its child, so
  * a pick made before `gh` answers keeps the process alive until it does. The wait moved from in
- * front of the draw to after the choice; the total is the same. Dropping it needs a
- * cancellation channel `PickOptions.onOpen` does not have, which is EXC-1014's to settle.
+ * front of the draw to after the choice; the total is the same.
+ *
+ * **The picker's README documents an `AbortController` for exactly this, and it is deliberately
+ * not used here.** Aborting would reach only the cold-cache case — a warm one answers from disk
+ * and refreshes in a detached process this one is not waiting on — and that is the single case
+ * where abandoning the fetch costs something real. `cached` writes the entry only once `refresh`
+ * resolves, and rethrows rather than falling back when there is no previous entry, so an
+ * aborted first run leaves the cache as cold as it found it. Every subsequent run would pay the
+ * same round trip and abandon it again, and the rows would stay bare until some other consumer
+ * warmed the entry. Waiting out a fetch that is about to fill the cache is the cheaper of the
+ * two, and it is bounded: it happens once per repository.
  *
  * **An un-annotated row carries one column, not five empty ones.** The picker sizes each
  * column across the whole row set and tolerates rows holding fewer of them, so a branch with
