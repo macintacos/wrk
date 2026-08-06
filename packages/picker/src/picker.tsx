@@ -1,3 +1,5 @@
+/** @jsxImportSource react */
+
 /**
  * The picker: a list you filter by typing, rendered inline beneath whatever the terminal
  * already held.
@@ -906,6 +908,12 @@ function Picker<T>({ rows, prompt, preview, onOpen, onDone }: PickerProps<T>): R
  * The picker erases its own frame on the way out, the way `fzf` does. A `wrk wt` wrapped in
  * a shell function is run dozens of times a day, and a picker that left its list behind
  * would push the user's prompt down twenty lines on every one of them.
+ *
+ * The erase rides on {@link PickerProps.onDone}, so it covers Escape and Enter and **not**
+ * `Ctrl-C`: Ink's own `exitOnCtrlC` unmounts directly, and by the time the log is finalised
+ * `clear()` is a no-op. Routing `Ctrl-C` through this component instead would mean
+ * `exitOnCtrlC: false` and a binding of its own — a change to how the picker exits, which is
+ * not a packaging issue's to make. `README.md` states the gap for a consumer.
  *
  * @param options - See {@link PickOptions}.
  * @returns The chosen row's payload, or `null`. `null` covers all three ways a run ends

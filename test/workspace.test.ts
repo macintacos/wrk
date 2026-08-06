@@ -77,25 +77,29 @@ describe("the picker's published tarball", () => {
   }
 
   test("carries the source, the manifest and the README, and nothing else", () => {
-    // Asserted as a shape rather than as a file list, so a new source module does
-    // not turn this red. What it pins is the `files` allowlist existing at all:
-    // without one the tarball also carries `tools/fzf-golden` and the 0.33 MB
-    // golden corpus, which is a Go program and its fixtures shipped to every
-    // consumer of a terminal picker.
-    for (const path of packed()) {
+    const paths = packed();
+
+    // The entry point first, so an empty list — a change in `bun pm pack`'s output
+    // format — fails here rather than letting the loop below pass over nothing.
+    expect(paths).toContain("src/index.ts");
+
+    // Then a shape rather than a file list, so a new source module does not turn
+    // this red. What it pins is the `files` allowlist existing at all: without one
+    // the tarball also carries `tools/fzf-golden` and the 0.33 MB golden corpus, a
+    // Go program and its fixtures shipped to every consumer of a terminal picker.
+    for (const path of paths) {
       expect(path).toMatch(/^(package\.json|README\.md|src\/)/);
     }
   });
 
-  test("carries the entry point its exports map names", () => {
-    expect(packed()).toContain("src/index.ts");
-  });
-
   test("is versioned, since a semver policy needs a version to start from", async () => {
-    // `0.0.0` is the scaffold's placeholder. The README's semver policy is written
-    // against a real `0.x`, where a minor may still move the surface.
+    // `0.0.0` is the scaffold's placeholder, and an absent field packs as `0.0.0`
+    // too — so the shape is asserted alongside it rather than just the inequality.
+    // The README's semver policy is written against a real `0.x`, where a minor may
+    // still move the surface.
     const picker = await readManifest("packages", "picker");
 
+    expect(picker.version).toMatch(/^\d+\.\d+\.\d+/);
     expect(picker.version).not.toBe("0.0.0");
   });
 });

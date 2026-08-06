@@ -1,7 +1,8 @@
 # @macintacos/wrk-picker
 
 A list you filter by typing, rendered **inline** beneath whatever the terminal already
-held — no alternate screen, no scrollback taken, and the frame erased on the way out.
+held — no alternate screen, no scrollback taken, and the frame erased behind it when the
+user chooses or dismisses.
 
 `fzf`'s shape, as a function you call rather than a process you pipe to. Rows arrive as
 data, each carrying a payload of your own; `pick()` resolves the payload of the row the
@@ -29,6 +30,33 @@ if (branch !== null) console.log(`you picked ${branch}`);
 **A TypeScript-aware runtime.** The package publishes its source: `exports` points at
 `src/index.ts`, so there is no build step, no `dist/`, and no separate `.d.ts` to fall out
 of step with the code. Bun runs it as-is. Plain `node` does not.
+
+**Two settings, if you type-check.** Publishing source means your compiler reads ours, so
+two of its options become part of this package's contract:
+
+```jsonc
+{
+  "compilerOptions": {
+    // `src/index.ts` reaches `src/picker.tsx`, and tsc refuses to read a `.tsx`
+    // at all without this. Any value works; the file carries its own
+    // `@jsxImportSource react` pragma, so your own JSX framework is unaffected.
+    "jsx": "react-jsx",
+    // The picker reads `process.stdin`, `process.stderr` and `process.env`.
+    "types": ["bun"] // or "node" — whichever your project already uses
+  }
+}
+```
+
+`@types/react` is **not** on that list: it is a direct dependency of this package, because
+a consumer of a terminal picker has no other reason to carry React types. `react` itself
+is a direct dependency for the matching reason. Ink declares it as a peer, and the usual
+worry about a peer-versus-direct React is a duplicate instance breaking hooks — that needs
+React values to cross the package boundary, and none do here. `pick()` resolves a payload;
+no element, component or context is ever exchanged. A second React in the tree is inert.
+
+**If you bundle**, pass `--external react-devtools-core`. Ink reaches its devtools through
+a dynamic import behind a runtime probe, so the branch is never taken — but a bundler
+follows it statically and fails on it.
 
 **A terminal on stdin and stderr.** The picker draws to **stderr**, so stdout stays free
 for whatever your program prints — the picker's own answer included. Neither stream being
@@ -60,6 +88,12 @@ Resolves the chosen row's `payload`, or `null`.
 on an empty result set — so a caller mapping this onto a cancellation should map all
 three. Throws `NotATerminal` if stdin or stderr is not a TTY.
 
+Two side effects worth knowing. `pick()` erases its frame on the Escape and Enter paths
+but **not on `Ctrl-C`**, which Ink handles itself and unmounts without giving the picker a
+chance to clear. And it borrows the process-global `chalk.level` for its lifetime and
+hands it back — so anything else writing chalk output while the picker is up sees the
+level the picker chose for stderr.
+
 | Option    | Type                                                | Required | What it does                                                       |
 | --------- | --------------------------------------------------- | -------- | ------------------------------------------------------------------ |
 | `rows`    | `readonly PickerRow<T>[]`                           | yes      | The rows to open on, in the order they will be shown.              |
@@ -74,11 +108,10 @@ something, and re-ranking on every keystroke moves the row the user was reaching
 **Keys.** Type to filter, `↑`/`↓` to move, `Enter` to choose, `Escape` to dismiss. With a
 preview pane, `PageUp`/`PageDown` scroll the pane independently of the list.
 
-**Colour.** Decided from stderr rather than stdout, because that is the stream being drawn
-on — a picker whose stdout is piped keeps its colour. `NO_COLOR` is honoured, and it
-strips a row's *own* colour too: passing that through would honour the letter of the
-setting while breaking it. The selection is marked with a gutter bar rather than an
-inverse, so it survives `NO_COLOR` with no escape sequence at all.
+**Colour.** Decided from stderr rather than stdout, so a picker whose stdout is piped
+keeps its colour. `NO_COLOR` is honoured and strips a row's *own* colour too; the
+selection is a gutter bar rather than an inverse, so it survives that with no escape
+sequence at all.
 
 **Height.** The frame is held to ~80% of the terminal's rows, measured from stderr and
 recomputed on resize. That is what keeps rendering inline: Ink takes the whole screen the
@@ -139,17 +172,22 @@ not an error to guard against. **Stopping that refresh is the caller's job**, an
 caller already owns everything it needs to do so:
 
 ```ts
-const refresh = new AbortController();
+async function choose() {
+  const refresh = new AbortController();
 
-try {
-  return await pick({
-    rows: cached,
-    onOpen: (replace) => {
-      fetchFresh({ signal: refresh.signal }).then(replace, () => {});
-    },
-  });
-} finally {
-  refresh.abort();
+  try {
+    return await pick({
+      rows: cached,
+      onOpen: (replace) => {
+        // The empty rejection handler is deliberate, and it is doing two jobs: swallowing
+        // the abort you just asked for, and swallowing a genuine fetch failure. Log the
+        // second if a user staring at a stale list deserves to be told why.
+        fetchFresh({ signal: refresh.signal }).then(replace, () => {});
+      },
+    });
+  } finally {
+    refresh.abort();
+  }
 }
 ```
 
@@ -190,6 +228,11 @@ screen, rename the window, write the clipboard through OSC 52, or reverse a row 
 reads as a different branch than the one it carries. **Ink does not already do this** — it
 preserves OSC by design, which is the family that matters most here.
 
+**Newlines and tabs are C0, so they go with the rest** — `sanitize("a\nb")` is `"ab"`.
+That is deliberate: a row that renders as two lines is how a frame outgrows its height
+budget. Split a document on newlines *before* sanitizing it, one line at a time, which is
+what the preview pane does.
+
 `pick()` runs every row through this itself. You need it only for text you render outside
 the picker.
 
@@ -208,10 +251,12 @@ is what a cheaper subsequence scan gets wrong. `positions` are **code-point** in
 `text`, not terminal cells; they differ for every wide, combining and emoji character.
 
 Exactness is pinned by a golden corpus of several thousand cases frozen from real fzf
-`v0.74.2` and replayed in this package's tests. It diverges from fzf only above fzf's own
-slab threshold, where fzf switches to a greedy fallback this port does not implement:
-`text.length × query.length` past `100 * 1024`. List rows are four orders of magnitude
-short of that.
+`v0.74.2` and replayed in this package's tests. Three things take it out of agreement, all
+far outside what a list of rows reaches: a query over 1000 characters or a
+`text.length × query.length` past `100 * 1024`, where fzf drops to a greedy fallback this
+port does not implement; a score past `32767`, where fzf's `int16` matrices wrap and this
+port's JavaScript arithmetic does not; and either side's Unicode tables moving out of step
+with the other.
 
 ## Semver policy
 
@@ -231,10 +276,15 @@ can be resolved without a major:
 - A new **parameter** on `onOpen` or `preview` — a callback that ignores it keeps
   compiling. This is the door left open for a cancellation signal.
 - A new export.
-- A widening of an accepted type, or a narrowing of a returned one.
+- A widening of a type you pass **in** (`rows`, `prompt`), or a narrowing of one the
+  package hands **back**.
 
 These **are** breaking: removing or renaming an export, adding a required field, changing
-what `pick()` resolves to, narrowing an accepted type, and changing which key does what.
+what `pick()` resolves to, narrowing a type you pass in, and changing which key does what.
+So is **widening a type the package passes into one of your callbacks** — `preview`'s
+`payload` and `width`, `onOpen`'s `replace` — which reads like the safe direction and is
+the opposite one: callback parameters are contravariant, so `width: number` becoming
+`width: number | null` stops every existing `preview` from type-checking.
 
 Behaviour not described here — the exact escape sequences a frame is made of, the score a
 particular query earns, the pane's 40% share — is implementation, and may move in a patch.
@@ -248,10 +298,10 @@ particular query earns, the pane's 40% share — is implementation, and may move
 - **The preview is not debounced.** One call per row the cursor passes through, and one
   per column count a resize drag passes through. Cache on `(payload, width)` — which you
   want anyway, per the resize contract above.
-- **Mid-session terminal *shrink* is out of scope.** The frame that meets a smaller
-  viewport is the one budgeted for the old size, so Ink takes the screen for exactly that
-  frame before the re-budgeted one lands. It settles back on the next frame. Every inline
-  Ink app behaves this way.
+- **A mid-session terminal *shrink* costs one frame.** The frame that meets the smaller
+  viewport was budgeted for the old size, so Ink takes the screen for that one frame
+  before the re-budgeted one lands. Every inline Ink app behaves this way; there is
+  nothing for a caller to do about it.
 
 ## Publishing
 
@@ -261,6 +311,6 @@ specifier and every install fails with `EUNSUPPORTEDPROTOCOL` — while the publ
 reports success, so nothing catches it.
 
 `bun pm pack --dry-run` lists what would ship. It must be `package.json`, this README, and
-`src/` — the repository's `test/workspace.test.ts` asserts exactly that, because the
+`src/` — the repository's `test/workspace.test.ts` asserts that shape, because the
 `tools/fzf-golden` Go generator and the 0.33 MB golden corpus beside it are six times the
 size of the package and belong to nobody but the tests.

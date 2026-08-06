@@ -53,10 +53,11 @@
  * A bundler follows the dynamic import statically anyway and dies on `devtools.js`'s
  * `react-devtools-core` import. `--external react-devtools-core` clears it without adding a
  * React devtools package to a CLI's dependency tree — for EXC-986, which is the issue that
- * will actually ship a bundle. The picker's own tarball is unaffected: it publishes
- * TypeScript source, so nothing bundles it on the way out. Only that one module needs
- * excluding: `ws`, the other import in `devtools.js`, is a real dependency of Ink and
- * resolves.
+ * will actually ship a bundle. The picker's own tarball is unaffected, since it publishes
+ * TypeScript source and nothing bundles it on the way out, but a *consumer* bundling the
+ * picker into their CLI inherits this exactly; `packages/picker/README.md` says so under
+ * Requirements. Only that one module needs excluding: `ws`, the other import in
+ * `devtools.js`, is a real dependency of Ink and resolves.
  *
  * @packageDocumentation
  */
