@@ -45,8 +45,8 @@ import { chooseWorktree } from "./wt";
  * Its human output goes to stderr through {@link note}, not to stdout. That is
  * [`./output`](./output)'s rule rather than a preference — `emit` owns stdout so that a
  * run's stdout is one JSON document, and the only stdout this program allows past it are
- * commander's own `--help` and an interactive component's escape sequences, neither of which
- * a printed recipe is. `--json` is what puts the same answer on the envelope instead.
+ * commander's own `--help` — `wt` excepted, see below — and an interactive component's escape
+ * sequences, neither of which a printed recipe is. `--json` is what puts the same answer on the envelope instead.
  *
  * `agent preflight` takes the opposite side of that flag and never consults it: its only
  * output is the envelope, because every one of its callers is a script that parses it. See
@@ -58,6 +58,14 @@ import { chooseWorktree } from "./wt";
  * through the back door: it is a *second machine* shape, for the editor's `WorktreeCreate`
  * hook, whose consumer is a `cd` rather than a parser. Which of the two it writes is the
  * only thing that flag decides.
+ *
+ * `wt` is the picker, and takes the same shape from the other end. It never consults
+ * {@link wantsJson} either, but for the opposite reason to `preflight`'s: its default output
+ * *is* the envelope, so the flag has nothing left to select and passing it changes nothing.
+ * `--print-path` is `--hook`'s second machine shape under another name, for the `cd` shim
+ * rather than for the editor. Passing both is the one contradictory pair this tree accepts in
+ * silence, and `--print-path` wins — the safe way round, since the caller that spells it is
+ * the one feeding stdout to `cd`.
  *
  * `--branch` is a `requiredOption` rather than validated in the action, which puts its
  * absence on the route this module's own `main` documents as already correct: commander
@@ -101,10 +109,18 @@ export function buildProgram(): Command {
     // documented shim this stdout is fed straight to `cd`, so a usage block there is a
     // directory name rather than a document. Scoped to `wt` alone, because `configureOutput`
     // replaces this command's inherited configuration object rather than mutating the shared
-    // one, so `wrk --help` and every `agent` command keep stdout. The cost is cosmetic and
-    // accepted: commander still derives help width and colour support from `process.stdout`,
-    // so help written here while stdout is a pipe wraps at 80 columns and renders unstyled.
-    .configureOutput({ writeOut: (text: string) => process.stderr.write(text) })
+    // one, so `wrk --help` and every `agent` command keep stdout.
+    //
+    // The width has to move with the text: commander reads it from `process.stdout` by
+    // default, which under the shim is a pipe, so help would wrap at 80 columns on a terminal
+    // twice that wide. `80` is spelled out rather than left to `undefined` because the typing
+    // declares a `number` — it is commander's own fallback, so a non-TTY stderr wraps exactly
+    // as it does today. Colour is deliberately left alone: its default routes through
+    // commander's `NO_COLOR` / `FORCE_COLOR` handling, worth more than matching the stream.
+    .configureOutput({
+      writeOut: (text: string) => process.stderr.write(text),
+      getOutHelpWidth: () => process.stderr.columns ?? 80,
+    })
     .action(async ({ printPath }) => {
       const chosen = await chooseWorktree(process.cwd());
       // Thrown rather than returned, because throwing unwinds: the whole of what the cd

@@ -65,7 +65,7 @@ the same shape, and may go anywhere in the argument list.
 `wrk wt` is the one you type by hand. It lists every worktree in the repository except the
 one you are standing in, annotated with where each branch sits in the PR stack, and
 filters as you type. No child process can move the shell that launched it, so it prints
-where to go and a three-line shell function does the `cd` —
+where to go and a small shell function does the `cd` —
 [doc/ADVANCED.md](doc/ADVANCED.md#the-cd-protocol) has both shims and the rest of it.
 
 ## Configuration

@@ -14,10 +14,11 @@
  * the runs slow enough to have printed progress.
  *
  * Two things on stdout are **not** answers and are not this module's to route. Commander
- * renders `--help` there itself, which is correct — a caller asking for help is a human.
- * And an interactive component must be constructed against stderr (Ink's `render` takes a
- * `stdout` option) rather than allowed its default, or its escape sequences land in the
- * machine channel.
+ * renders `--help` there itself, which is correct — a caller asking for help is a human. One
+ * command takes that back: `wrk wt`'s stdout is a *path*, so it routes its own help to stderr
+ * rather than hand a shell function a usage block to `cd` into. And an interactive component
+ * must be constructed against stderr (Ink's `render` takes a `stdout` option) rather than
+ * allowed its default, or its escape sequences land in the machine channel.
  *
  * There is one answer that is deliberately **not** JSON, and it is routed through here
  * rather than written behind this module's back: {@link emitLine}, the shape the editor's
@@ -137,9 +138,9 @@ export function emit(payload: object): void {
  * nothing else — no braces, no quotes, no key. Handing it the envelope would not be a
  * stricter answer, it would be a directory that cannot be entered.
  *
- * The pickers' `--print-path`, arriving with `wrk wt` and `wrk pr`, will be the second, and
- * wants the same line for the same reason: a Node process cannot move its parent shell, so
- * the path goes to stdout and a shell function does the `cd`. That caller adds an obligation
+ * `wrk wt`'s `--print-path` is the second, and `wrk pr`'s will be the third; each wants the
+ * same line for the same reason: a Node process cannot move its parent shell, so the path
+ * goes to stdout and a shell function does the `cd`. That caller adds an obligation
  * this function cannot carry on its own — a run that produced no choice must leave stdout
  * **empty** — which is why cancelling throws {@link Cancelled} rather than reaching here.
  *

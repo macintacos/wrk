@@ -144,9 +144,10 @@ and sends you to your home directory.
 **A picker's own `--help` renders on stderr**, which is the one place `wrk` departs from
 the rule above it. Commander writes help to stdout, and for every other command that is
 right — but a picker's stdout is a path being fed to `cd`, so a usage block there is a
-directory name. The carve-out is exactly the commands that print a path: `wrk --help` and
-every `agent` command keep stdout. What a shim sees is therefore an empty stdout, which
-its emptiness guard turns into a `1` while the help itself lands on the terminal.
+directory name. `wrk wt` is the only such command today, so it is the only one carved out:
+`wrk --help` and every `agent` command keep stdout. What a shim sees is therefore an empty
+stdout, which its emptiness guard turns into a `1` while the help itself lands on the
+terminal.
 
 `wrk pr` arrives in [EXC-1018](https://linear.app/macintacos/issue/EXC-1018); the shims
 above and the keybindings that call them live in the dotfiles repo rather than here.
@@ -166,15 +167,16 @@ row: it has no work tree to stand in. A detached worktree is a row like any othe
 as `(detached 1a2b3c4)`.
 
 Each row is its branch, then its pull request when it has one: the stack marker,
-`#number`, the position in the stack, and the title. Type to filter — the query runs
-across the whole row, so `1016 preview` matches a row whose branch and title each carry
-one of those words.
+`#number`, the position in the stack, and the title. Type to filter. The query is one
+fuzzy pattern matched across the whole row, so it can span columns — but only in the order
+they are drawn: `1016 preview` matches a branch named for the issue with `preview` in its
+title, while `preview 1016` does not.
 
-| Marker      | Means                                                        |
-| ----------- | ------------------------------------------------------------ |
-| `glyphs.top`    | Nothing is stacked on this branch.                        |
-| `glyphs.bottom` | The bottom layer that has not merged yet.                 |
-| `glyphs.merged` | The pull request has landed; the worktree is still here.  |
+| Configured at   | Marks                                                   |
+| --------------- | ------------------------------------------------------- |
+| `glyphs.top`    | Nothing is stacked on this branch.                      |
+| `glyphs.bottom` | The bottom layer that has not merged yet.               |
+| `glyphs.merged` | The pull request has landed; the worktree is still here. |
 
 The glyphs and their colours are configurable — see
 [Configuration](../README.md#configuration).
@@ -187,9 +189,11 @@ list of one. With none it refuses: exit `1`, nothing on stdout.
 
 **With `gh` absent, logged out, offline or rate-limited, rows render un-annotated** — the
 branch name alone, exactly as if there were no pull requests to look for — and nothing is
-said about it on stderr. The annotation is read through the shared `pr-graph` cache and
-refreshed behind the draw rather than in front of it, so a stale graph is what you see
-rather than a picker waiting on the network.
+said about it on stderr. The annotation is read through the shared `pr-graph` cache, and
+once that cache has been filled the refresh runs behind the draw rather than in front of
+it, so a stale graph is what you see rather than a picker waiting on the network. The very
+first run in a repository is the exception: with nothing stored there is nothing to draw,
+so it waits for `gh` once.
 
 `--print-path` selects the bare-path stdout shape the `cd` protocol above consumes.
 Without it the answer is the usual envelope, `{worktree_path, branch}`, with `branch` null

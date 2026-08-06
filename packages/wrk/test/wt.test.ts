@@ -263,14 +263,18 @@ const GHLESS: string = (() => {
 })();
 
 /**
- * Environment for one `wrk wt` child: no `gh`, and a cache of its own.
+ * Environment for one `wrk wt` child: no `gh`, a cache of its own, and no config at all.
  *
- * The private `XDG_CACHE_HOME` is not tidiness. Without it these runs read and write the
+ * Neither redirection is tidiness. Without `XDG_CACHE_HOME` these runs read and write the
  * developer's real `~/.cache/wrk`, so a case would depend on what a previous *real* `wrk wt`
- * had left there — and would leave entries of its own behind.
+ * had left there — and would leave entries of its own behind. Without `XDG_CONFIG_HOME` they
+ * read the developer's real `~/.config/wrk/config.toml`, and the annotated case asserts
+ * against `DEFAULTS.glyphs`, so anyone who has ever set `[glyphs]` would fail this suite for a
+ * reason that has nothing to do with the code. `config.test.ts` shields the same variable for
+ * the same reason.
  */
 function childEnv(cacheHome: string = tempDir()): Record<string, string> {
-  return { PATH: GHLESS, XDG_CACHE_HOME: cacheHome };
+  return { PATH: GHLESS, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: tempDir() };
 }
 
 /** Height of the pty every driven case runs in, matching `picker.test.ts`'s. */
@@ -307,7 +311,9 @@ async function driveWt(
   const out = join(tempDir(), "stdout");
   const argv = args.map((argument) => `"${argument}"`).join(" ");
   const env = childEnv(cacheHome);
-  const exports = `PATH="${env.PATH}" XDG_CACHE_HOME="${env.XDG_CACHE_HOME}"`;
+  const exports = Object.entries(env)
+    .map(([name, value]) => `${name}="${value}"`)
+    .join(" ");
   const script = `cd "${cwd}" && ${exports} "${process.execPath}" "${CLI}" wt ${argv} >"${out}"; echo "EXIT:$?"`;
   const run = await runInPty(script, { rows: ROWS, drive });
 
@@ -318,18 +324,19 @@ async function driveWt(
  * Types `key` until the run reacts to it, rather than once and hopefully.
  *
  * A frame on screen does **not** mean the terminal is ready to be typed at. Ink enables raw
- * mode from an effect, and React runs effects after the frame they belong to has been
- * written — so between the list appearing and the line discipline going raw there is a window
- * in which a keystroke is not delivered to the application at all. An `ESC` sent inside it is
- * echoed back as `^[` and buffered, waiting for a newline that a picker's user never sends,
- * and the run hangs with its list still up. That was observed here, in about one driven run
- * in ten, and it is a property of driving a terminal faster than a person can — which is why
- * this belongs in the harness rather than in the picker.
+ * mode from an effect, and React runs effects after the frame they belong to has been written,
+ * so a key sent the instant the list appears lands in the gap and is **dropped** — the same
+ * window `picker.test.ts`'s `opened()` names. It is observable from the outside: the byte is
+ * echoed back by the line discipline (an `ESC` arrives as a literal `^[` in the capture) and
+ * the picker never sees it, leaving the run hung with its list still up. About one driven run
+ * in ten did that here, which is a property of driving a terminal faster than fingers can.
  *
- * Re-typing closes it. The condition is the run *ending*, which both keys this is used with
- * cause and which the driving script says out loud, so nothing here has to know whether the
- * key chose a row or dismissed the list. A key that arrives after the run has already ended
- * lands on `bash`, which is running a `-c` script and never reads its stdin.
+ * Re-typing closes it, and does so on a *condition* rather than on the fixed settle the
+ * sibling suite sleeps for — which is what `fixtures/pty.ts` warns a guessed interval costs on
+ * a loaded machine. The condition is the run *ending*, which both keys this is used with cause
+ * and which the driving script says out loud, so nothing here has to know whether the key
+ * chose a row or dismissed the list. A key arriving after the run has already ended lands on
+ * `bash`, which is running a `-c` script and never reads its stdin.
  *
  * @throws If the run never ended, which is the genuine hang this is not allowed to hide.
  */
@@ -355,7 +362,10 @@ async function quit(session: PtySession, key: string): Promise<void> {
  * frame in a capture, and the picker erases its own frame on the way out — so a capture read
  * after the run has ended reports the shell's next line, not the list.
  *
- * @param needle - Text whose appearance means the picker has drawn.
+ * @param needle - Text whose appearance means the frame is **complete**, which is why every
+ *   caller passes something from the *last* row rather than the first: a needle drawn earlier
+ *   would let the snapshot catch a frame still being written, and it is the assertions about
+ *   what a frame does *not* contain that a short frame passes for free.
  * @returns The frame's non-empty lines, and the whole capture for the escape-sequence claims.
  */
 async function frameWhileOpen(
@@ -439,7 +449,7 @@ describe("wrk wt — what it offers", () => {
     expect(result.code).toBe(0);
     expect(result.stdout).toBe(`${worktrees[0]}\n`);
     expect(result.stderr).toContain("wrk: ");
-    expect(result.stderr).toContain("only other worktree");
+    expect(result.stderr).toContain("only worktree on offer");
   });
 
   test("no other worktree is a refusal, not an empty pick", async () => {
@@ -492,7 +502,8 @@ describe("wrk wt — the stack annotation, end to end", () => {
     mkdirSync(dirname(entry), { recursive: true });
     writeFileSync(entry, JSON.stringify(rows));
 
-    const { lines } = await frameWhileOpen(checkout, "#12", cacheHome);
+    // The last row's title, not its `#12`: the needle has to be the last thing drawn.
+    const { lines } = await frameWhileOpen(checkout, "the EXC-2/thing-2 change", cacheHome);
 
     const rendered = lines.join("\n");
     expect(rendered).toContain(`${DEFAULTS.glyphs.bottom} #11 1/2 the EXC-1/thing-1 change`);
@@ -510,6 +521,9 @@ describe("wrk wt — the two stdout shapes and --help", () => {
       worktree_path: worktrees[0],
       branch: "EXC-1/thing-1",
     });
+    // `toEqual` is indifferent to key order, and order is one of the envelope's two
+    // guarantees — the same assertion `conformance.test.ts` makes for `agent create`.
+    expect(Object.keys(JSON.parse(result.stdout))).toEqual(["worktree_path", "branch"]);
   });
 
   test("--help writes nothing to stdout, because stdout is a path the shim cds into", async () => {

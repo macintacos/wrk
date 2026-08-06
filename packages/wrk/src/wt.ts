@@ -49,8 +49,7 @@
 import { NotATerminal, type PickerColumn, type PickerRow, pick } from "@macintacos/wrk-picker";
 
 import { type ByStackPosition, loadConfig, type WrkConfig } from "./config";
-import type { Cancelled } from "./errors";
-import { Refusal } from "./errors";
+import { type Cancelled, Refusal } from "./errors";
 import type { PullRequest } from "./gh";
 import { listWorktrees, showToplevel, type Worktree } from "./git";
 import { debug, note, PREFIX } from "./output";
@@ -71,7 +70,7 @@ const SHORT_SHA = 7;
  * rather than imported because it is the *user's* key: someone configuring
  * `cache.ttls."pr-graph"` is configuring this read.
  */
-const TTL = "pr-graph";
+const ENTRY = "pr-graph";
 
 /**
  * What choosing a row means: where to go, and what is checked out there.
@@ -91,8 +90,13 @@ export interface Chosen {
   branch: string | null;
 }
 
-/** Which stack positions carry a marker — `config.ts`'s three, by name. */
-type Position = keyof ByStackPosition;
+/**
+ * Which stack positions carry a marker — `config.ts`'s three, by name.
+ *
+ * Deliberately not `Position`, which `stack.ts` already uses internally for something else
+ * entirely — a root ref and a depth. One file reading both should not have to notice.
+ */
+type Marked = keyof ByStackPosition;
 
 /** A branch ref without its `refs/heads/`, which is how `gh` and the stack graph key on it. */
 function short(ref: string): string {
@@ -126,18 +130,18 @@ function chosen(worktree: Worktree): Chosen {
 /**
  * Which of the three markers a row takes, or `null` for none.
  *
- * **A one-layer stack takes none**, which is the issue's own constraint: there is no "where am
- * I" to answer, and marking it both the top and the bottom would say nothing. `height === 1`
- * is the whole test, because `stackGraph` has already dropped merged and cyclic branches.
- *
  * A merged branch is marked from its **row's own state** rather than from a position, since
  * `stack.ts` builds its edges from open pull requests only and a merged branch is therefore in
  * no stack at all. A middle layer takes no marker while still reporting its position — being
  * neither end is exactly what there is to say about it.
+ *
+ * @param node - The branch's place in its stack, or `undefined` when it has none *worth
+ *   drawing* — which {@link annotate} decides, so that "a one-layer stack is not a stack" is
+ *   settled once rather than here and again at the position column.
  */
-function marker(pull: PullRequest, node: StackNode | undefined): Position | null {
+function marker(pull: PullRequest, node: StackNode | undefined): Marked | null {
   if (pull.state === "MERGED") return "merged";
-  if (node === undefined || node.height === 1) return null;
+  if (node === undefined) return null;
   if (node.top) return "top";
 
   return node.depth === 1 ? "bottom" : null;
@@ -148,6 +152,12 @@ function marker(pull: PullRequest, node: StackNode | undefined): Position | null
  *
  * An empty array rather than four empty columns — see this module's header for why that is the
  * difference between degrading and merely looking degraded.
+ *
+ * **`stacked` is where the issue's constraint lives**: a one-layer stack gets neither a
+ * position nor a marker, because there is no "where am I" to answer and marking it both the
+ * top and the bottom would say nothing. `height > 1` is the whole test, since `stackGraph` has
+ * already dropped merged and cyclic branches — and it is computed once here rather than in
+ * both {@link marker} and the position column, which could otherwise drift into disagreeing.
  */
 function annotate(
   branch: string,
@@ -159,14 +169,15 @@ function annotate(
   if (pull === undefined) return [];
 
   const node = stack.get(branch);
-  const position = marker(pull, node);
+  const stacked = node !== undefined && node.height > 1 ? node : undefined;
+  const position = marker(pull, stacked);
 
   return [
     position === null
       ? { text: "" }
       : { text: config.glyphs[position], color: config.colours[position] },
     { text: `#${pull.number}` },
-    { text: node !== undefined && node.height > 1 ? `${node.depth}/${node.height}` : "" },
+    { text: stacked === undefined ? "" : `${stacked.depth}/${stacked.height}` },
     { text: pull.title },
   ];
 }
@@ -191,11 +202,14 @@ export function candidates(worktrees: readonly Worktree[], here: string | null):
  * The graph is built here rather than passed in, so the rows and the positions drawn on them
  * cannot be derived from two different sets of pull requests.
  *
- * **The payload is the worktree's path**, and both halves of `PickerRow.payload`'s contract
- * are why. It has to survive a row-set replacement by `===`, which a string does and a
- * `{ worktree_path, branch }` object rebuilt from a fresh `git worktree list` would not; and
- * it has to be unique across the rows, which git guarantees by never listing two worktrees at
- * one path. {@link chooseWorktree} maps it back to the answer it emits.
+ * **The payload is the worktree's path.** `PickerRow.payload` has to be unique across the
+ * rows, because the cursor resolves to the first `===` hit and a duplicate makes every later
+ * row carrying it unreachable — and git guarantees that by never listing two worktrees at one
+ * path, where a `{ worktree_path, branch }` object would rely on nobody rebuilding it. That
+ * second half is not idle: the same contract requires a payload to still compare `===` after a
+ * row-set replacement, which is how EXC-1017 will push annotations in behind the draw. A
+ * string satisfies it today and will still satisfy it then. {@link chooseWorktree} maps the
+ * path back to the answer it emits.
  *
  * @param offered - The worktrees to draw, as {@link candidates} answered.
  * @param prs - Pull requests by head ref, as `pullRequests` returns them. An empty map is the
@@ -236,7 +250,11 @@ async function annotations(
   config: WrkConfig,
 ): Promise<Map<string, PullRequest>> {
   try {
-    return await pullRequests(container, config.cache.ttls[TTL] ?? 0, { background: true });
+    // The `??` is `noUncheckedIndexedAccess` demanding a total lookup, not a real absence:
+    // `loadConfig` seeds every key `DEFAULTS` carries and this is one of them. `0` is the
+    // honest value for the branch that cannot fire — refresh on every read, which is correct
+    // and merely slower — the same call `preview.ts` makes for the same key.
+    return await pullRequests(container, config.cache.ttls[ENTRY] ?? 0, { background: true });
   } catch (error) {
     debug(
       `the pull-request graph could not be read, so rows render un-annotated: ${String(error)}`,
@@ -280,16 +298,19 @@ export async function chooseWorktree(cwd: string): Promise<Chosen | null> {
     throw new Refusal("not a git repository; run this from inside the repository to look around");
   }
 
-  // Concurrent: neither answer depends on the other, and both are process spawns.
+  // Concurrent with each other, but not with the `containerFor` above them, which has to have
+  // answered first: `listWorktrees` throws outside a repository rather than reporting it, so
+  // folding all three together would turn the refusal above into git's own exit 128. The same
+  // ordering, for the same reason, as `repo.ts`'s `checkoutFor`.
   const [here, all] = await Promise.all([showToplevel(cwd), listWorktrees(cwd)]);
   const offered = candidates(all, here);
 
   const only = offered[0];
   if (only === undefined) {
-    throw new Refusal("this is the repository's only worktree, so there is nowhere else to go");
+    throw new Refusal("this repository has no other worktree to go to");
   }
   if (offered.length === 1) {
-    note(`${PREFIX}${label(only)} is the only other worktree, so there was nothing to pick`);
+    note(`${PREFIX}${label(only)} is the only worktree on offer, so there was nothing to pick`);
 
     return chosen(only);
   }
