@@ -71,10 +71,9 @@
  *
  * {@link PickOptions.onOpen} hands the caller a `replace`, so a picker can open on a stale
  * cache and take the fresh rows when they arrive. That makes the keyboard the *second*
- * writer into this component's state rather than the only one, which is why every piece of
- * that state lives in the one reducer: two writers on one queue are applied in order,
- * whereas two `useState`s let a keystroke be computed from a row set that has already been
- * superseded.
+ * writer into this component's state rather than the only one, which is why the rows sit in
+ * the reducer beside the query and the selection: one atom and one queue, so the two writes
+ * are applied in the order React received them.
  *
  * The selection survives a replacement because it is stored as the **payload**, not as an
  * index — see {@link State.selected}. An index means nothing across a swap: rows appear
@@ -82,6 +81,15 @@
  * haystack, so the filter's answer moves as well. The cursor's index is derived from the
  * payload on each render, and a payload that has left the list takes its selection with it,
  * putting the cursor back at the top.
+ *
+ * Ordering is all the reducer gives, and it is worth being exact about the rest. A `move`
+ * carries the payloads of the last *render* ({@link Action}), so a replacement that lands
+ * ahead of a keystroke in the same batch leaves that keystroke answering the old list — for
+ * one batch, costing at worst a cursor at the top. That window stays shut in practice
+ * because Ink mounts a **legacy, non-concurrent** root unless asked otherwise, which is a
+ * dependency {@link pick} records at the `render` call rather than one this component can
+ * enforce. [`../test/reducer.test.ts`](../test/reducer.test.ts) pins the behaviour either
+ * way, since a driven terminal cannot put two writers in one batch on purpose.
  *
  * ## What is not here
  *
@@ -164,9 +172,12 @@ export interface PickerRow<T> {
    * A worktree path or a pull-request number, carried beside the columns rather than parsed
    * back out of them. It is also the row's **identity**: a replacement through
    * {@link PickOptions.onOpen} restores the selection by matching this value with `===`,
-   * which is only possible because it is not the text. A payload therefore has to be
-   * something that comes back equal from a fresh fetch — a string or a number does, an
-   * object rebuilt from the same fields does not.
+   * which is only possible because it is not the text.
+   *
+   * Two obligations follow, and both are the caller's. A payload has to come back equal from
+   * a fresh fetch — a string or a number does, an object rebuilt from the same fields does
+   * not — and it has to be **unique across the rows**, because the cursor resolves to the
+   * first `===` hit and a duplicate makes every later row carrying it unreachable.
    */
   readonly payload: T;
   /** The row's columns, left to right. */
@@ -196,8 +207,12 @@ export interface PickOptions<T> {
    *
    * A handle passed out rather than an async iterable of row sets: {@link pick} already
    * returns the answer, so it cannot also return a handle, and a generator is a lot of
-   * ceremony for something that happens once or twice per run. Calling `replace` after the
-   * user has chosen is safe and does nothing.
+   * ceremony for something that happens once or twice per run.
+   *
+   * A `replace` that arrives after the user has chosen is ignored, so a refresh losing its
+   * race is not an error to guard against — but *stopping* that refresh is the caller's job,
+   * and the cue is {@link pick}'s promise resolving. There is deliberately no cancellation
+   * channel here yet; see EXC-1014, which settles this surface before the first publish.
    */
   readonly onOpen?: (replace: (rows: readonly PickerRow<T>[]) => void) => void;
 }
@@ -450,19 +465,22 @@ function Row<T>({
 interface State<T> {
   readonly query: string;
   /**
-   * The payload under the cursor, or `undefined` when nothing has been selected.
+   * The payload under the cursor, or `undefined` when nothing is selected.
    *
-   * The **payload**, never the index. An index is only meaningful against the filtered list
-   * it was taken from, and a replacement produces a different list: new rows shift the ones
-   * that stayed, and the annotations that arrive with them change every haystack, so the
-   * filter's answer moves too. Keeping the identity and deriving the index each render is
-   * what makes "the cursor stays where the user put it" true by construction rather than by
-   * a reconciliation step that would render one wrong frame on its way.
+   * The index is derived from this on each render and never stored; this module's header
+   * has why an index cannot survive a replacement.
    */
   readonly selected: T | undefined;
   /** The first visible row, as a hint — {@link Picker} re-derives the real one each render. */
   readonly top: number;
-  /** The rows, as they stand. Replaced wholesale by {@link Action}'s `replace`. */
+  /**
+   * The rows, as they stand.
+   *
+   * Seeded from {@link PickOptions.rows} and thereafter owned here, replaced wholesale by
+   * {@link Action}'s `replace`. Reading a prop once into state is a shape worth distrusting
+   * on sight, so: {@link pick} renders {@link Picker} exactly once and never re-renders it
+   * from outside, which means that prop cannot change and there is nothing to sync back to.
+   */
   readonly rows: readonly PickerRow<T>[];
 }
 
@@ -480,12 +498,15 @@ interface State<T> {
  *
  * `replace` arrives from outside the keyboard entirely, and holding the rows here rather
  * than in a second `useState` is what keeps the two writers on one queue: a refresh landing
- * in the same batch as a keystroke is applied in order against the accumulated state, so
- * neither can be computed from a version of the other that has already been superseded.
+ * in the same batch as a keystroke is applied in order against the accumulated state.
  *
  * `payloads` and `listRows` ride along on a move because the reducer cannot derive them:
- * the filtered list depends on the matcher and the row budget on the viewport. Both are
- * constant across a batch, since neither changes without a re-render.
+ * the filtered list depends on the matcher and the row budget on the viewport. Neither
+ * changes without a re-render, so both are constant across a batch of keystrokes — but a
+ * `replace` in that batch does not re-render either, which makes the guarantee **ordering,
+ * not freshness**. A move sitting behind a replacement answers the row list it was built
+ * from, and if that answer is not in the new rows the cursor falls to the top for one
+ * frame, exactly as a dropped row does.
  */
 type Action<T> =
   | { readonly type: "retype"; readonly edit: (query: string) => string }
@@ -498,29 +519,48 @@ type Action<T> =
   | { readonly type: "replace"; readonly rows: readonly PickerRow<T>[] };
 
 /**
- * Where `selected` sits in the list currently on screen.
+ * Where `selected` sits in the list currently on screen — the cursor.
  *
- * Nothing selected, or a selected payload that is no longer in the list, answers the top
- * row. That is the whole fallback: a payload that has left takes its selection with it, and
- * the top is where a picker with no selection already puts the cursor. Carrying the old
- * *index* across instead would leave the cursor on a row the user never moved onto, with no
- * cue that anything had happened.
+ * Nothing selected, or a payload no longer in the list, answers the top row. That is the
+ * whole fallback: a payload that has left takes its selection with it, and the top is where
+ * a picker with no selection already puts the cursor. Carrying the old *index* across
+ * instead would leave the cursor on a row the user never moved onto, with no cue that
+ * anything had happened.
  *
- * Identity is `===`, so a payload has to be a value that survives a refetch — the worktree
- * path or the pull-request number, per {@link PickerRow.payload}, rather than an object
- * rebuilt from the same fields.
+ * Matched by `===`, on the identity contract {@link PickerRow.payload} states.
  */
-function indexOf<T>(payloads: readonly T[], selected: T | undefined): number {
+function cursorFor<T>(payloads: readonly T[], selected: T | undefined): number {
   if (selected === undefined) return 0;
 
   return Math.max(payloads.indexOf(selected), 0);
 }
 
-/** Applies one action. See {@link Action} for why this is a reducer. */
-function reduce<T>(state: State<T>, action: Action<T>): State<T> {
-  // Only the rows change. Leaving `query`, `selected` and `top` alone is the feature: the
-  // user keeps what they typed and the row they were on, wherever it has moved to.
-  if (action.type === "replace") return { ...state, rows: action.rows };
+/**
+ * Applies one action. See {@link Action} for why this is a reducer.
+ *
+ * Exported for [`../test/reducer.test.ts`](../test/reducer.test.ts) and not from
+ * [`./index`](./index): a batch is two actions applied with no render between them, which a
+ * driven terminal cannot schedule on purpose and a direct call is. The same split
+ * `stripSgr` has.
+ */
+export function reduce<T>(state: State<T>, action: Action<T>): State<T> {
+  if (action.type === "replace") {
+    // `query` and `top` are left alone: the user keeps what they typed, and the window is
+    // re-derived from the cursor each render anyway. `selected` is kept too — that is the
+    // feature — but only while the payload is still somewhere in the rows. Letting a
+    // departed one linger would make the fallback hold for exactly one replacement: the
+    // cursor renders at the top because the payload cannot be found, and then a later
+    // replacement that brings it back teleports the cursor out from under a user who has
+    // been sitting on that top row for a while. `onOpen` promises any number of
+    // replacements, so the drop has to be a state transition rather than a rendering
+    // accident. A payload still in `rows` but filtered out by a standing query is the one
+    // case this cannot see; `retype` clears the selection on every keystroke, so reaching it
+    // takes a replacement that keeps a row while making it stop matching, and it costs a
+    // cursor at the top either way.
+    const kept = action.rows.some((row) => row.payload === state.selected);
+
+    return { ...state, rows: action.rows, selected: kept ? state.selected : undefined };
+  }
 
   if (action.type === "retype") {
     // A changed query invalidates the selection: the row under the cursor is probably not
@@ -531,7 +571,7 @@ function reduce<T>(state: State<T>, action: Action<T>): State<T> {
 
   const last = Math.max(action.payloads.length - 1, 0);
   const cursor = Math.min(
-    Math.max(indexOf(action.payloads, state.selected) + action.delta, 0),
+    Math.max(cursorFor(action.payloads, state.selected) + action.delta, 0),
     last,
   );
 
@@ -556,7 +596,7 @@ interface PickerProps<T> extends PickOptions<T> {
 function Picker<T>({ rows, prompt, onOpen, onDone }: PickerProps<T>): ReactElement {
   const { exit } = useApp();
   const { rows: viewportRows } = useWindowSize();
-  const [{ query, selected, top, rows: current }, dispatch] = useReducer(reduce<T>, {
+  const [{ query, selected, top, rows: current }, dispatch] = useReducer(reduce, {
     query: "",
     selected: undefined,
     top: 0,
@@ -566,15 +606,15 @@ function Picker<T>({ rows, prompt, onOpen, onDone }: PickerProps<T>): ReactEleme
   const prepared = useMemo(() => prepare(current), [current]);
   const matches = useMatches(prepared, query);
 
-  // Handed out once, after the first frame. A `replace` that arrives after the user has
-  // chosen dispatches into an unmounted component, which React makes a no-op — the caller's
-  // refresh losing its race is not an error it should have to guard against.
+  // Handed out after the first frame — once, since `pick` renders this component exactly
+  // once and the prop it passes therefore never changes identity. A `replace` arriving after
+  // the user has chosen dispatches into an unmounted component, which React makes a no-op.
   useEffect(() => {
     onOpen?.((next) => dispatch({ type: "replace", rows: next }));
   }, [onOpen]);
 
   const payloads = useMemo(() => matches.map((match) => match.row.payload), [matches]);
-  const cursor = indexOf(payloads, selected);
+  const cursor = cursorFor(payloads, selected);
 
   // One line for the query, and the rest of the budget for rows. `floor` of a fraction
   // below one is strictly under `viewportRows` for any viewport worth rendering in, which
@@ -639,7 +679,7 @@ function Picker<T>({ rows, prompt, onOpen, onDone }: PickerProps<T>): ReactEleme
  * a shell function is run dozens of times a day, and a picker that left its list behind
  * would push the user's prompt down twenty lines on every one of them.
  *
- * @param options - The rows and the prompt; see {@link PickOptions}.
+ * @param options - See {@link PickOptions}.
  * @returns The chosen row's payload, or `null`. `null` covers all three ways a run ends
  *   without a choice: Escape, `Ctrl-C` (Ink's own `exitOnCtrlC`), and Enter on an empty
  *   result set. A caller mapping this onto a cancellation should map all three.
@@ -685,6 +725,12 @@ export async function pick<T>(options: PickOptions<T>): Promise<T | null> {
       // stderr, because stdout is the machine channel. `patchConsole: false` because a
       // library has no business rerouting its host's `console`, and `packages/wrk` writes its
       // human output through its own `note()` rather than through `console` anyway.
+      //
+      // `concurrent` is left at Ink's default of `false`, which is a decision rather than an
+      // omission: the legacy root flushes a dispatch from a promise before the next stdin
+      // event is read, so a row replacement cannot sit unrendered behind a keystroke. The
+      // component survives that window anyway — see its header — but anyone turning
+      // concurrent rendering on should re-read that section first.
       { stdout: process.stderr, patchConsole: false },
     );
     control.clear = instance.clear;

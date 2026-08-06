@@ -36,6 +36,9 @@ function generated(count: number): PickerRow<string>[] {
   }));
 }
 
+/** Flipped once the picker has resolved, which is what bounds {@link landed}. */
+let picked = false;
+
 /**
  * Waits for the file the driving test will drop, then answers the rows inside it.
  *
@@ -43,9 +46,21 @@ function generated(count: number): PickerRow<string>[] {
  * replacement lands relative to the keys it has already typed. A probe that swapped its
  * rows after a fixed interval could only be raced against, and the whole point of the
  * cases this serves is the ordering.
+ *
+ * The wait ends with the picker rather than on a timer: while the frame is up, a file that
+ * has not arrived yet is simply a refresh still running, and there is nothing to give up
+ * on. Once the user has chosen there is, and a poll that kept its timer referenced past
+ * that point would hold the process open with its answer already written — surfacing as a
+ * bare `bun test` timeout with nothing pointing at the cause.
+ *
+ * @returns The replacement rows, or nothing if the picker closed first.
  */
-async function landed(path: string): Promise<PickerRow<string>[]> {
-  while (!existsSync(path)) await Bun.sleep(25);
+async function landed(path: string): Promise<PickerRow<string>[] | undefined> {
+  while (!existsSync(path)) {
+    if (picked) return undefined;
+    await Bun.sleep(25);
+  }
+
   return JSON.parse(await Bun.file(path).text());
 }
 
@@ -61,11 +76,14 @@ try {
     rows,
     onOpen: replaceFile
       ? (replace) => {
-          landed(replaceFile).then(replace);
+          landed(replaceFile).then((next) => {
+            if (next) replace(next);
+          });
         }
       : undefined,
   });
 
+  picked = true;
   process.stdout.write(JSON.stringify(chosen));
 } catch (error) {
   if (!(error instanceof NotATerminal)) throw error;

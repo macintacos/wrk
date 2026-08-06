@@ -637,10 +637,14 @@ describe("the row set can be replaced while the picker is open", () => {
   });
 
   test("a standing query survives the replacement and filters what arrived", async () => {
-    // The interleaving case: the async writer must leave what the keystroke writer put in
-    // the same state alone. `beta-stack` is an annotation that makes a row the query had
-    // already rejected start matching it, so a query that was merely *kept* is not enough —
-    // it has to have been re-run against the rows that arrived.
+    // Deliberately sequential — the keystroke's frame has settled before the rows land, and
+    // the claim is that the replacement leaves the query standing and re-runs it over what
+    // arrived. `beta-stack` is an annotation that makes a row the query had already rejected
+    // start matching it, so a query that was merely *kept* would not be enough.
+    //
+    // Two writers in one React batch is the other half of this, and no driven terminal can
+    // schedule that on purpose; [`./reducer.test.ts`](./reducer.test.ts) applies the actions
+    // directly for it.
     const stacked: Row[] = [
       { payload: "/wt/alpha", columns: [{ text: "wt-alpha" }, { text: "beta-stack" }] },
       { payload: "/wt/beta", columns: [{ text: "wt-beta" }, { text: "solo" }] },
