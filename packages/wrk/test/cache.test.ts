@@ -31,7 +31,7 @@ import {
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { cached, cachePath, readCache, writeCache } from "../src/cache";
+import { cached, cachedBehind, cachePath, readCache, writeCache } from "../src/cache";
 import { cacheSlug } from "../src/naming";
 
 /** A container path with enough separators to prove the per-repo directory is flattened. */
@@ -574,6 +574,79 @@ describe("cached", () => {
 
       finish.resolve("first");
       await first;
+    });
+  });
+});
+
+describe("cachedBehind", () => {
+  test("returns a fresh entry and starts nothing", async () => {
+    await withRoot(async (root) => {
+      const key = { name: ENTRY, container: CONTAINER, root };
+      await writeCache(key, "fresh");
+
+      let spawns = 0;
+      const text = await cachedBehind(key, 60_000, () => {
+        spawns++;
+      });
+
+      expect(text).toBe("fresh");
+      expect(spawns).toBe(0);
+    });
+  });
+
+  test("returns the stale entry rather than the refresh it started", async () => {
+    await withRoot(async (root) => {
+      const key = { name: ENTRY, container: CONTAINER, root };
+      await writeCache(key, "stale");
+      await age(cachePath(key), 90_000);
+
+      let spawns = 0;
+      const text = await cachedBehind(key, 60_000, () => {
+        spawns++;
+      });
+
+      // The whole point of the function: the answer is the old value and the refresh is
+      // somebody else's problem, so what is on disk is untouched apart from its mtime.
+      expect(text).toBe("stale");
+      expect(spawns).toBe(1);
+      expect(await readCache(key)).toBe("stale");
+    });
+  });
+
+  test("stamps the entry as it passes, so the next call does not start a second refresh", async () => {
+    await withRoot(async (root) => {
+      const key = { name: ENTRY, container: CONTAINER, root };
+      await writeCache(key, "stale");
+      await age(cachePath(key), 90_000);
+
+      let spawns = 0;
+      const spawn = (): void => {
+        spawns++;
+      };
+
+      await cachedBehind(key, 60_000, spawn);
+      // Same TTL, immediately afterwards: only the touch can have made this one fresh. Without
+      // it, every redraw of a prompt starts another refresh of an entry already being refreshed.
+      const second = await cachedBehind(key, 60_000, spawn);
+
+      expect(second).toBe("stale");
+      expect(spawns).toBe(1);
+    });
+  });
+
+  test("answers null for an entry that does not exist, and starts nothing", async () => {
+    await withRoot(async (root) => {
+      let spawns = 0;
+      const text = await cachedBehind({ name: ENTRY, container: CONTAINER, root }, 60_000, () => {
+        spawns++;
+      });
+
+      // A cold cache has nothing to hand back, and a caller that could not tell that apart from
+      // an empty answer would draw "no pull requests" for a repository that has plenty. Starting
+      // a refresh anyway is the other half: `utimes` cannot create the entry, so there would be
+      // nothing to debounce the next caller with and every invocation would start one.
+      expect(text).toBeNull();
+      expect(spawns).toBe(0);
     });
   });
 });

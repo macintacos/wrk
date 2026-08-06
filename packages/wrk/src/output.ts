@@ -159,6 +159,30 @@ export function note(message: string): void {
 }
 
 /**
+ * Writes one diagnostic line to stderr, but only when `WRK_DEBUG` is set.
+ *
+ * For the paths that are correct when they work and *also* correct-looking when they do not
+ * — a refresh that was supposed to happen in the background and silently did not. Nothing
+ * downstream of one of those can tell, so the line is the only signal there is, and it has
+ * to be available in the field rather than only under a debugger.
+ *
+ * An environment variable rather than a `--json`-style flag because the caller this exists
+ * for is a shell prompt calling `wrk` as a library on every redraw, not a command someone
+ * typed a flag onto. It routes through {@link note}, so a diagnostic can never reach the
+ * machine channel, and carries {@link PREFIX} like every other line `wrk` composes.
+ *
+ * Any non-empty value enables it. `WRK_DEBUG=0` therefore *enables* it too, which is the
+ * shell's own convention for "exported means set" and matches how `cache.ts` reads
+ * `XDG_CACHE_HOME`; a variable someone exported to `0` to turn this off would be a surprise
+ * worth having, not a bug worth branching on.
+ *
+ * @param message - The line, without a trailing newline or a prefix.
+ */
+export function debug(message: string): void {
+  if (process.env.WRK_DEBUG) note(`${PREFIX}${message}`);
+}
+
+/**
  * Writes a thrown value's human message to stderr and answers the status to exit with.
  *
  * The three exit rules in one function — see this module's header. It is deliberately
