@@ -351,6 +351,26 @@ describe("clearPreviews", () => {
     expect(await entries(root)).toEqual([`${name}.lock`]);
   });
 
+  test("leaves a staging file in place rather than breaking the write it belongs to", async () => {
+    // `cache.ts` stages every write to `<entry>.<pid>.<n>.tmp` and then renames it over the
+    // entry. Removing one mid-flight makes that rename fail `ENOENT`, and `cached` writes
+    // outside its own stale-contents fallback — so the rejection reaches whatever was drawing.
+    // A purge is designed to run concurrently with a render, so this is the same reasoning the
+    // lock case above rests on, applied to the other sibling a cache write leaves beside an entry.
+    const bin = makeBin({ stdout: "#22 Simplify README\n" });
+    process.env.PATH = bin;
+    const root = cacheRoot();
+
+    await previewPullRequest(PR, 100, { container: CONTAINER, root });
+    const [name = ""] = await entries(root);
+    const staging = `${name}.${process.pid}.0.tmp`;
+    writeFileSync(join(containerDir(root), staging), "half a render");
+
+    await clearPreviews({ container: CONTAINER, root });
+
+    expect(await entries(root)).toEqual([staging]);
+  });
+
   test("is a no-op when nothing was ever cached for the container", async () => {
     await expect(
       clearPreviews({ container: CONTAINER, root: cacheRoot() }),

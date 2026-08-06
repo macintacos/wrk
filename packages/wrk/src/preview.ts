@@ -30,8 +30,9 @@
  * belongs in the pane — an empty pane says nothing at all — so the text comes back, and is
  * stored, exactly like a successful render. Throwing instead would be worse in the very case
  * that matters: {@link cached} serves previous contents when a refresh throws, and on a
- * first-ever lookup there are none. The single failure carrying no message of its own is an
- * absent `gh`, where {@link viewPullRequest} answers `null` and {@link NO_GH} is substituted.
+ * first-ever lookup there are none. The single failure carrying no message of its own is a `gh`
+ * that could not be run at all, where {@link viewPullRequest} answers `null` and {@link NO_GH}
+ * is substituted.
  *
  * Nothing here reads configuration files, resolves a repository, or spawns anything directly.
  * The container arrives as a parameter exactly as it does in `cache.ts` and `config.ts`, which
@@ -60,7 +61,7 @@ const PR_CACHE = "pr-graph";
  * Leading segment of every preview entry's name.
  *
  * Chosen so it cannot prefix-match {@link PR_CACHE}, which shares the same per-repo directory:
- * {@link clearPreviews} decides what to remove on this prefix alone, and a `pr-graph-preview`
+ * {@link clearPreviews} recognises what it may remove by this prefix, and a `pr-graph-preview`
  * spelling would leave the PR graph one careless `startsWith` away from being purged with its
  * previews. Every character is inside `cacheSlug`'s alphabet, so the prefix survives onto disk
  * unfolded — which is what makes that filename test work at all.
@@ -70,22 +71,24 @@ const PREFIX = "pr-preview";
 /**
  * Staleness threshold a caller inherits when it supplies none.
  *
- * Read off {@link DEFAULTS} rather than restated, so the two cannot drift. The fallback is
- * `noUncheckedIndexedAccess` demanding a total lookup rather than a case expected to fire —
- * `config.ts` ships that key today. `0` is the honest value for it: refresh on every read,
- * which is correct and merely slower, where an invented constant would silently reinstate the
- * divergence this default exists to prevent.
+ * The fallback is `noUncheckedIndexedAccess` demanding a total lookup rather than a case
+ * expected to fire — `config.ts` ships that key today. `0` is the honest value for it: refresh
+ * on every read, which is correct and merely slower, where an invented constant would silently
+ * reinstate the divergence this default exists to prevent.
  */
 const DEFAULT_TTL = DEFAULTS.cache.ttls[PR_CACHE] ?? 0;
 
 /**
- * Shown when `gh` is absent — the one failure that carries no message of its own.
+ * Shown when `gh` could not be run — the one failure that carries no message of its own.
  *
- * Worded over both of the causes `gh.ts` documents as indistinguishable at the spawn, which is
- * why it says nothing about the directory: an absent `gh` and an unreadable `cwd` produce the
- * same `ENOENT`, and a sentence asserting the wrong one sends a reader chasing it.
+ * Worded over **both** of the causes `gh.ts` documents as indistinguishable at the spawn, and
+ * modelled on `checkoutPullRequest`'s message for that reason: a missing `gh` and a `cwd` that
+ * no longer exists produce the same `ENOENT`, and this is a sentence a user reads, so asserting
+ * the more likely one would send someone who has `gh` installed chasing an install. A worktree
+ * torn down under a running picker is exactly how the second cause reaches here.
  */
-const NO_GH = "gh is not installed, so there is nothing to preview — see https://cli.github.com\n";
+const NO_GH =
+  "could not run gh — check that it is installed (https://cli.github.com) and that the directory exists\n";
 
 /** Options for {@link previewPullRequest}. */
 export interface PreviewOptions extends Omit<CacheKey, "name"> {
@@ -115,10 +118,12 @@ export interface PreviewOptions extends Omit<CacheKey, "name"> {
  * @param width - Column count to render at, which is also what makes `gh` render markdown
  *   rather than fall back to plain text. Expected to be a positive integer: it reaches `gh` as
  *   `GH_FORCE_TTY` and reaches disk as part of the entry name, so a fractional or negative
- *   value produces a strange render under a strange filename rather than an error.
+ *   value produces a strange render under a strange filename rather than an error — and a
+ *   fractional one puts a `.` in that filename, which {@link clearPreviews} then reads as a
+ *   sibling and leaves behind.
  * @param options - See {@link PreviewOptions}.
- * @returns What to display. Never empty: a failed lookup yields `gh`'s own message, and an
- *   absent `gh` yields {@link NO_GH}.
+ * @returns What to display. A failed lookup yields `gh`'s own message and an unrunnable `gh`
+ *   yields {@link NO_GH}, so the pane goes blank only if `gh` itself exited saying nothing.
  * @throws Whatever {@link cached} throws — a cache directory that cannot be written. `gh`
  *   itself failing is not among them; that is a render.
  *
@@ -127,9 +132,11 @@ export interface PreviewOptions extends Omit<CacheKey, "name"> {
  * const pane = await previewPullRequest(22, columns, { container, cwd: checkout });
  * ```
  */
-// ponytail: every distinct width mints an entry of its own and only `clearPreviews` reaps
-// them, so dragging a terminal resize leaves one file per column count it passed through.
-// Round the width to a step, or sweep the oldest entries here, if that ever piles up.
+// ponytail: every distinct width is a cache miss by construction, so dragging a terminal
+// resize does not merely leave a file per column count it passed through — it spawns a `gh`
+// per column count, and `cached`'s single-flight lock cannot collapse any of it because each
+// width is a different key. Quantising the width here would contradict the exact-column-count
+// contract, so the fix belongs to the caller: debounce the resize before drawing.
 export async function previewPullRequest(
   number: number,
   width: number,
@@ -137,9 +144,11 @@ export async function previewPullRequest(
 ): Promise<string> {
   const { cwd, ttl = DEFAULT_TTL, ...key } = options;
 
-  // ponytail: a transient `gh` failure is stored for a full TTL like any successful render,
-  // which is deliberate — the alternative re-runs a failing `gh` on every redraw of the picker.
-  // Give a nonzero render a shorter threshold of its own if a flaky network makes it visible.
+  // ponytail: a failed render is stored for a full TTL like a successful one, which is
+  // deliberate for a flaky network — the alternative re-runs a failing `gh` on every redraw.
+  // It reads worse for the NO_GH case, the one failure a user actively fixes: the pane keeps
+  // saying so until the entry ages out or `clearPreviews` runs. Give a nonzero render a
+  // shorter threshold of its own if either becomes visible.
   return cached(
     { ...key, name: `${PREFIX}-${number}-${width}` },
     ttl,
@@ -155,15 +164,21 @@ export async function previewPullRequest(
  * waiting out a shared TTL would leave the pane describing pull requests the list no longer
  * shows. The passive half is {@link DEFAULT_TTL}.
  *
- * The PR cache itself is left standing — see {@link PREFIX} for what keeps the two apart — as
- * is any `.lock` directory. Skipping locks is not tidiness: `cache.ts` documents why taking a
- * refresh lock from its holder is a larger problem than it looks, and a render running
- * concurrently with this call is exactly a holder. The lock is released by whoever took it.
+ * Entries are removed; the **siblings a cache write leaves beside one are not**. `cache.ts`
+ * puts two kinds of file next to an entry — the `.lock` a refresh holds, and the
+ * `.<pid>.<n>.tmp` a write is staged in before being renamed over the entry — and removing
+ * either mid-flight breaks a caller that has done nothing wrong. Taking a lock from its holder
+ * is the larger problem `cache.ts` documents at length; deleting a staging file makes its
+ * rename fail `ENOENT`, and `cached` writes outside its own stale-contents fallback, so that
+ * rejection surfaces in whatever was drawing. A purge is designed to run *concurrently* with a
+ * render, so both are live rather than theoretical. The PR cache itself is left standing too —
+ * see {@link PREFIX} for what keeps the two apart.
+ *
+ * A repository with no cache directory yet is not an error: nothing was stored, which is the
+ * state the caller asked for.
  *
  * @param key - Which repository's previews to discard. Takes {@link CacheKey}'s container and
  *   root, since a purge is addressed to every name rather than to one.
- * @returns Nothing. A repository with no cache directory yet is not an error — nothing was
- *   stored, which is the state the caller asked for.
  * @throws If the directory exists but cannot be read, or an entry cannot be removed. An
  *   unreadable cache is a real fault, and reporting it as "nothing to do" would leave a stale
  *   pane with no explanation.
@@ -180,9 +195,13 @@ export async function clearPreviews(key: Omit<CacheKey, "name">): Promise<void> 
 
   await Promise.all(
     names
-      // The trailing separator matters as much as the prefix: without it a future `pr-previews`
-      // entry would be swept by a call that never meant to touch it.
-      .filter((name) => name.startsWith(`${PREFIX}-`) && !name.endsWith(".lock"))
+      // Two conditions, each answering a different question. The trailing separator matters as
+      // much as the prefix: without it a future `pr-previews` entry would be swept by a call
+      // that never meant to touch it. And the dot test asks "is this an entry, or a sibling of
+      // one?" rather than enumerating today's suffixes — an entry name is the folded key plus a
+      // hex digest, which holds no `.`, while every sibling `cache.ts` writes does. Stated as a
+      // property, so a third suffix invented there is excluded without an edit here.
+      .filter((name) => name.startsWith(`${PREFIX}-`) && !name.includes("."))
       .map((name) => rm(join(directory, name), { force: true })),
   );
 }
