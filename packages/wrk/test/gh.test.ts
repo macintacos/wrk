@@ -5,9 +5,13 @@
  * **The argv assertions are the point of this suite.** The separate-window rule the epic
  * rests on — open and merged PRs queried apart, each with its own `--limit` — is invisible
  * in the returned value and observable only in what was actually run, so `gh` is replaced by
- * a real executable on `PATH` that logs `<cwd>\t<argv>\t<GH_FORCE_TTY>\t<GH_PAGER set?>` and
- * emits scripted output. Asserting the parsed rows alone would stay green through a rewrite
- * that asked for `--state all` in one call.
+ * a real executable on `PATH` that logs its cwd, its argv and the environment it was handed, then
+ * emits scripted output. Asserting the parsed rows alone would stay green through a rewrite that
+ * asked for both states in one call.
+ *
+ * The environment columns are there for the same reason. Three ordinary variables a developer may
+ * have exported — `GH_REPO`, `CLICOLOR_FORCE`, `GH_FORCE_TTY` — each break this adapter, and the
+ * only evidence they were shed is what the child saw.
  *
  * `process.env.PATH` is set in-process rather than passed through: `proc.ts`'s `run` reads
  * `process.env` at call time, so the fake reaches the real adapter with no injection seam
@@ -83,23 +87,33 @@ function shQuote(text: string): string {
 }
 
 /**
+ * The environment variables the fake reports back, in the order it writes them.
+ *
+ * Each is recorded through `${VAR-unset}`, which distinguishes all three states the assertions
+ * care about: `"unset"` for absent, `""` for present-but-emptied, and the value otherwise. The
+ * `:-` form would collapse the first two, and `+set` would collapse the last two — which is the
+ * difference between pinning "the pager is disabled" and pinning only "something was exported".
+ */
+const PROBED = ["GH_FORCE_TTY", "GH_PAGER", "GH_REPO", "CLICOLOR_FORCE"] as const;
+
+/**
  * A directory holding a fake `gh`, to be used as the whole of `PATH`.
  *
- * The fake records one `<cwd>\t<argv…>\t<GH_FORCE_TTY or "unset">\t<"set" when GH_PAGER is
- * defined, empty otherwise>` line per invocation. `${GH_PAGER+set}` rather than
- * `${GH_PAGER:+set}` is deliberate: the adapter sets it to the *empty string*, which is what
- * `gh` reads as "no pager", and the `:+` form cannot tell that apart from unset.
+ * The fake records one `<cwd>\t<argv…>` line per invocation, followed by one field per
+ * {@link PROBED} variable as the child actually saw it.
  *
  * The `read` is what makes the stdin criterion enforceable — see this file's header.
  */
 function makeBin(options: BinOptions = {}): string {
   const bin = tempDir();
+  const fields = ["%s", "%s", ...PROBED.map(() => "%s")].join("\\t");
+  const values = PROBED.map((name) => `"\${${name}-unset}"`).join(" ");
 
   writeFileSync(
     join(bin, "gh"),
     [
       "#!/bin/sh",
-      `printf '%s\\t%s\\t%s\\t%s\\n' "$(pwd)" "$*" "\${GH_FORCE_TTY-unset}" "\${GH_PAGER+set}" >> ${shQuote(logPath(bin))}`,
+      `printf '${fields}\\n' "$(pwd)" "$*" ${values} >> ${shQuote(logPath(bin))}`,
       "read -r _ignored",
       `printf '%s' ${shQuote(options.stdout ?? "[]")}`,
       `printf '%s' ${shQuote(options.stderr ?? "")} >&2`,
@@ -116,13 +130,8 @@ function makeEmptyBin(): string {
   return tempDir();
 }
 
-/** One recorded invocation of the fake. */
-interface Invocation {
-  cwd: string;
-  argv: string;
-  forceTty: string;
-  pagerSet: boolean;
-}
+/** One recorded invocation of the fake: what it ran as, and the environment it saw. */
+type Invocation = { cwd: string; argv: string } & Record<(typeof PROBED)[number], string>;
 
 /** Every invocation the fake recorded, in order. */
 function recorded(bin: string): Invocation[] {
@@ -133,8 +142,9 @@ function recorded(bin: string): Invocation[] {
     .split("\n")
     .filter((line) => line !== "")
     .map((line) => {
-      const [cwd = "", argv = "", forceTty = "", pagerSet = ""] = line.split("\t");
-      return { cwd, argv, forceTty, pagerSet: pagerSet === "set" };
+      const [cwd = "", argv = "", ...env] = line.split("\t");
+      const seen = Object.fromEntries(PROBED.map((name, index) => [name, env[index] ?? ""]));
+      return { cwd, argv, ...seen } as Invocation;
     });
 }
 
@@ -151,10 +161,21 @@ function ghRow(overrides: Record<string, unknown> = {}): Record<string, unknown>
   };
 }
 
-const originalPath = process.env.PATH;
+/**
+ * The variables these tests mutate on `process.env`, snapshotted so each case starts clean.
+ *
+ * The shedding cases export `GH_REPO` and friends to stand in for a developer's shell profile,
+ * and leaving one set would silently change what every later case observes.
+ */
+const originalEnv: Record<string, string | undefined> = Object.fromEntries(
+  ["PATH", ...PROBED].map((name) => [name, process.env[name]]),
+);
 
 afterEach(() => {
-  process.env.PATH = originalPath;
+  for (const [name, value] of Object.entries(originalEnv)) {
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+  }
 });
 
 afterAll(() => {
@@ -208,9 +229,17 @@ describe("listPullRequests", () => {
     await listPullRequests("OPEN");
     await listPullRequests("MERGED");
 
+    // Asserted structurally rather than as `not.toContain("--state all")`, which would also pass
+    // for `--state open --state merged` and — worse — for a call that dropped `--state`
+    // altogether, where gh quietly defaults to open and the merged query silently returns open
+    // PRs. Exactly one `--state`, and neither call mentions the other's, is the real rule.
     const argvs = recorded(bin).map((invocation) => invocation.argv);
     expect(argvs).toHaveLength(2);
-    for (const argv of argvs) expect(argv).not.toContain("--state all");
+    for (const argv of argvs) {
+      expect(argv.match(/--state\b/g)).toHaveLength(1);
+    }
+    expect(argvs[0]).not.toContain("merged");
+    expect(argvs[1]).not.toContain("open");
   });
 
   test("answers an empty array rather than null when there are no matching PRs", async () => {
@@ -282,13 +311,40 @@ describe("listPullRequests", () => {
     expect(await listPullRequests("OPEN")).toHaveLength(1);
   });
 
-  test("empties GH_PAGER so no invocation can start a pager", async () => {
+  test("drops an inherited GH_REPO so cwd alone decides the repository", async () => {
+    // Not exotic: GH_REPO is something people export in a shell profile, and gh lets it outrank
+    // cwd — so without the shed, every row describes a repository the caller never asked about
+    // and the checkout below would act on a stranger's PR.
     const bin = makeBin();
     process.env.PATH = bin;
+    process.env.GH_REPO = "cli/cli";
 
     await listPullRequests("OPEN");
 
-    expect(recorded(bin)[0]?.pagerSet).toBe(true);
+    expect(recorded(bin)[0]?.GH_REPO).toBe("unset");
+  });
+
+  test("drops an inherited CLICOLOR_FORCE, which would make gh emit coloured JSON", async () => {
+    // Verified against gh 2.96.0: with this set, `gh pr list --json` writes ANSI-coloured,
+    // indented output through a pipe, which no JSON parser accepts — turning every healthy
+    // listing into the unreadable-response fault above. NO_COLOR does not rescue it.
+    const bin = makeBin();
+    process.env.PATH = bin;
+    process.env.CLICOLOR_FORCE = "1";
+
+    await listPullRequests("OPEN");
+
+    expect(recorded(bin)[0]?.CLICOLOR_FORCE).toBe("unset");
+  });
+
+  test("drops an inherited GH_FORCE_TTY, which would also colour the JSON", async () => {
+    const bin = makeBin();
+    process.env.PATH = bin;
+    process.env.GH_FORCE_TTY = "120";
+
+    await listPullRequests("OPEN");
+
+    expect(recorded(bin)[0]?.GH_FORCE_TTY).toBe("unset");
   });
 });
 
@@ -315,7 +371,7 @@ describe("viewPullRequest", () => {
 
     await viewPullRequest(22, undefined, { width: 80 });
 
-    expect(recorded(bin)[0]?.forceTty).toBe("80");
+    expect(recorded(bin)[0]?.GH_FORCE_TTY).toBe("80");
   });
 
   test("leaves GH_FORCE_TTY unset when no width is given", async () => {
@@ -324,7 +380,33 @@ describe("viewPullRequest", () => {
 
     await viewPullRequest(22);
 
-    expect(recorded(bin)[0]?.forceTty).toBe("unset");
+    expect(recorded(bin)[0]?.GH_FORCE_TTY).toBe("unset");
+  });
+
+  test("prefers a requested width over one inherited from the environment", async () => {
+    // The shed and the deliberate set have to coexist: an ambient GH_FORCE_TTY must not reach
+    // gh, while the caller's chosen width must. Spread order in `gh()` is what decides this.
+    const bin = makeBin();
+    process.env.PATH = bin;
+    process.env.GH_FORCE_TTY = "120";
+
+    await viewPullRequest(22, undefined, { width: 80 });
+
+    expect(recorded(bin)[0]?.GH_FORCE_TTY).toBe("80");
+  });
+
+  test("empties GH_PAGER on the one call that could otherwise start a pager", async () => {
+    // Asserted here rather than on a listing, because a listing cannot page at all — gh only
+    // reaches for the pager when it believes stdout is a terminal, which is exactly what a
+    // requested width makes it believe. The assertion is on the *value*: a `+set`-style check
+    // would stay green with GH_PAGER left at `less`, re-arming the hazard it exists to close.
+    const bin = makeBin();
+    process.env.PATH = bin;
+    process.env.GH_PAGER = "less";
+
+    await viewPullRequest(22, undefined, { width: 80 });
+
+    expect(recorded(bin)[0]?.GH_PAGER).toBe("");
   });
 
   test("returns gh's stderr when the lookup failed", async () => {
@@ -383,9 +465,23 @@ describe("checkoutPullRequest", () => {
     expect((failure as CommandFailed).message).toContain("branch already checked out");
   });
 
-  test("refuses rather than crashing when gh is not installed", async () => {
+  test("refuses rather than crashing when gh cannot be run", async () => {
     process.env.PATH = makeEmptyBin();
 
     await expect(checkoutPullRequest(22)).rejects.toBeInstanceOf(Refusal);
+  });
+
+  test("refuses without asserting which of the two indistinguishable causes it was", async () => {
+    // A missing binary and a nonexistent cwd both surface as a byte-identical ENOENT, so a
+    // message that said only "gh is not installed" would send a user who has it chasing the
+    // wrong thing. Both causes are named, and the directory is quoted so it can be checked.
+    process.env.PATH = makeEmptyBin();
+
+    const failure = await checkoutPullRequest(22, "/no/such/dir").catch((error: unknown) => error);
+
+    expect(failure).toBeInstanceOf(Refusal);
+    expect((failure as Refusal).message).toContain("/no/such/dir");
+    expect((failure as Refusal).message).toContain("installed");
+    expect((failure as Refusal).message).toContain("exists");
   });
 });

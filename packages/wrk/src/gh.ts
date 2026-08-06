@@ -12,12 +12,15 @@
  * **A query reads any refusal as "no"; a command with no "no" to express throws.** This is
  * `git.ts`'s split, and here it is also the acceptance criterion that an absent,
  * unauthenticated, offline or rate-limited `gh` is a normal outcome rather than an error.
- * {@link listPullRequests} and {@link viewPullRequest} answer `null` for every one of those,
- * because a prompt and a picker have to draw anyway and a caller's next move is the same
- * whichever it was. {@link checkoutPullRequest} is a mutation the user asked for outright and
- * has no honest value to return, so it throws — a {@link CommandFailed} carrying `gh`'s own
- * exit status when `gh` ran and refused, and a {@link Refusal} when there is no `gh` to run.
- * Neither is a crash: `output.ts`'s `reportFailure` prints each as one line and exits.
+ * {@link listPullRequests} answers `null` for every one of those, because a prompt and a picker
+ * have to draw anyway and a caller's next move is the same whichever it was.
+ * {@link viewPullRequest} answers `null` only when there is no `gh` at all, and otherwise hands
+ * back whatever `gh` said including its complaint — a message in a preview pane beats an empty
+ * one, which is the whole reason its caller wants the failure rather than a `null`.
+ * {@link checkoutPullRequest} is a mutation the user asked for outright and has no honest value
+ * to return, so it throws — a {@link CommandFailed} carrying `gh`'s own exit status when `gh`
+ * ran and refused, and a {@link Refusal} when it could not be run at all. Neither is a crash:
+ * `output.ts`'s `reportFailure` prints each as one line and exits.
  *
  * **Open and merged pull requests are queried separately, never sharing one result window.**
  * {@link listPullRequests} takes a single state rather than a set, so a combined query cannot
@@ -30,16 +33,19 @@
  * the child could not be started, and that rejection becomes the `null`, so no `which` is
  * reimplemented and no window opens between a probe answering and the spawn running.
  * `provision.ts` notes that an `ENOENT` is also what a nonexistent `cwd` produces and that
- * telling them apart is impossible; here the conflation costs nothing, because both readings
- * mean "`gh` could not answer" and a directory that does not exist is not a GitHub checkout
- * either.
+ * telling them apart is impossible. For the two queries the conflation costs nothing, because
+ * both readings mean "`gh` could not answer" and a directory that does not exist is not a
+ * GitHub checkout either. It is **not** free for {@link checkoutPullRequest}, which turns the
+ * reading into a sentence a user reads, so that message is worded over both causes rather than
+ * asserting the one this module cannot actually distinguish.
  *
- * **Nothing here can block on input.** `run` closes the child's stdin, so a `gh` that would
- * prompt sees EOF instead — and {@link GH_ENV} empties `GH_PAGER`, because
- * {@link ViewOptions.width} makes `gh` believe stdout is a terminal and a `gh` that believes
- * that starts the user's pager, which is the canonical thing that waits for a keystroke. `gh`
- * reads the variable with `LookupEnv`, so an explicitly empty value means "no pager" rather
- * than falling through to `PAGER`.
+ * **Nothing here can block on input, and nothing outside decides what `gh` answers about.**
+ * `run` closes the child's stdin, so a `gh` that would prompt sees EOF instead;
+ * {@link GH_PINNED} empties `GH_PAGER` so a forced-TTY render cannot start the user's pager,
+ * which is the canonical thing that waits for a keystroke; and {@link GH_SHED} drops the three
+ * inherited variables that would otherwise override what this module's `cwd` and argv decide.
+ * That last one is `git.ts`'s `LOCAL_REPO_ENV` idea applied to `gh` — see {@link GH_SHED} for
+ * why an ordinary developer's shell really can break this adapter without it.
  *
  * Unlike `git.ts` this module exports no escape hatch. There is no one-off `gh` command in the
  * package, and a spawn helper with no caller is surface invented ahead of need; whichever
@@ -54,12 +60,43 @@ import { CommandFailed, Refusal } from "./errors";
 import { type RunResult, run } from "./proc";
 
 /**
- * Environment every invocation gets, whatever else a caller adds.
+ * Inherited variables every invocation is stripped of, because each one overrides something
+ * this module's `cwd` or argv has already decided.
  *
- * One entry, and it is a safety property rather than a preference — see this module's header
- * for why an emptied `GH_PAGER` is what keeps a forced-TTY render from waiting on a keystroke.
+ * `git.ts` sheds the fifteen variables that bind git to a repository, and calls doing it in one
+ * place rather than per wrapper the thing that keeps it true of the next wrapper anyone adds.
+ * `gh` has the same problem through three different doors, and none of them is exotic — these
+ * are variables people export in a shell profile:
+ *
+ * - `GH_REPO` re-points `gh` at another repository wholesale and outranks `cwd`, so with one
+ *   exported the queries describe a repository the caller never asked about and
+ *   {@link checkoutPullRequest} checks out a stranger's pull request. This is `GIT_DIR`'s trap
+ *   arriving one process later.
+ * - `CLICOLOR_FORCE` and `GH_FORCE_TTY` both make `gh` write **ANSI-coloured, indented** JSON
+ *   through a pipe, which is not JSON any parser accepts — so an inherited one turns every
+ *   healthy listing into {@link listPullRequests}'s unreadable-response fault. `NO_COLOR` does
+ *   not rescue it: `gh` treats a forced colour as outranking a disabled one.
+ *
+ * Deliberately **not** shed: `GH_TOKEN`, `GH_HOST`, `GH_CONFIG_DIR` and the rest of `gh`'s
+ * credential and host configuration. Those are how the user tells `gh` who they are, and this
+ * module has nothing better to say about it — unlike the three above, they override nothing this
+ * module decides.
  */
-const GH_ENV: Record<string, string> = { GH_PAGER: "" };
+const GH_SHED: Record<string, undefined> = {
+  GH_REPO: undefined,
+  GH_FORCE_TTY: undefined,
+  CLICOLOR_FORCE: undefined,
+};
+
+/**
+ * Variables every invocation is pinned to, whatever else a caller adds.
+ *
+ * A safety property rather than a preference — see this module's header for why an emptied
+ * `GH_PAGER` is what keeps a forced-TTY render from waiting on a keystroke. `gh` reads it with
+ * `LookupEnv`, so an explicitly empty value means "no pager" rather than falling through to
+ * `PAGER`.
+ */
+const GH_PINNED: Record<string, string> = { GH_PAGER: "" };
 
 /**
  * The pull-request states `wrk` asks about, spelled as `gh`'s own JSON reports them.
@@ -136,7 +173,13 @@ const PULL_REQUEST = z.object({
   headRefName: z.string().min(1),
   baseRefName: z.string().min(1),
   state: z.enum(["OPEN", "MERGED"]),
-  updatedAt: z.iso.datetime(),
+
+  // `precision: 0` is what makes {@link PullRequest.updatedAt}'s promise enforceable rather than
+  // merely stated: without it the schema also accepts fractional seconds, and mixed precision
+  // breaks byte order silently — `"…:34.123Z"` sorts *before* `"…:34Z"` while being the later
+  // instant, so a caller picking a winner picks the wrong one and nothing errors. GitHub emits
+  // second precision, so this is a promise being pinned, not a case expected to fire.
+  updatedAt: z.iso.datetime({ precision: 0 }),
 });
 
 /**
@@ -144,8 +187,22 @@ const PULL_REQUEST = z.object({
  *
  * Asking `gh` for exactly what the schema parses means there is no second list to drift: a
  * field added to {@link PULL_REQUEST} is requested from `gh` by the same edit.
+ *
+ * The coupling runs one way, and the direction is worth knowing before editing the schema: these
+ * keys are **`gh`'s** spelling of each field, not this module's choice of name. A key `gh` does
+ * not recognise makes it exit nonzero, which {@link listPullRequests} reads as "could not
+ * answer" — so a typo there surfaces as a permanent `null`, indistinguishable from being
+ * offline, rather than as an error naming the field.
  */
 const FIELDS = Object.keys(PULL_REQUEST.shape).join(",");
+
+/**
+ * How much of `gh`'s stdout an unreadable-response error quotes.
+ *
+ * Enough to recognise what arrived — a warning banner, an HTML error page — without pasting up
+ * to a hundred pull requests into an exception message.
+ */
+const EXCERPT = 200;
 
 /**
  * Runs `gh` with `args` in `cwd`, or answers `null` when `gh` is not installed.
@@ -158,21 +215,28 @@ const FIELDS = Object.keys(PULL_REQUEST.shape).join(",");
  * it is each wrapper's own decision.
  *
  * @param args - Arguments after `gh`, one array element per argv entry.
- * @param cwd - Directory to run in, which is what decides the repository `gh` answers about.
- * @param env - Variables for this call alone. {@link GH_ENV} is spread after it and therefore
- *   wins, so a caller can add to the environment but cannot re-enable the pager.
+ * @param cwd - Directory to run in, which — with {@link GH_SHED} applied — is what decides the
+ *   repository `gh` answers about.
+ * @param env - Variables for this call alone. The three spreads are ordered so each layer can
+ *   only do its own job: {@link GH_SHED} first, so a caller's deliberate `GH_FORCE_TTY` still
+ *   reaches `gh` where an inherited one does not; `env` next; {@link GH_PINNED} last, so nothing
+ *   can re-enable the pager.
  */
-// ponytail: no timeout, matching the implementation this replaces — a blackholed network wedges
-// the call rather than failing it. Give `run` a `timeout` here if one is ever observed.
+// ponytail: no timeout. The `cdpr` half of the fish implementation this replaces has none
+// either, but the refresh half runs disowned in the background where a wedged `gh` costs nothing
+// — whereas every call here is awaited by whatever is drawing, so the ceiling is higher than
+// straight parity suggests. Give `run` a `timeout` here if a hang is ever observed.
 function gh(
   args: string[],
   cwd?: string,
   env?: Record<string, string | undefined>,
 ): Promise<RunResult | null> {
-  return run("gh", args, { cwd, env: { ...env, ...GH_ENV } }).catch((error: unknown) => {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
-    throw error;
-  });
+  return run("gh", args, { cwd, env: { ...GH_SHED, ...env, ...GH_PINNED } }).catch(
+    (error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    },
+  );
 }
 
 /**
@@ -231,10 +295,18 @@ export async function listPullRequests(
 
   const rows = z.array(PULL_REQUEST).safeParse(tryJson(result.stdout));
   if (!rows.success) {
-    // The payload is truncated, unlike `git.ts`'s equivalent: one worktree record is a line,
-    // whereas this is up to a hundred pull requests and a reader needs the shape, not all of
-    // it. A `ZodError`'s issue array is deliberately not let out of the module.
-    throw new Error(`gh emitted an unreadable pull-request list: ${result.stdout.slice(0, 200)}`);
+    // Both halves are needed, and `git.ts`'s equivalent — which quotes the whole record and
+    // nothing else — does not transfer, because that record is one line and this is up to a
+    // hundred pull requests. The first issue says *which* field of *which* row `gh` changed,
+    // which the excerpt alone would not show if the row is past the truncation; the excerpt says
+    // what arrived when the payload was not JSON at all, which the issue reports only as an
+    // absent array. The `ZodError` object itself still stays inside the module.
+    const [issue] = rows.error.issues;
+    const at =
+      issue === undefined ? "" : ` at ${issue.path.join(".") || "<root>"}: ${issue.message}`;
+    throw new Error(
+      `gh emitted an unreadable pull-request list${at} — stdout began: ${result.stdout.slice(0, EXCERPT)}`,
+    );
   }
 
   return rows.data;
@@ -291,7 +363,10 @@ export async function viewPullRequest(
  *
  * @param number - The pull request to check out.
  * @param cwd - Directory to check out into. Defaults to this process's cwd.
- * @throws {Refusal} If `gh` is not installed, so there is nothing that could do this.
+ * @throws {Refusal} If `gh` could not be started. The message names **both** causes rather than
+ *   the more likely one, because they are genuinely indistinguishable here — see this module's
+ *   header — and a user who has `gh` installed would be sent chasing the wrong thing by a
+ *   message that only said "not installed".
  * @throws {CommandFailed} If `gh` refused — most often because the branch is already checked
  *   out in another worktree. Carries `gh`'s own exit status, which becomes `wrk`'s.
  */
@@ -301,7 +376,7 @@ export async function checkoutPullRequest(number: number, cwd?: string): Promise
   const result = await gh(args, cwd);
   if (result === null) {
     throw new Refusal(
-      "gh is not installed, so pull requests cannot be checked out — see https://cli.github.com.",
+      `could not run gh${cwd === undefined ? "" : ` in ${cwd}`}: check that gh is installed (https://cli.github.com) and that the directory exists.`,
     );
   }
   if (result.code !== 0) {
