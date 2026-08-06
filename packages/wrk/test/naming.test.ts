@@ -22,6 +22,7 @@ import {
   mintBranch,
   worktreeDirName,
 } from "../src/naming";
+import { Refusal } from "../src/output";
 
 describe("fold", () => {
   test("replaces every slash, not just the first", () => {
@@ -259,10 +260,20 @@ describe("mintBranch", () => {
   test("rejects an issue key that would not survive its own predicates", () => {
     // The downstream comparison is case-sensitive and does not normalise, so a lowercase
     // key would mint a branch nothing recognises.
-    expect(() => mintBranch("exc-1", "Add thing")).toThrow();
+    //
+    // The class is asserted, not merely that it throws: a bare `Error` reaches
+    // `reportFailure` unrecognised and is rethrown, so a typed key — user input — would
+    // print a stack trace instead of the one `wrk:` line the contract promises.
+    expect(() => mintBranch("exc-1", "Add thing")).toThrow(Refusal);
   });
 
   test("rejects an issue key carrying its own separator", () => {
-    expect(() => mintBranch("EXC-1/x", "Add thing")).toThrow();
+    expect(() => mintBranch("EXC-1/x", "Add thing")).toThrow(Refusal);
+  });
+
+  test("rejects a key typed without its hyphen", () => {
+    // The typo the bug report was filed on. It is the shape a human actually produces, and
+    // the one that made the wrong error class visible.
+    expect(() => mintBranch("EXC996", "Some title")).toThrow(Refusal);
   });
 });

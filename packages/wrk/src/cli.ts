@@ -28,8 +28,9 @@
 import { Command } from "@commander-js/extra-typings";
 
 import { renderConversion, resolveConversion } from "./convert";
-import { emit, note, Refusal, reportFailure } from "./output";
+import { emit, emitLine, note, Refusal, reportFailure } from "./output";
 import { preflight } from "./preflight";
+import { createWorktree } from "./worktree";
 
 /**
  * Assembles the commander tree.
@@ -48,6 +49,17 @@ import { preflight } from "./preflight";
  * output is the envelope, because every one of its callers is a script that parses it. See
  * [`./preflight`](./preflight)'s header for the contract, including why a blocking verdict
  * still exits `0`.
+ *
+ * `agent create` never consults {@link wantsJson} either, for the same reason, and is
+ * additionally the reason `emitLine` exists. `--hook` is not a human-output mode returning
+ * through the back door: it is a *second machine* shape, for the editor's `WorktreeCreate`
+ * hook, whose consumer is a `cd` rather than a parser. Which of the two it writes is the
+ * only thing that flag decides.
+ *
+ * `--branch` is a `requiredOption` rather than validated in the action, which puts its
+ * absence on the route this module's own `main` documents as already correct: commander
+ * writes its message to stderr and exits `1` itself, before the action runs and therefore
+ * before anything could have reached stdout.
  *
  * @returns The configured program, not yet parsed.
  */
@@ -77,15 +89,32 @@ export function buildProgram(): Command {
       else note(recipe);
     });
 
-  program
+  // Bound rather than chained straight into a subcommand: `.command()` answers the *sub*
+  // command it just made, so chaining would leave no handle for the second one, and a
+  // second `program.command("agent")` throws rather than reopening the group.
+  const agent = program
     .command("agent")
-    .description("Deterministic git mechanics for an agent's Setup Worktree phase.")
+    .description("Deterministic git mechanics for an agent's Setup Worktree phase.");
+
+  agent
     .command("preflight")
     .description("Run the Setup Worktree checks and print the verdict as JSON")
     .requiredOption("--issue <id>", "The run's primary issue identifier, e.g. EXC-997")
     .option("--base <branch>", "What the worktree will be based on; skips the default-branch sync")
     .action(async (options) => {
       emit(await preflight(options.issue, process.cwd(), { base: options.base }));
+    });
+
+  agent
+    .command("create")
+    .description("Create a worktree and the branch that goes with it")
+    .requiredOption("--branch <name>", "The new branch; its folded form names the directory")
+    .option("--base <commit-ish>", "What to branch from; defaults to the default branch")
+    .option("--hook", "Print the worktree path alone, for the WorktreeCreate hook")
+    .action(async ({ branch, base, hook }) => {
+      const created = await createWorktree(process.cwd(), { branch, base });
+      if (hook === true) emitLine(created.worktree_path);
+      else emit(created);
     });
 
   return program;
