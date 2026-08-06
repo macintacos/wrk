@@ -119,20 +119,19 @@ describe("worktreeRows — the plain picker", () => {
     expect(texts(rows)).toEqual(["EXC-1/thing"]);
   });
 
-  test("the payload carries the path and branch, not the text", () => {
+  test("the payload is the worktree's path, not its text and not an object", () => {
+    // `PickerRow.payload` has to compare `===` across a row-set replacement and be unique
+    // across the rows. A path is both; an object rebuilt from a fresh `git worktree list`
+    // would be neither.
     const rows = worktreeRows([worktree("/c/EXC-1+thing", "EXC-1/thing")], new Map(), DEFAULTS);
 
-    expect(rows[0]?.payload).toEqual({
-      worktree_path: "/c/EXC-1+thing",
-      branch: "EXC-1/thing",
-    });
+    expect(rows[0]?.payload).toBe("/c/EXC-1+thing");
   });
 
-  test("a detached head is rendered, and carries a null branch", () => {
+  test("a detached head is rendered rather than skipped", () => {
     const rows = worktreeRows([worktree("/c/spike", null)], new Map(), DEFAULTS);
 
     expect(texts(rows)).toEqual(["(detached 0f1e2d3)"]);
-    expect(rows[0]?.payload.branch).toBeNull();
   });
 
   test("an unborn branch renders its branch name, having no commit to show", () => {
@@ -458,12 +457,13 @@ describe("wrk wt — what it offers", () => {
     const spike = addRunWorktree(container, "EXC-9/spike");
     fixtureGit(["checkout", "-q", "--detach"], spike);
     const head = fixtureGit(["rev-parse", "HEAD"], spike);
-    const result = await wtCli(["wt", "--print-path"], checkout);
+    const result = await wtCli(["wt"], checkout);
 
-    // One candidate, so the picker is skipped and the path is printed — which is what makes a
-    // detached worktree's *offerability* assertable without a terminal at all.
+    // One candidate, so the picker is skipped and the answer is printed — which is what makes
+    // a detached worktree's *offerability* assertable without a terminal at all. The envelope
+    // shape rather than `--print-path`, because `branch` is the field a detached HEAD decides.
     expect(result.code).toBe(0);
-    expect(result.stdout).toBe(`${spike}\n`);
+    expect(JSON.parse(result.stdout)).toEqual({ worktree_path: spike, branch: null });
     expect(result.stderr).toContain(`detached ${head.slice(0, 7)}`);
   });
 });

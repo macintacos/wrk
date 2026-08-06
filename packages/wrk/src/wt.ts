@@ -79,6 +79,9 @@ const TTL = "pr-graph";
  * **`worktree_path` is snake_case deliberately**, as `Created.worktree_path` is: this type is
  * serialised straight into the run's JSON envelope, so the property name is the field name.
  * The properties are declared in the order the envelope emits them.
+ *
+ * Deliberately **not** the picker's payload, which is the path alone — see
+ * {@link worktreeRows}.
  */
 export interface Chosen {
   /** Absolute path of the worktree to move to. */
@@ -188,21 +191,27 @@ export function candidates(worktrees: readonly Worktree[], here: string | null):
  * The graph is built here rather than passed in, so the rows and the positions drawn on them
  * cannot be derived from two different sets of pull requests.
  *
+ * **The payload is the worktree's path**, and both halves of `PickerRow.payload`'s contract
+ * are why. It has to survive a row-set replacement by `===`, which a string does and a
+ * `{ worktree_path, branch }` object rebuilt from a fresh `git worktree list` would not; and
+ * it has to be unique across the rows, which git guarantees by never listing two worktrees at
+ * one path. {@link chooseWorktree} maps it back to the answer it emits.
+ *
  * @param offered - The worktrees to draw, as {@link candidates} answered.
  * @param prs - Pull requests by head ref, as `pullRequests` returns them. An empty map is the
  *   un-annotated case and is not an error.
  * @param config - Supplies the glyph and colour for each stack position.
- * @returns One row per worktree, carrying {@link Chosen} as its payload.
+ * @returns One row per worktree, carrying its absolute path as the payload.
  */
 export function worktreeRows(
   offered: readonly Worktree[],
   prs: ReadonlyMap<string, PullRequest>,
   config: WrkConfig,
-): PickerRow<Chosen>[] {
+): PickerRow<string>[] {
   const stack = stackGraph(prs);
 
   return offered.map((worktree) => ({
-    payload: chosen(worktree),
+    payload: worktree.path,
     columns: [
       { text: label(worktree) },
       ...(worktree.branch === null ? [] : annotate(short(worktree.branch), prs, stack, config)),
@@ -286,11 +295,17 @@ export async function chooseWorktree(cwd: string): Promise<Chosen | null> {
   }
 
   const config = await loadConfig({ container });
+  const answers = new Map(offered.map((worktree) => [worktree.path, chosen(worktree)]));
 
   try {
-    return await pick({
+    const path = await pick({
       rows: worktreeRows(offered, await annotations(container, config), config),
     });
+
+    // The `??` is unreachable — every payload came out of a row built from `offered` on the
+    // line above — and is spelled as a dismissal rather than asserted away because that is the
+    // one outcome a `cd` protocol can take safely: exit 130, stdout empty, nobody moved.
+    return path === null ? null : (answers.get(path) ?? null);
   } catch (error) {
     // The picker's own sentence says which stream is not a terminal, which is the whole of
     // what a user needs; wrapping it is only about the exit status and the `wrk: ` prefix.
