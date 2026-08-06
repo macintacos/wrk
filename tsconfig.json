@@ -17,13 +17,13 @@
     "noFallthroughCasesInSwitch": true,
     "noImplicitReturns": true,
     "noImplicitOverride": true,
+    // The automatic runtime, so a `.tsx` file needs no `import React` of its own
+    // — Ink components are written as plain JSX and React is never referenced by
+    // name. `jsxImportSource` is left at its default, `react`, which is what
+    // `packages/picker` depends on.
+    "jsx": "react-jsx",
     "types": ["bun"]
   },
-  // `.tsx` is in scope from the start even though no component exists yet: the
-  // picker is built on Ink, whose components are `.tsx`, and a file the type
-  // checker silently skips is a worse failure than one it loudly rejects. No
-  // `jsx` option until a package actually pulls in React — its absence is that
-  // loud rejection.
   // Listed extension by extension: TypeScript's include globs support `*`, `?`
   // and `**/`, but not brace expansion — `*.{ts,tsx}` matches nothing at all.
   "include": [
