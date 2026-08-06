@@ -32,6 +32,7 @@ import {
   type PtySession,
   runInPty,
   SHOW_CURSOR,
+  typeUntil,
 } from "../../picker/test/fixtures/pty";
 import { cachePath } from "../src/cache";
 import { DEFAULTS } from "../src/config";
@@ -335,12 +336,6 @@ const CLI = join(import.meta.dir, "../src/cli.ts");
 /** What the driving script echoes once the CLI has exited, whatever its status. */
 const ENDED = "EXIT:";
 
-/** How long one {@link typeUntil} attempt waits for the picker to react before typing again. */
-const REACT_MS = 200;
-
-/** How many times {@link typeUntil} will re-type before calling the picker unresponsive. */
-const ATTEMPTS = 12;
-
 /**
  * Runs `wrk wt` inside a pty, from `cwd`, with stdout captured to a file.
  *
@@ -371,51 +366,11 @@ async function driveWt(
 }
 
 /**
- * Types `key` until the run reacts to it, rather than once and hopefully.
+ * {@link typeUntil} for a key that ends the run, which the driving script says out loud.
  *
- * A frame on screen does **not** mean the terminal is ready to be typed at. Ink enables raw
- * mode from an effect, and React runs effects after the frame they belong to has been written,
- * so a key sent the instant the list appears lands in the gap and is **dropped** — the same
- * window `picker.test.ts`'s `opened()` names. It is observable from the outside: the byte is
- * echoed back by the line discipline (an `ESC` arrives as a literal `^[` in the capture) and
- * the picker never sees it, leaving the run hung with its list still up. About one driven run
- * in ten did that here, which is a property of driving a terminal faster than fingers can.
- *
- * Re-typing closes it, and does so on a *condition* rather than on the fixed settle the
- * sibling suite sleeps for — which is what `fixtures/pty.ts` warns a guessed interval costs on
- * a loaded machine. What the condition *is* belongs to the caller, because the two things a
- * key here causes are observed in different places: the run ending is announced by the driving
- * script, while the cursor moving is only visible in the frame.
- *
- * A key arriving after the condition already holds is harmless in both cases — an extra
- * keystroke lands on `bash`, which is running a `-c` script and never reads its stdin, or on a
- * picker that treats a second arrow as a second arrow at the end of the list.
- *
- * @param ready - What the capture looks like once the key has landed.
- * @param what - How the failure reads: "the picker never `<what>` after N keystrokes".
- * @throws If `ready` never held, which is the genuine hang this is not allowed to hide.
+ * An extra keystroke landing after the run has already ended is harmless: it reaches `bash`,
+ * which is running a `-c` script and never reads its stdin.
  */
-async function typeUntil(
-  session: PtySession,
-  key: string,
-  ready: (capture: string) => boolean,
-  what: string,
-): Promise<void> {
-  for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
-    session.write(key);
-    try {
-      await session.waitUntil(ready, REACT_MS);
-
-      return;
-    } catch {
-      // Not yet raw, or not yet finished. Either way the answer is to type again.
-    }
-  }
-
-  throw new Error(`the picker never ${what} after ${ATTEMPTS} keystrokes`);
-}
-
-/** {@link typeUntil} for a key that ends the run, which the driving script says out loud. */
 function quit(session: PtySession, key: string): Promise<void> {
   return typeUntil(session, key, (text) => text.includes(ENDED), "ended");
 }

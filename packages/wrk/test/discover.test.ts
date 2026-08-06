@@ -17,7 +17,7 @@ import { symlinkSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { frameLines, KEY, runInPty } from "../../picker/test/fixtures/pty";
+import { frameLines, KEY, runInPty, SHOW_CURSOR, typeUntil } from "../../picker/test/fixtures/pty";
 import { findContainers, resolveRepo } from "../src/discover";
 import { Refusal } from "../src/errors";
 import {
@@ -257,19 +257,19 @@ describe("resolveRepo in a terminal", () => {
       cols: WIDE,
       drive: async (pty) => {
         await pty.waitFor("alpha");
-        // The keystroke handler attaches in an effect that runs around the first commit, so a
-        // key sent the instant the frame appears can land in the gap and be dropped.
-        await Bun.sleep(150);
         frame = frameLines(pty.capture());
         // Sorted, so the second row is `beta` — chosen by moving rather than by typing, since
-        // a fuzzy query would also match the temp path every row shares. The move is waited on
-        // rather than slept through: a guessed interval is how this suite would go flaky on a
-        // loaded machine, and a cursor that had not moved yet would choose `alpha` and fail as
+        // a fuzzy query would also match the temp path every row shares. `typeUntil` covers
+        // both hazards at once: the keystroke handler attaches in an effect that can swallow
+        // the first key, and a cursor that had not moved yet would choose `alpha` and fail as
         // if the picker were broken.
-        pty.write(KEY.down);
-        await pty.waitUntil((capture) =>
-          frameLines(capture).some((line) => line.startsWith(`${CURSOR}beta`)),
+        await typeUntil(
+          pty,
+          KEY.down,
+          (capture) => frameLines(capture).some((line) => line.startsWith(`${CURSOR}beta`)),
+          "moved",
         );
+        // Unguarded, and safe: raw mode is on by the time a key has been seen to land.
         pty.write(KEY.enter);
       },
     });
@@ -291,8 +291,9 @@ describe("resolveRepo in a terminal", () => {
       cols: WIDE,
       drive: async (pty) => {
         await pty.waitFor("alpha");
-        await Bun.sleep(150);
-        pty.write(KEY.escape);
+        // The condition is Ink letting the cursor back, which is the dismissal itself — the
+        // probe's own exit is redirected away and says nothing on this terminal.
+        await typeUntil(pty, KEY.escape, (capture) => capture.includes(SHOW_CURSOR), "closed");
       },
     });
 

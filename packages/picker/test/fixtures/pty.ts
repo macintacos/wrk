@@ -170,6 +170,66 @@ export interface PtySession {
   waitFor(needle: string, timeoutMs?: number): Promise<void>;
 }
 
+/** How long one {@link typeUntil} attempt waits for the program to react before typing again. */
+const REACT_MS = 200;
+
+/** How many times {@link typeUntil} will re-type before calling the program unresponsive. */
+const ATTEMPTS = 12;
+
+/**
+ * Types `key` until the program reacts to it, rather than once and hopefully.
+ *
+ * **A frame on screen does not mean the terminal is ready to be typed at.** Ink enables raw
+ * mode from an effect, and React runs effects *after* the frame they belong to has been
+ * written, so a key sent the instant a list appears lands in the gap and is **dropped**. It is
+ * observable from outside: the byte comes back echoed by the line discipline — an `ESC`
+ * arrives in the capture as a literal `^[` — and the program never sees it, leaving the run
+ * hung with its frame still up. Roughly one driven run in ten did that before this existed.
+ *
+ * Re-typing closes the gap, and does so on a **condition** rather than on a settle interval,
+ * which is the same rule {@link PtySession.waitUntil} states: a guessed sleep is both slower
+ * than it needs to be and still too short on a loaded machine.
+ *
+ * **Only the first key of a session needs this.** Raw mode is enabled once and stays on, so a
+ * key sent after any other key has been observed to land cannot fall into the gap — which is
+ * why a driver typically reaches for this once and then writes directly.
+ *
+ * What the condition *is* belongs to the caller, because what a key causes is observed in
+ * different places: a cursor moving is visible only in the frame, while a run ending is
+ * whatever the driving script announces.
+ *
+ * @param session - The live terminal, as {@link PtyOptions.drive} is handed one.
+ * @param key - The bytes to send; see {@link KEY}.
+ * @param ready - What the capture looks like once the key has landed.
+ * @param what - How the failure reads: "the program never `<what>` after N keystrokes".
+ * @throws If `ready` never held, which is the genuine hang this is not allowed to hide.
+ *
+ * @example
+ * ```ts
+ * await typeUntil(pty, KEY.down, selects("beta"), "moved");
+ * pty.write(KEY.enter); // safe unguarded: raw mode is on by now
+ * ```
+ */
+export async function typeUntil(
+  session: PtySession,
+  key: string,
+  ready: (capture: string) => boolean,
+  what: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < ATTEMPTS; attempt += 1) {
+    session.write(key);
+    try {
+      await session.waitUntil(ready, REACT_MS);
+
+      return;
+    } catch {
+      // Not yet raw, or not yet finished. Either way the answer is to type again.
+    }
+  }
+
+  throw new Error(`the program never ${what} after ${ATTEMPTS} keystrokes`);
+}
+
 /** Options for {@link runInPty}. */
 export interface PtyOptions {
   /** Viewport height. */
