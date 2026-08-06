@@ -2,8 +2,15 @@
  * The subprocess helper the rest of the CLI builds on.
  *
  * `wrk` is mostly a well-behaved front-end to `git` and `gh`, so nearly every operation
- * bottoms out in "run this argv, tell me what it said and how it exited". This module is
+ * bottoms out in "run this argv, tell me what it said and how it exited". {@link run} is
  * that one primitive; the git plumbing and the `gh` adapter are thin wrappers over it.
+ *
+ * {@link detach} is the other half of the same idea and the only other place in the package
+ * a child is started: work whose *result* nobody waits for, running in a process that
+ * outlives this one. It is here rather than beside its caller because what makes it correct
+ * is three spawn settings that have to travel together — see its own documentation — and a
+ * second `spawn` call site elsewhere in the package would be one edit away from losing one
+ * of them, invisibly.
  *
  * Built on `node:child_process` rather than `Bun.spawn` deliberately: the published
  * artifact targets Node, so a Bun-only API here would have to be unpicked at build time.
@@ -135,4 +142,49 @@ export function run(
  */
 function toExitStatus(code: number | null, signal: NodeJS.Signals | null): number {
   return code ?? 128 + constants.signals[signal ?? "SIGTERM"];
+}
+
+/**
+ * Starts `cmd` in a process that outlives this one, and returns without waiting for it.
+ *
+ * For work whose result nobody is waiting on — a cache refreshed so that the *next*
+ * invocation is fast, where paying for it now is the whole thing being avoided. There is no
+ * promise, no output and no exit status, because a caller that wanted any of the three
+ * wanted {@link run}.
+ *
+ * Three spawn settings make that true and none of them is decoration:
+ *
+ * - **`detached`** puts the child in a process group of its own, so a signal delivered to
+ *   this process's group — the `^C` that ends a shell pipeline — does not take it along.
+ * - **`stdio: "ignore"`** gives the child three descriptors onto `/dev/null` rather than
+ *   this process's own. A child that inherits the parent's stdout holds that pipe open
+ *   after the parent has exited, so whatever is capturing the parent's output blocks until
+ *   the *child* finishes — reintroducing, from the far side, exactly the wait this function
+ *   exists to avoid. That failure is invisible from everywhere else: the bytes, the ordering
+ *   and the exit status all stay correct, and only a clock shows it.
+ * - **`unref`** drops the child from this process's event loop, so an otherwise finished CLI
+ *   exits rather than lingering until the child is done.
+ *
+ * A child that could not be started is **swallowed**, which is the one judgement here rather
+ * than a mechanism. `spawn` reports that asynchronously as an `error` event, and an `error`
+ * event with no listener is rethrown as an uncaught exception — so a background job that
+ * could not start would take down the invocation that merely asked for one. There is nothing
+ * a caller could do about it either: the work was optional, which is why it was detached.
+ *
+ * @param cmd - Executable to run, resolved against `PATH`.
+ * @param args - Arguments passed verbatim, one array element per argv entry.
+ * @returns The child's process id, or `undefined` when it could not be started — useful for
+ *   a diagnostic, and the only evidence this function leaves behind.
+ *
+ * @example
+ * ```ts
+ * detach(process.execPath, [fileURLToPath(import.meta.url), container]);
+ * ```
+ */
+export function detach(cmd: string, args: string[] = []): number | undefined {
+  const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+  child.on("error", () => undefined);
+  child.unref();
+
+  return child.pid;
 }

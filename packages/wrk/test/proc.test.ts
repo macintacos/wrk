@@ -12,9 +12,11 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { realpathSync } from "node:fs";
+import { existsSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
-import { run } from "../src/proc";
+import { detach, run } from "../src/proc";
 
 describe("run", () => {
   test("resolves with the exit code instead of throwing when the command fails", async () => {
@@ -118,5 +120,42 @@ describe("run", () => {
     // The boundary between information and error: an exit code means the command ran and
     // had something to say, whereas a missing binary leaves the caller nothing to act on.
     await expect(run("wrk-definitely-not-a-real-binary-xyz", [])).rejects.toThrow();
+  });
+});
+
+describe("detach", () => {
+  test("returns before the child does, and the child finishes anyway", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "wrk-detach-"));
+    const marker = join(directory, "done");
+
+    const pid = detach(process.execPath, [
+      "-e",
+      `setTimeout(() => require("node:fs").writeFileSync(${JSON.stringify(marker)}, ""), 300)`,
+    ]);
+
+    // Both halves of "detached" in one pair of assertions: the call is already back while the
+    // child is still working, and the child gets to finish regardless. Were `detach` awaiting
+    // anything at all, the marker would already exist by the time this line ran.
+    expect(pid).toBeGreaterThan(0);
+    expect(existsSync(marker)).toBe(false);
+
+    const deadline = Date.now() + 10_000;
+    while (!existsSync(marker) && Date.now() < deadline) {
+      await Bun.sleep(25);
+    }
+
+    expect(existsSync(marker)).toBe(true);
+    rmSync(directory, { recursive: true, force: true });
+  }, 15_000);
+
+  test("survives a command that cannot be spawned at all", async () => {
+    // The case that would otherwise end the caller rather than the child: `spawn` reports a
+    // failed start as an `error` event, and an `error` event with no listener is rethrown as an
+    // uncaught exception. A background job nobody is waiting on must not be able to kill the
+    // invocation that merely asked for one. The failure is asynchronous, so the tick below is
+    // what gives it somewhere to land — without the listener, this suite dies here.
+    expect(detach("wrk-definitely-not-a-real-binary-xyz", [])).toBeUndefined();
+
+    await Bun.sleep(50);
   });
 });

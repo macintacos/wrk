@@ -45,13 +45,29 @@
  * positionally and this module is a layer over that call, so a caller that has already loaded
  * `WrkConfig` passes `cache.ttls["pr-graph"]` and one that has not passes whatever it likes.
  *
+ * **This module is also a script, and that is what keeps `gh` off the critical path.** With
+ * {@link PullRequestOptions.background} set, {@link pullRequests} answers from the stored entry
+ * immediately and starts the refresh in a process nobody is waiting on. Nothing smaller works:
+ * an in-process refresh that is merely not awaited is abandoned the moment the event loop
+ * drains, so the entry never lands, and a shell waits on the *process* rather than on a
+ * promise. The child is this process's own runtime re-run on this module's own path —
+ * `process.execPath` and `import.meta.url`, neither of them guessed — which makes it exactly as
+ * runnable as whatever loaded this module, with no file extension baked into a spawn and no
+ * dependence on `process.argv[1]`, which names the test runner under `bun test` rather than the
+ * CLI. `cli.ts`'s `import.meta.main` guard is the same idiom; the worker is at the bottom of
+ * this file.
+ *
  * @packageDocumentation
  */
 
+import { fileURLToPath } from "node:url";
+
 import { z } from "zod";
 
-import { cached } from "./cache";
+import { cached, cachedBehind } from "./cache";
 import { listPullRequests, PULL_REQUEST, type PullRequest } from "./gh";
+import { debug } from "./output";
+import { detach } from "./proc";
 
 /**
  * The cache entry every repository's graph is stored under.
@@ -77,6 +93,19 @@ const ROWS = z.array(PULL_REQUEST);
  */
 class Unavailable extends Error {}
 
+/**
+ * The staleness threshold the detached worker refreshes at: nothing is ever fresher than it.
+ *
+ * Deliberately **not** `0`. {@link cached} asks whether `Date.now() - stats.mtimeMs < ttl`, and
+ * `Date.now()` is whole milliseconds while `mtimeMs` is not — so at `0` an entry written in the
+ * same millisecond compares as *fresh* and the refresh is skipped. Reaching the worker at all
+ * means the parent has just stamped the entry on its way past, so `0` would be relying on the
+ * child's own start-up to take more than a millisecond. The failure that buys is the invisible
+ * one this whole path exists to avoid: the worker does nothing, the entry never lands, and
+ * every consumer keeps drawing the stale graph with nothing anywhere saying why.
+ */
+const FORCED = Number.NEGATIVE_INFINITY;
+
 /** Options for {@link pullRequests}. */
 export interface PullRequestOptions {
   /**
@@ -86,6 +115,17 @@ export interface PullRequestOptions {
    * mutating `XDG_CACHE_HOME` in a shared process — the seam `CacheKey.root` is.
    */
   root?: string;
+
+  /**
+   * Answer from the stored entry and refresh it in a detached process, rather than waiting.
+   *
+   * For anything drawing on a keystroke — a prompt, a picker — where a stale graph now beats a
+   * fresh one in three seconds. A **cold** cache is unaffected: with nothing stored there is
+   * nothing to draw, so the call falls through to the waiting path and pays for the first
+   * answer once, rather than returning an empty map that a caller could not tell apart from a
+   * repository with no pull requests.
+   */
+  background?: boolean;
 }
 
 /**
@@ -166,10 +206,39 @@ function parse(text: string): Map<string, PullRequest> {
 }
 
 /**
+ * Starts a detached refresh of this repository's entry, and says so under `WRK_DEBUG`.
+ *
+ * The argv is `[this module, container, root?]` — see this module's header for why the runtime
+ * and the path are read off the running process rather than written down. `root` is passed
+ * along rather than left to the child's own defaults because it decides *where* the answer
+ * lands: a caller that pointed the cache somewhere and a worker that did not would refresh a
+ * different file from the one the caller is reading, forever.
+ *
+ * The diagnostic is the only evidence this path leaves. Everything downstream of it — the rows,
+ * the markers, the exit status — is identical whether the refresh happened or not, so a
+ * regression here is silent by construction and a line naming the pid is what makes it
+ * observable in the field rather than only under a debugger.
+ */
+function spawnRefresh(container: string, root?: string): void {
+  const worker = fileURLToPath(import.meta.url);
+  const pid = detach(process.execPath, [worker, container, ...(root === undefined ? [] : [root])]);
+
+  debug(
+    pid === undefined
+      ? `${ENTRY} for ${container} is stale, but the background refresh could not be started`
+      : `${ENTRY} for ${container} is stale; refreshing in the background as pid ${pid}`,
+  );
+}
+
+/**
  * The repository's pull requests, keyed by head ref, refreshed through `gh` when stale.
  *
  * The read-through every consumer should reach for. A fresh entry is served without `gh` being
  * run at all; a stale or missing one is refreshed, deduplicated and stored atomically.
+ *
+ * **The wait is optional.** With {@link PullRequestOptions.background}, a stale entry is served
+ * as it stands and the refresh runs in a detached process instead — everything below still
+ * applies to it, one process later. Only a cold cache is unaffected, having nothing to serve.
  *
  * Note the TTL is spent on a *failed* refresh too, by {@link cached}'s design: a `gh` that
  * cannot answer is not retried until the entry goes stale again, which is what keeps a flaky
@@ -202,10 +271,29 @@ export async function pullRequests(
 ): Promise<Map<string, PullRequest>> {
   const key = { name: ENTRY, container, root: options.root };
 
+  if (options.background === true) {
+    const stored = await cachedBehind(key, ttl, () => spawnRefresh(container, options.root));
+    if (stored !== null) return parse(stored);
+
+    debug(`${ENTRY} for ${container} has nothing stored; refreshing in the foreground`);
+  }
+
   try {
     return parse(await cached(key, ttl, () => collect(container)));
   } catch (error) {
     if (error instanceof Unavailable) return new Map();
     throw error;
   }
+}
+
+// The worker `spawnRefresh` starts, guarded so that importing this module runs nothing —
+// `cli.ts`'s idiom. `FORCED` rather than the caller's TTL because the caller has just stamped
+// the entry to debounce its siblings, and this process is the refresh that stamp was promising.
+if (import.meta.main) {
+  const [container, root] = process.argv.slice(2);
+  if (container === undefined) {
+    throw new Error("usage: pr.ts <container> [cache-root]");
+  }
+
+  await pullRequests(container, FORCED, { root });
 }

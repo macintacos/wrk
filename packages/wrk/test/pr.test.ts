@@ -20,6 +20,14 @@
  * Every fake reads a line from stdin before answering, so the "stdin is closed" property
  * `proc.ts` promises is enforced by the whole suite — were stdin left as an open pipe, each
  * call would block until bun's per-test timeout killed it.
+ *
+ * **The background-refresh case is a clock, and it runs against a whole process.** What it
+ * guards is that `gh` is off the critical path, which is a claim about elapsed time and
+ * therefore has to be measured rather than asserted: the fake sleeps for seconds and the
+ * caller has to come back in milliseconds. It goes through
+ * [`./fixtures/background-caller.ts`](./fixtures/background-caller.ts) rather than calling
+ * `pullRequests` here, because half of what it measures — that the detached refresh holds no
+ * descriptor of the caller's — exists only at the process boundary. See that fixture's header.
  */
 
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
@@ -30,6 +38,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -104,7 +113,25 @@ interface GhScript {
 
   /** The merged query's exit status. Nonzero is `gh` declining to answer. */
   mergedExit?: number;
+
+  /**
+   * Seconds the fake stalls before answering either query, for the clock case.
+   *
+   * Whole seconds because POSIX `sleep` is only required to accept an integer, and this is
+   * the one place the suite calls a binary it did not write — see {@link SLEEP}.
+   */
+  delaySeconds?: number;
 }
+
+/**
+ * Absolute path of `sleep`, resolved while `PATH` is still the real one.
+ *
+ * By absolute path because {@link withGh} replaces `PATH` with the fake's directory alone, so
+ * a bare `sleep` inside the fake would not resolve — the same reason the fake carries its
+ * payloads inline instead of reading them with `cat`. The fallback is `noUncheckedIndexedAccess`
+ * in spirit rather than a case expected to fire: `sleep` is in POSIX.
+ */
+const SLEEP = Bun.which("sleep") ?? "/bin/sleep";
 
 /**
  * A directory holding a fake `gh`, to be used as the whole of `PATH`.
@@ -127,6 +154,9 @@ function makeBin(script: GhScript = {}): string {
       "#!/bin/sh",
       `printf '%s\\t%s\\n' "$(pwd)" "$*" >> ${shQuote(logPath(bin))}`,
       "read -r _ignored",
+      ...(script.delaySeconds === undefined
+        ? []
+        : [`${shQuote(SLEEP)} ${String(script.delaySeconds)}`]),
       'case "$*" in',
       `  *"--state merged"*)`,
       `    printf '%s' ${shQuote(JSON.stringify(script.merged ?? []))}`,
@@ -188,6 +218,19 @@ function withGh(script: GhScript = {}): { bin: string; root: string } {
 /** The stored entry's raw text, exactly as it sits on disk. */
 function stored(root: string): string {
   return readFileSync(cachePath({ name: ENTRY, container: CONTAINER, root }), "utf8");
+}
+
+/**
+ * Backdates an entry so it reads as older than any TTL these cases use.
+ *
+ * `cache.test.ts`'s helper, copied for the reason that suite gives for manipulating mtimes
+ * rather than sleeping: a test that waits out a real TTL is either slow or flaky, usually both.
+ * A `ttl` of `0` is not the substitute it looks like — `Date.now()` is whole milliseconds and
+ * `mtimeMs` is not, so an entry written in the same millisecond compares as *fresh*.
+ */
+function age(path: string, ms: number): void {
+  const when = new Date(Date.now() - ms);
+  utimesSync(path, when, when);
 }
 
 /** `PATH` is repointed at a fake by every case, so it is restored between them. */
@@ -383,4 +426,81 @@ describe("pullRequests", () => {
     // reads, for a full TTL. Nothing downstream could tell.
     expect(recorded(bin).map(({ cwd }) => cwd)).toEqual([CONTAINER, CONTAINER]);
   });
+});
+
+/** How long the fake `gh` stalls in the clock case — the wait that must not be paid. */
+const DELAY_SECONDS = 3;
+
+/**
+ * What the caller's whole process must finish inside, in milliseconds.
+ *
+ * Half the delay, which is the margin that makes this a regression guard rather than a
+ * benchmark: a `bun` boot and a module graph is a couple of hundred milliseconds, and an
+ * implementation that awaited `gh` could not come in under `DELAY_SECONDS` however fast the
+ * machine is. Nothing between the two numbers is a legitimate outcome.
+ */
+const CEILING_MS = (DELAY_SECONDS * 1000) / 2;
+
+/** How long the case waits for the detached refresh to publish, and how often it looks. */
+const LANDING_MS = 20_000;
+const POLL_MS = 50;
+
+describe("background refresh", () => {
+  test("answers from the stored entry without waiting for gh, and lands the refresh behind it", async () => {
+    const { root } = withGh({
+      open: [ghRow({ number: 22 }), ghRow({ number: 23, headRefName: "EXC-1030/other" })],
+      delaySeconds: DELAY_SECONDS,
+    });
+    const key = { name: ENTRY, container: CONTAINER, root };
+    await writeCache(key, JSON.stringify([ghRow({ number: 7 })]));
+    age(cachePath(key), 90_000);
+
+    const started = Date.now();
+    const child = Bun.spawn(
+      [process.execPath, join(import.meta.dir, "fixtures", "background-caller.ts")],
+      {
+        env: {
+          ...process.env,
+          WRK_CONTAINER: CONTAINER,
+          WRK_CACHE_ROOT: root,
+          WRK_TTL: "60000",
+        },
+        stdout: "pipe",
+        stderr: "pipe",
+      },
+    );
+
+    // All three awaited together, and the elapsed figure covers the slowest of them. Draining
+    // concurrently with the wait is `cache.test.ts`'s rule — awaiting `exited` first deadlocks
+    // a child that fills the pipe buffer — but here the stdout clock is also half the
+    // assertion: a refresh holding the caller's stdout leaves the pipe open until it exits, so
+    // the read reaches EOF three seconds after the process itself is gone.
+    const [out, err, code] = await Promise.all([
+      new Response(child.stdout).text(),
+      new Response(child.stderr).text(),
+      child.exited,
+    ]);
+    const elapsed = Date.now() - started;
+
+    expect(err).toBe("");
+    expect(code).toBe(0);
+    // One row, so this is the seeded entry rather than the fake's two-row answer — the caller
+    // returned the stale graph rather than a fresh one it had waited for.
+    expect(out.trim()).toBe("1");
+    expect(elapsed).toBeLessThan(CEILING_MS);
+
+    // Condition-based rather than a fixed sleep: what is being waited for is a file appearing,
+    // and the delay above is a floor on when it can, not a prediction of when it will.
+    const deadline = Date.now() + LANDING_MS;
+    let numbers: number[] = [];
+    while (Date.now() < deadline) {
+      numbers = (JSON.parse(stored(root)) as { number: number }[])
+        .map(({ number }) => number)
+        .sort((a, b) => a - b);
+      if (numbers.length > 1) break;
+      await Bun.sleep(POLL_MS);
+    }
+
+    expect(numbers).toEqual([22, 23]);
+  }, 30_000);
 });

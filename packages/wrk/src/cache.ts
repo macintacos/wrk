@@ -348,3 +348,63 @@ export async function cached(
     }
   }
 }
+
+/**
+ * Reads an entry and starts its refresh *behind* the answer rather than in front of it.
+ *
+ * {@link cached} with the wait taken out. It answers with whatever is on disk — stale or not
+ * — and, when that value has aged past `ttl`, calls `spawn` on the way past. The refresh
+ * itself is none of this function's business: `spawn` is expected to start it somewhere this
+ * process is not waiting on, and is called for effect, so nothing here observes whether it
+ * worked. A caller drawing something a user is looking at spends microseconds here rather
+ * than however long the upstream takes.
+ *
+ * **The touch is what makes it a debounce, and it lands before `spawn` runs.** Stamping the
+ * entry's mtime is what stops the *next* invocation from starting a second refresh while the
+ * first is still in flight, and it is the same mechanism {@link cached} uses for the same
+ * reason. Ordering it after the spawn would leave the window it exists to close open for as
+ * long as starting a process takes, which — for a shell prompt redrawing three times a second
+ * — is long enough to matter. It is deliberately spent on a refresh that goes on to *fail*,
+ * exactly as `cached`'s is: an upstream that cannot answer is not retried until the entry
+ * goes stale again.
+ *
+ * No lock is taken. There is nothing to serialise here, because this function does no work
+ * worth serialising — whatever `spawn` starts is expected to go through {@link cached}
+ * itself, where the single-flight lock already lives, so two of them racing resolves there
+ * rather than being pre-empted here. A caller that lost that race gets the previous contents,
+ * which is what this one just returned anyway.
+ *
+ * **A missing entry answers `null`,** because there is no third thing to say: this function
+ * exists to hand back what was stored, and on a cold cache nothing was. What to do about it
+ * belongs to the caller — refresh in the foreground and pay for it once, or draw nothing —
+ * and the two are different enough that guessing here would be wrong for one of them.
+ *
+ * @param key - The entry to read.
+ * @param ttl - Milliseconds after which the entry is stale.
+ * @param spawn - Starts the refresh. Called at most once, only when the entry is stale, and
+ *   only after the touch. Its own failures are its own to handle.
+ * @returns The entry's contents, fresh or stale; `null` when it does not exist.
+ * @throws Whatever reading the entry threw. An unreadable cache directory is a real fault —
+ *   see {@link readCache}, which makes the same call.
+ *
+ * @example
+ * ```ts
+ * const stored = await cachedBehind(key, ttl, () => detach(process.execPath, [worker, container]));
+ * ```
+ */
+export async function cachedBehind(
+  key: CacheKey,
+  ttl: number,
+  spawn: () => void,
+): Promise<string | null> {
+  const path = cachePath(key);
+  const entry = await readEntry(path);
+
+  if (entry === null) return null;
+  if (Date.now() - entry.mtimeMs < ttl) return entry.text;
+
+  await touch(path);
+  spawn();
+
+  return entry.text;
+}
