@@ -147,16 +147,23 @@ export interface PtySession {
   /** Everything received so far. */
   capture(): string;
   /**
-   * Waits until the capture contains `needle`.
+   * Waits until the capture satisfies `condition`.
    *
    * The alternative is sleeping a guessed interval before every keystroke, which is how a
    * suite becomes flaky on a loaded machine. Waiting on what the frame actually says is
    * both faster and deterministic.
    *
-   * @throws If `needle` has not appeared within `timeoutMs` (3 s by default, deliberately
+   * The predicate form is the load-bearing one, because a capture is **cumulative**:
+   * {@link waitFor}'s substring can only wait for text that has never appeared, so waiting
+   * on a redraw that shows rows already seen — a narrowed filter, a shrunk window — needs a
+   * question about the *last frame*, which `frameLines` answers and a substring cannot.
+   *
+   * @throws If `condition` has not held within `timeoutMs` (3 s by default, deliberately
    *   under `bun test`'s own 5 s so the timeout that fires is the one that says what it was
    *   waiting for).
    */
+  waitUntil(condition: (capture: string) => boolean, timeoutMs?: number): Promise<void>;
+  /** {@link waitUntil} for the common case: waiting on text that has not appeared before. */
   waitFor(needle: string, timeoutMs?: number): Promise<void>;
 }
 
@@ -214,20 +221,27 @@ export async function runInPty(script: string, options: PtyOptions): Promise<Pty
   });
 
   const terminal = proc.terminal;
-  if (options.drive && terminal) {
+  if (options.drive) {
+    // Loudly, rather than silently skipping the driver: a scenario that meant to type keys
+    // and instead captured an untouched opening frame would still produce assertions, and
+    // they would be about the wrong thing.
+    if (!terminal) throw new Error("the spawned process has no terminal to drive");
+
+    const waitUntil = async (condition: (text: string) => boolean, timeoutMs = 3000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!condition(capture())) {
+        if (Date.now() > deadline)
+          throw new Error(`timed out; last frame: ${frameLines(capture())}`);
+        await Bun.sleep(10);
+      }
+    };
+
     await options.drive({
       write: (data) => terminal.write(data),
       resize: (cols, rows) => terminal.resize(cols, rows),
       capture,
-      async waitFor(needle, timeoutMs = 3000) {
-        const deadline = Date.now() + timeoutMs;
-        while (!capture().includes(needle)) {
-          if (Date.now() > deadline) {
-            throw new Error(`timed out waiting for ${JSON.stringify(needle)}`);
-          }
-          await Bun.sleep(10);
-        }
-      },
+      waitUntil,
+      waitFor: (needle, timeoutMs) => waitUntil((text) => text.includes(needle), timeoutMs),
     });
   }
 

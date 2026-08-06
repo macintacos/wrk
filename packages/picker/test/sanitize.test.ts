@@ -4,11 +4,14 @@
  * A picker row is a branch name or a pull-request title, and on a fork both are written by
  * whoever opened the pull request. Writing one to a terminal unfiltered hands that person
  * the terminal: an escape sequence can move the cursor, erase the screen, rename the
- * window, or — through OSC 52 — put text on the user's clipboard. fzf shipped this same
- * filter in 0.73.0, and the allowlist here is its allowlist: colour, and nothing else.
+ * window, or — through OSC 52 — put text on the user's clipboard. The allowlist is colour
+ * and nothing else, and **this file is what pins it**: the module's own header explains why
+ * there is no upstream version to resync against, so a regression here is caught by these
+ * cases or it is not caught.
  *
- * Every case below names a sequence a real terminal acts on, so a regression here is a
- * regression in what an attacker can make the terminal do — not a formatting nit.
+ * Every case below names a sequence a real terminal acts on, or a character that reorders
+ * what a reader sees, so a failure is a change in what an attacker can do — not a
+ * formatting nit.
  *
  * @packageDocumentation
  */
@@ -106,6 +109,32 @@ describe("everything else is dropped", () => {
 
   test("a dropped C1 does not swallow the colour that follows it", () => {
     expect(sanitize(`${C1_CSI}2J${RED}kept${RESET}`)).toBe(`${RED}kept${RESET}`);
+  });
+
+  test("the other string families, payload and all", () => {
+    // DCS, SOS, PM and APC each run to a terminator like an OSC does. Dropping only the
+    // introducer would leave a Sixel image or a `DECRQSS` reply as visible text in a row.
+    expect(sanitize(`a${ESC}Pq#0;2;0;0;0#1${ST}b`)).toBe("ab");
+    expect(sanitize(`a${ESC}Xsos${ST}b`)).toBe("ab");
+    expect(sanitize(`a${ESC}^pm${ST}b`)).toBe("ab");
+    expect(sanitize(`a${ESC}_apc${ST}b`)).toBe("ab");
+  });
+
+  test("the bidirectional overrides, which reorder what a row says", () => {
+    // CVE-2021-42574's shape. It lands on this component in particular because the payload
+    // a row resolves to is deliberately not the text it displays, so a row made to read as
+    // someone else's branch is a row that can be acted on.
+    expect(sanitize(`fix/${ctrl(0x202e)}nwo-ym-toober${ctrl(0x202c)}`)).toBe("fix/nwo-ym-toober");
+    expect(sanitize(`a${ctrl(0x2066)}b${ctrl(0x2069)}c`)).toBe("abc");
+    expect(sanitize(`a${ctrl(0x200f)}b${ctrl(0x061c)}c`)).toBe("abc");
+    // The line and paragraph separators, for the same reason the C0 newline goes.
+    expect(sanitize(`a${ctrl(0x2028)}b${ctrl(0x2029)}c`)).toBe("abc");
+  });
+
+  test("but the zero-width joiner stays, because emoji are made of it", () => {
+    // The one member of the zero-width family that reorders nothing and carries meaning:
+    // strip it and a multi-person emoji becomes several separate people.
+    expect(sanitize("👨‍👩‍👧")).toBe("👨‍👩‍👧");
   });
 });
 

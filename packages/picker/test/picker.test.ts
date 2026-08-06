@@ -30,7 +30,6 @@ import {
   KEY,
   lastFrame,
   maxCursorRise,
-  type PtyRun,
   type PtySession,
   runInPty,
 } from "./fixtures/pty";
@@ -56,7 +55,7 @@ const ctrl = (code: number): string => String.fromCodePoint(code);
 /** A row as the probe's JSON expects it. */
 interface Row {
   payload: string;
-  columns: { text: string; width?: number; color?: string }[];
+  columns: { text: string; color?: string }[];
 }
 
 /**
@@ -105,6 +104,51 @@ function payloadPath(purpose: string): string {
   return path;
 }
 
+/** A driven run, plus the frame as it stood before the picker erased it on the way out. */
+interface Session {
+  /** Everything the terminal received. */
+  readonly capture: string;
+  /** The last frame drawn while the picker was up — what a viewer was looking at. */
+  readonly frame: string;
+  readonly exitCode: number;
+}
+
+/**
+ * Runs a scenario, drives it, snapshots the frame, and quits.
+ *
+ * The snapshot is why this exists rather than a bare {@link runInPty}. `pick()` erases its
+ * own frame on the way out, so a capture read after the process exits has no frame left in
+ * it — every assertion about what was *displayed* has to be taken while the picker is still
+ * up, and taking it in one place is what keeps that from being remembered eleven times.
+ *
+ * @param script - A {@link scenario}.
+ * @param options - `act` drives the session and returns once the frame under test has
+ *   settled; `quit` is the key that ends it, Escape unless a test needs Enter.
+ */
+async function driven(
+  script: string,
+  options: {
+    rows?: number;
+    cols?: number;
+    quit?: string;
+    act: (pty: PtySession) => Promise<void>;
+  },
+): Promise<Session> {
+  let frame = "";
+
+  const run = await runInPty(script, {
+    rows: options.rows ?? ROWS,
+    cols: options.cols,
+    drive: async (pty) => {
+      await options.act(pty);
+      frame = pty.capture();
+      pty.write(options.quit ?? KEY.escape);
+    },
+  });
+
+  return { ...run, frame };
+}
+
 /**
  * Waits for the picker's first frame, then lets it finish attaching to the keyboard.
  *
@@ -115,6 +159,22 @@ function payloadPath(purpose: string): string {
 async function opened(pty: PtySession, marker: string): Promise<void> {
   await pty.waitFor(marker);
   await Bun.sleep(150);
+}
+
+/** Waits until the last frame is exactly `count` lines tall. */
+function tall(count: number): (capture: string) => boolean {
+  return (capture) => frameLines(capture).length === count;
+}
+
+/**
+ * Waits until the gutter marks the row beginning with `label`.
+ *
+ * Over `frameLines` rather than the raw frame, because the gutter and the row it marks are
+ * separated by the escape sequences that colour them: `▌ beta` is what a viewer sees and
+ * never what the bytes say.
+ */
+function selects(label: string): (capture: string) => boolean {
+  return (capture) => frameLines(capture).some((line) => line.startsWith(`▌ ${label}`));
 }
 
 afterAll(() => {
@@ -130,16 +190,14 @@ describe("the picker renders inline", () => {
    * if both were observed in the same one. Typing before quitting is what makes the session
    * redraw at all — a first paint proves nothing about relative addressing.
    */
-  let session: PtyRun;
+  let session: Session;
 
   beforeAll(async () => {
-    session = await runInPty(scenario(), {
-      rows: ROWS,
-      drive: async (pty) => {
+    session = await driven(scenario(), {
+      act: async (pty) => {
         await opened(pty, "feature/thing-0");
-        pty.write("thing");
-        await pty.waitFor("thing-1");
-        pty.write(KEY.escape);
+        pty.write("thing-1");
+        await pty.waitUntil(tall(FRAME));
       },
     });
 
@@ -157,8 +215,16 @@ describe("the picker renders inline", () => {
   });
 
   test("the frame is the query line plus its list rows, strictly under the viewport", () => {
-    expect(frameHeight(session.capture)).toBe(FRAME);
+    expect(frameHeight(session.frame)).toBe(FRAME);
     expect(FRAME).toBeLessThan(ROWS);
+  });
+
+  test("it erases its own frame on the way out", () => {
+    // `fzf` does this, and a `cd`-wrapping shell function is run dozens of times a day: a
+    // picker that left nineteen lines behind would push the prompt down the screen on every
+    // invocation. Erasing is not clearing — the assertion above that no erase-screen was
+    // ever emitted covers the same session.
+    expect(frameLines(session.capture)).toHaveLength(0);
   });
 
   test("a row far wider than the terminal still costs exactly one line", async () => {
@@ -169,72 +235,56 @@ describe("the picker renders inline", () => {
       { payload: "b", columns: [{ text: "short" }, { text: "also short" }] },
     ]);
 
-    const { capture } = await runInPty(scenario(`PROBE_ROWS_FILE="${path}"`), {
-      rows: ROWS,
+    const { frame } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
       cols: 40,
-      drive: async (pty) => {
-        await opened(pty, "short");
-        pty.write(KEY.escape);
-      },
+      act: (pty) => opened(pty, "short"),
     });
 
     // Query line plus the two rows, and not a line more.
-    expect(frameHeight(capture)).toBe(3);
+    expect(frameHeight(frame)).toBe(3);
   });
 
   test("growing the viewport re-budgets the frame and disturbs nothing", async () => {
     // EXC-1009's third obligation. Nothing here handles SIGWINCH directly — Ink's
     // `useWindowSize` re-renders on the render stream's own `resize` event — so this is
     // the assertion that the budget is derived from that stream rather than read once.
-    const { capture } = await runInPty(scenario(), {
-      rows: ROWS,
-      drive: async (pty) => {
+    const { frame, capture } = await driven(scenario(), {
+      act: async (pty) => {
         await opened(pty, "feature/thing-17");
         pty.resize(80, 30);
-        await pty.waitFor("feature/thing-22");
-        await Bun.sleep(200);
-        pty.write(KEY.escape);
+        // floor(30 × 0.8) - 1 = 23 list rows, plus the query line.
+        await pty.waitUntil(tall(24));
       },
     });
 
-    // floor(30 × 0.8) - 1 = 23 list rows, plus the query line.
-    expect(frameHeight(capture)).toBe(24);
+    expect(frameHeight(frame)).toBe(24);
     expect(capture).not.toContain(ERASE_SCREEN);
   });
 
   test("shrinking it re-budgets the frame too", async () => {
     // The frame settles inside the new budget, which is the criterion. What it does on the
-    // way there is Ink's and not the picker's: `Ink.resized` re-lays out and writes the
-    // *current* React tree synchronously, before the `useWindowSize` state update has been
-    // processed, so a shrink puts one stale over-tall frame through
-    // `shouldClearTerminalForFrame` and takes the screen for that one frame. It is a
-    // property of any Ink app whose frame outgrows its viewport, not of this component, and
-    // EXC-1009 left mid-session resize explicitly out of scope for that reason. Asserted as
-    // "it comes back inline, correctly budgeted" rather than papered over.
-    const { capture } = await runInPty(scenario(), {
-      rows: ROWS,
-      drive: async (pty) => {
+    // way there is Ink's rather than the picker's — see `picker.tsx`'s module header, which
+    // records why a shrink puts one stale over-tall frame through the fullscreen path and
+    // why EXC-1009 left mid-session resize out of scope. Asserted as "it comes back inline,
+    // correctly budgeted" rather than papered over.
+    const { frame } = await driven(scenario(), {
+      act: async (pty) => {
         await opened(pty, "feature/thing-17");
         pty.resize(80, 12);
-        await pty.waitFor("feature/thing-7");
-        await Bun.sleep(200);
-        pty.write(KEY.escape);
+        // floor(12 × 0.8) - 1 = 8 list rows, plus the query line.
+        await pty.waitUntil(tall(9));
       },
     });
 
-    // floor(12 × 0.8) - 1 = 8 list rows, plus the query line.
-    expect(frameHeight(capture)).toBe(9);
+    expect(frameHeight(frame)).toBe(9);
   });
 
   test("frames go to stderr, leaving stdout for the payload", async () => {
     const stdout = payloadPath("streams");
 
-    const { capture } = await runInPty(scenario("", { stdout }), {
-      rows: ROWS,
-      drive: async (pty) => {
-        await opened(pty, "feature/thing-0");
-        pty.write(KEY.enter);
-      },
+    const { capture } = await driven(scenario("", { stdout }), {
+      quit: KEY.enter,
+      act: (pty) => opened(pty, "feature/thing-0"),
     });
 
     expect(capture).toContain("feature/thing-0");
@@ -243,85 +293,113 @@ describe("the picker renders inline", () => {
 });
 
 describe("filtering is incremental and never re-ranks", () => {
-  /** Two rows a scorer would order one way and insertion order the other. */
+  /** Three rows a scorer would order one way and insertion order the other. */
   const ORDERED = [
     { payload: "first", columns: [{ text: "zebra apple" }] },
     { payload: "second", columns: [{ text: "apple" }] },
     { payload: "third", columns: [{ text: "nothing here" }] },
   ];
 
-  test("typing narrows the list, and only matching rows survive", async () => {
-    const path = rowsFile("order", ORDERED);
+  /** Types `apple` into the three-row list and waits for the two survivors. */
+  async function filtered(purpose: string): Promise<Session> {
+    const path = rowsFile(purpose, ORDERED);
 
-    const { capture } = await runInPty(scenario(`PROBE_ROWS_FILE="${path}"`), {
-      rows: ROWS,
-      drive: async (pty) => {
+    return driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
+      act: async (pty) => {
         await opened(pty, "nothing here");
         pty.write("apple");
-        await Bun.sleep(200);
-        pty.write(KEY.escape);
+        await pty.waitUntil(tall(3));
       },
     });
+  }
 
-    const lines = frameLines(capture);
+  test("typing narrows the list, and only matching rows survive", async () => {
+    const { frame } = await filtered("order");
+    const lines = frameLines(frame);
 
     expect(lines).toHaveLength(3);
-    expect(lines[0]).toContain("apple");
+    expect(lines[0]).toBe("❯ apple");
     expect(lines.join("\n")).not.toContain("nothing here");
   });
 
   test("the survivors keep their input order rather than their scores", async () => {
     // fzf scores a whole-string match above one buried behind a word, so a picker that
     // sorted would put `apple` first. This is the criterion that forbids that.
-    const path = rowsFile("order", ORDERED);
-
-    const { capture } = await runInPty(scenario(`PROBE_ROWS_FILE="${path}"`), {
-      rows: ROWS,
-      drive: async (pty) => {
-        await opened(pty, "nothing here");
-        pty.write("apple");
-        await Bun.sleep(200);
-        pty.write(KEY.escape);
-      },
-    });
-
-    const [, first, second] = frameLines(capture);
+    const [, first, second] = frameLines((await filtered("order")).frame);
 
     expect(first).toContain("zebra apple");
     expect(second).not.toContain("zebra");
   });
 
-  test("backspace widens it again", async () => {
+  test("a query that matches nothing says so", async () => {
     const path = rowsFile("order", ORDERED);
 
-    const { capture } = await runInPty(scenario(`PROBE_ROWS_FILE="${path}"`), {
-      rows: ROWS,
-      drive: async (pty) => {
+    const { frame } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
+      act: async (pty) => {
         await opened(pty, "nothing here");
-        pty.write("apple");
-        await Bun.sleep(150);
-        for (const _unused of "apple") {
-          pty.write(KEY.backspace);
-          await Bun.sleep(50);
-        }
-        await Bun.sleep(150);
-        pty.write(KEY.escape);
+        pty.write("zzzz");
+        await pty.waitUntil(tall(2));
       },
     });
 
-    expect(frameLines(capture)).toHaveLength(4);
+    // An empty list under a query line reads the same as a picker that stopped working, and
+    // Enter there resolves `null`, which a caller maps to a cancellation and prints nothing.
+    expect(frameLines(frame)[1]).toContain("no matches");
+  });
+
+  test("backspace widens it again", async () => {
+    // From a query that matches nothing back to one that matches two, on one keystroke —
+    // the filter has to run on the way out as well as on the way in.
+    const path = rowsFile("order", ORDERED);
+
+    const { frame } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
+      act: async (pty) => {
+        await opened(pty, "nothing here");
+        pty.write("applez");
+        await pty.waitUntil(tall(2));
+        pty.write(KEY.backspace);
+        await pty.waitUntil(tall(3));
+      },
+    });
+
+    const lines = frameLines(frame);
+
+    expect(lines[0]).toBe("❯ apple");
+    expect(lines[1]).toContain("zebra apple");
+  });
+
+  test("a burst of keys in one chunk is a burst of keys, not one", async () => {
+    // Ink parses a stdin chunk into every event it holds and calls the `useInput` handler
+    // for each one synchronously, without a re-render in between — which is what a held-down
+    // key and ordinary fast typing both look like on the wire. Written as a single `write`
+    // for exactly that reason: spacing the keys out is what hides a handler that reads stale
+    // state, and every other case in this file spaces them out.
+    const path = rowsFile("order", ORDERED);
+
+    const { frame } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
+      act: async (pty) => {
+        await opened(pty, "nothing here");
+        pty.write("apple");
+        await pty.waitUntil(tall(3));
+        pty.write(KEY.backspace.repeat(5));
+        await pty.waitUntil((capture) => frameLines(capture)[0] === "❯");
+      },
+    });
+
+    const lines = frameLines(frame);
+
+    expect(lines[0]).toBe("❯");
+    expect(lines).toHaveLength(4);
   });
 
   test("the matched characters are highlighted where they sit", async () => {
     const path = rowsFile("highlight", [{ payload: "a", columns: [{ text: "alpha" }] }]);
 
-    const { capture } = await runInPty(scenario(`PROBE_ROWS_FILE="${path}"`), {
-      rows: ROWS,
-      drive: async (pty) => {
+    const { frame } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
+      act: async (pty) => {
         await opened(pty, "alpha");
         pty.write("lph");
-        await Bun.sleep(200);
-        pty.write(KEY.escape);
+        await pty.waitUntil((capture) => frameLines(capture)[0] === "❯ lph");
       },
     });
 
@@ -330,9 +408,9 @@ describe("filtering is incremental and never re-ranks", () => {
     // place and not about which colour chalk picked for it.
     const highlighted = new RegExp(`${ctrl(0x1b)}\\[[\\d;]*mlph`);
 
-    expect(lastFrame(capture)).toMatch(highlighted);
+    expect(lastFrame(frame)).toMatch(highlighted);
     // And the characters the query did not match are not inside that run.
-    expect(lastFrame(capture)).not.toMatch(new RegExp(`${ctrl(0x1b)}\\[[\\d;]*malpha`));
+    expect(lastFrame(frame)).not.toMatch(new RegExp(`${ctrl(0x1b)}\\[[\\d;]*malpha`));
   });
 });
 
@@ -343,18 +421,32 @@ describe("rows carry columns and an identity of their own", () => {
       { payload: "b", columns: [{ text: "worktree" }, { text: "beta" }] },
     ]);
 
-    const { capture } = await runInPty(scenario(`PROBE_ROWS_FILE="${path}"`), {
-      rows: ROWS,
-      drive: async (pty) => {
-        await opened(pty, "beta");
-        pty.write(KEY.escape);
-      },
+    const { frame } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
+      act: (pty) => opened(pty, "beta"),
     });
 
-    const [, first, second] = frameLines(capture);
+    const [, first, second] = frameLines(frame);
 
     expect(first?.indexOf("alpha")).toBe(second?.indexOf("beta") ?? -1);
     expect(first?.indexOf("alpha")).toBeGreaterThan(0);
+  });
+
+  test("a column is measured in terminal cells, not code points", async () => {
+    // A CJK title is half as many code points as it is columns wide. Sizing the box by code
+    // points would cut the far half off every cell in the column and misplace everything
+    // after it — and PR titles are exactly where this input arrives.
+    const path = rowsFile("wide-glyphs", [
+      { payload: "a", columns: [{ text: "日本語のタイトル" }, { text: "second" }] },
+      { payload: "b", columns: [{ text: "ascii" }, { text: "second" }] },
+    ]);
+
+    const { frame } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
+      act: (pty) => opened(pty, "ascii"),
+    });
+
+    const [, first] = frameLines(frame);
+
+    expect(first).toContain("日本語のタイトル");
   });
 
   test("Enter resolves the payload, which never appeared on screen", async () => {
@@ -364,13 +456,12 @@ describe("rows carry columns and an identity of their own", () => {
       { payload: "/worktrees/beta", columns: [{ text: "beta" }] },
     ]);
 
-    const { capture } = await runInPty(scenario(`PROBE_ROWS_FILE="${path}"`, { stdout }), {
-      rows: ROWS,
-      drive: async (pty) => {
+    const { capture } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`, { stdout }), {
+      quit: KEY.enter,
+      act: async (pty) => {
         await opened(pty, "beta");
         pty.write(KEY.down);
-        await Bun.sleep(150);
-        pty.write(KEY.enter);
+        await pty.waitUntil(selects("beta"));
       },
     });
 
@@ -379,15 +470,29 @@ describe("rows carry columns and an identity of their own", () => {
     expect(capture).not.toContain("/worktrees/");
   });
 
+  test("a burst of arrows moves that many rows", async () => {
+    // The selection half of the batched-keystroke case above: three downs in one chunk are
+    // three rows, not one.
+    const stdout = payloadPath("burst");
+
+    const { exitCode } = await driven(scenario("", { stdout }), {
+      quit: KEY.enter,
+      act: async (pty) => {
+        await opened(pty, "feature/thing-0");
+        pty.write(KEY.down.repeat(3));
+        await pty.waitUntil(selects("wt-3"));
+      },
+    });
+
+    expect(exitCode).toBe(0);
+    expect(await Bun.file(stdout).text()).toBe(`"/worktrees/wt-3"`);
+  });
+
   test("Escape resolves nothing", async () => {
     const stdout = payloadPath("cancel");
 
-    const { capture, exitCode } = await runInPty(scenario("", { stdout }), {
-      rows: ROWS,
-      drive: async (pty) => {
-        await opened(pty, "feature/thing-0");
-        pty.write(KEY.escape);
-      },
+    const { capture, exitCode } = await driven(scenario("", { stdout }), {
+      act: (pty) => opened(pty, "feature/thing-0"),
     });
 
     expect(exitCode).toBe(0);
@@ -411,18 +516,17 @@ describe("it degrades rather than crashing or hanging", () => {
     expect(capture).not.toContain("feature/thing-0");
   });
 
-  test("a row given a colour is coloured", async () => {
-    // The control. Without it the next case passes on a picker that never styles anything.
+  test("a row given a colour is coloured, even with stdout piped", async () => {
+    // The control, and a finding in its own right: chalk derives its level from stdout,
+    // which every shipping invocation of this picker redirects. Without `pick()` pinning the
+    // level from stderr this run would be colourless and the next case would pass for the
+    // wrong reason.
     const path = rowsFile("colour", [
       { payload: "a", columns: [{ text: "alpha", color: "green" }] },
     ]);
 
-    const { capture } = await runInPty(scenario(`PROBE_ROWS_FILE="${path}"`), {
-      rows: ROWS,
-      drive: async (pty) => {
-        await opened(pty, "alpha");
-        pty.write(KEY.escape);
-      },
+    const { capture } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
+      act: (pty) => opened(pty, "alpha"),
     });
 
     expect(hasColour(capture)).toBe(true);
@@ -438,13 +542,11 @@ describe("it degrades rather than crashing or hanging", () => {
       { payload: "b", columns: [{ text: "beta", color: "green" }] },
     ]);
 
-    const { capture } = await runInPty(scenario(`NO_COLOR=1 PROBE_ROWS_FILE="${path}"`), {
-      rows: ROWS,
-      drive: async (pty) => {
+    const { capture } = await driven(scenario(`NO_COLOR=1 PROBE_ROWS_FILE="${path}"`), {
+      act: async (pty) => {
         await opened(pty, "beta");
         pty.write("a");
-        await Bun.sleep(200);
-        pty.write(KEY.escape);
+        await pty.waitUntil((capture) => frameLines(capture)[0] === "❯ a");
       },
     });
 
@@ -464,6 +566,7 @@ describe("it degrades rather than crashing or hanging", () => {
               `${ctrl(0x1b)}]0;pwned${ctrl(0x07)}`,
               `${ctrl(0x9b)}10;1H`,
               ctrl(0x0a),
+              ctrl(0x202e),
               "the-bug",
             ].join(""),
           },
@@ -471,18 +574,15 @@ describe("it degrades rather than crashing or hanging", () => {
       },
     ]);
 
-    const { capture } = await runInPty(scenario(`PROBE_ROWS_FILE="${path}"`), {
-      rows: ROWS,
-      drive: async (pty) => {
-        await opened(pty, "fixthe-bug");
-        pty.write(KEY.escape);
-      },
+    const { capture, frame } = await driven(scenario(`PROBE_ROWS_FILE="${path}"`), {
+      act: (pty) => opened(pty, "fixthe-bug"),
     });
 
     expect(capture).not.toContain(ERASE_SCREEN);
     expect(capture).not.toContain("pwned");
+    expect(capture).not.toContain(ctrl(0x202e));
     expect(hasAbsoluteAddressing(capture)).toBe(false);
     // The visible characters survive; only the instructions are gone.
-    expect(frameLines(capture)[1]).toContain("fixthe-bug");
+    expect(frameLines(frame)[1]).toContain("fixthe-bug");
   });
 });

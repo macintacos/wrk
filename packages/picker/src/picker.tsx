@@ -80,7 +80,8 @@
 import chalk, { chalkStderr } from "chalk";
 import { Box, render, Text, useApp, useInput, useWindowSize } from "ink";
 import type { ReactElement } from "react";
-import { useCallback, useMemo, useState } from "react";
+import { useMemo, useReducer } from "react";
+import stringWidth from "string-width";
 
 import { fuzzyMatch } from "./fuzzy";
 import { sanitize, stripSgr } from "./sanitize";
@@ -97,8 +98,11 @@ const DEFAULT_PROMPT = "❯ ";
  */
 const GUTTER = ["  ", "▌ "] as const;
 
-/** The colour a matched character is drawn in. */
+/** The colour the picker draws attention with: a matched character, and the selected gutter. */
 const HIGHLIGHT = "cyan";
+
+/** What the list says when the query matches nothing. */
+const NO_MATCHES = "no matches";
 
 /** The fraction of the viewport the whole frame is allowed to occupy. */
 const HEIGHT_BUDGET = 0.8;
@@ -114,19 +118,24 @@ const COLOUR = !process.env.NO_COLOR;
 /** Control characters, which a keystroke handler must not append to the query. */
 const CONTROL = /\p{Cc}/u;
 
-/** One aligned column of a row. */
+/**
+ * One aligned column of a row.
+ *
+ * There is deliberately no `width`. A column is sized to its widest cell across **all**
+ * rows — all, not the filtered ones, so a column cannot change width as the user types —
+ * and a caller who wants a wider one pads its text. A per-column width declared on a
+ * per-row type has no coherent meaning when two rows disagree, and this is public surface
+ * EXC-1014 has to bless; the smallest surface that answers the need wins.
+ */
 export interface PickerColumn {
-  /** The text to display. Sanitized before it reaches the terminal. */
-  readonly text: string;
   /**
-   * Column width, in characters.
+   * The text to display.
    *
-   * Optional, and normally omitted: a column nobody sizes is sized to its widest cell
-   * across **all** rows — all, not the filtered ones, so a column cannot change width as
-   * the user types. Supply it for a column whose width is a design decision rather than a
-   * consequence, such as a one-glyph status gutter.
+   * Sanitized before it reaches the terminal, per [`./sanitize`](./sanitize). A cell that
+   * carries its own SGR keeps its colour but forgoes match highlighting — see
+   * {@link CellText} for why those two cannot both be had.
    */
-  readonly width?: number;
+  readonly text: string;
   /** A chalk colour name or hex string. Ignored under `NO_COLOR`. */
   readonly color?: string;
 }
@@ -149,7 +158,13 @@ export interface PickerRow<T> {
 export interface PickOptions<T> {
   /** The rows, in the order they will be shown. Filtering never reorders them. */
   readonly rows: readonly PickerRow<T>[];
-  /** What precedes the query on the first line. Defaults to `"❯ "`. */
+  /**
+   * What precedes the query on the first line. Defaults to `"❯ "`.
+   *
+   * Sanitized like row text is, even though a prompt comes from the calling program rather
+   * than from a pull request: a newline here would cost the frame a line just as surely,
+   * and one shared rule is easier to keep than two.
+   */
   readonly prompt?: string;
 }
 
@@ -170,7 +185,14 @@ interface Cell {
   /** {@link safe} with its colour removed — what matches, and what renders under `NO_COLOR`. */
   readonly plain: string;
   readonly color: string | undefined;
-  /** Resolved width, in characters. */
+  /**
+   * The column's resolved width, in **terminal cells**.
+   *
+   * A different unit from {@link offset} and {@link length} below, and deliberately so: this
+   * one becomes a `<Box width>`, which Ink sizes and truncates against `string-width`, so
+   * counting code points here sizes a column of CJK or emoji at half the space it occupies
+   * and destroys the far end of every cell in it.
+   */
   readonly width: number;
   /** Where this cell's text begins within its row's match text, in code points. */
   readonly offset: number;
@@ -199,41 +221,43 @@ interface Match<T> {
   readonly positions: readonly number[];
 }
 
-/** Code points, since that is the unit {@link fuzzyMatch} reports positions in. */
+/**
+ * Length in code points — the unit {@link fuzzyMatch} reports positions in.
+ *
+ * Never the unit a layout wants; {@link stringWidth} is that one. The two disagree for every
+ * wide, combining and emoji character, which is most of what makes a pull-request title
+ * interesting.
+ */
 const count = (text: string): number => Array.from(text).length;
 
 /**
  * Sanitizes, measures and lays out every row once.
  *
  * Once, rather than per keystroke: the widths are a property of the whole row set, and the
- * sanitizer is a regex pass over every cell. Both would otherwise run on every frame.
+ * sanitizer is a regex pass over every cell. Both would otherwise run on every frame — which
+ * is also why the sanitized forms are computed up front and the widths read from them,
+ * rather than each pass sanitizing the same text again.
  */
 function prepare<T>(rows: readonly PickerRow<T>[]): Prepared<T>[] {
+  const plain = rows.map((row) => row.columns.map((column) => stripSgr(sanitize(column.text))));
   const columnCount = Math.max(0, ...rows.map((row) => row.columns.length));
 
-  const widths = Array.from({ length: columnCount }, (_unused, column) => {
-    const cells = rows.map((row) => row.columns[column]);
-    const supplied = cells.map((cell) => cell?.width).filter((width) => width !== undefined);
-
-    // A column the caller sized keeps that size; one nobody sized is sized to fit.
-    return supplied.length > 0
-      ? Math.max(...supplied)
-      : Math.max(1, ...cells.map((cell) => count(stripSgr(sanitize(cell?.text ?? "")))));
-  });
+  const widths = Array.from({ length: columnCount }, (_unused, column) =>
+    Math.max(1, ...plain.map((cells) => stringWidth(cells[column] ?? ""))),
+  );
 
   return rows.map((row, index) => {
     let offset = 0;
     const cells = row.columns.map((column, columnIndex): Cell => {
-      const safe = sanitize(column.text);
-      const plain = stripSgr(safe);
+      const text = plain[index]?.[columnIndex] ?? "";
       const cell: Cell = {
         key: String(columnIndex),
-        safe,
-        plain,
+        safe: sanitize(column.text),
+        plain: text,
         color: column.color,
-        width: widths[columnIndex] ?? count(plain),
+        width: widths[columnIndex] ?? stringWidth(text),
         offset,
-        length: count(plain),
+        length: count(text),
       };
 
       // `+ 1` for the space the layout puts between columns, which the haystack joins on.
@@ -292,17 +316,14 @@ interface Segment {
  */
 function segment(text: string, positions: readonly number[]): Segment[] {
   const hit = new Set(positions);
-  const segments: Segment[] = [];
+  const segments: { at: number; text: string; matched: boolean }[] = [];
 
   Array.from(text).forEach((character, index) => {
     const matched = hit.has(index);
     const previous = segments.at(-1);
 
-    if (previous && previous.matched === matched) {
-      segments[segments.length - 1] = { ...previous, text: previous.text + character };
-    } else {
-      segments.push({ at: index, text: character, matched });
-    }
+    if (previous && previous.matched === matched) previous.text += character;
+    else segments.push({ at: index, text: character, matched });
   });
 
   return segments;
@@ -332,10 +353,13 @@ function CellText({
     return <Text wrap="truncate">{cell.plain}</Text>;
   }
 
-  // A cell carrying its own colour renders whole and unhighlighted. Slicing it at code-point
-  // offsets could cut an escape sequence in half, and half a sequence written to a terminal
-  // is the garbage this component exists not to emit. Colour is kept; only the highlight is
-  // given up, and only for a row no caller in this repository produces.
+  // A cell carrying its own colour can have its colour or its highlight, not both: the
+  // highlight is per-character `<Text>` nodes, and rebuilding those around an arbitrary run
+  // of SGR would mean tracking which attributes were open at each boundary and reopening
+  // them — a small ANSI state machine, for a row no caller in this repository produces. The
+  // trade is made toward colour, since that is what the caller asked for explicitly.
+  // (Rendering `plain` highlighted was the other option; it silently discards a caller's
+  // colour, which is worse than silently discarding a highlight.)
   if (positions.length === 0 || cell.safe !== cell.plain) {
     return (
       <Text wrap="truncate" color={cell.color} bold={selected}>
@@ -385,19 +409,71 @@ function Row<T>({
   );
 }
 
+/** Everything a keystroke can change. */
+interface State {
+  readonly query: string;
+  readonly cursor: number;
+  /** The first visible row, as a hint — {@link Picker} re-derives the real one each render. */
+  readonly top: number;
+}
+
+/**
+ * A keystroke's effect, expressed so it can be applied to a state it has not seen yet.
+ *
+ * This indirection is the whole reason there is a reducer here rather than three
+ * `useState`s. Ink parses a stdin *chunk* into however many events it holds and calls the
+ * `useInput` handler for each one **synchronously, in a loop** — its own parser splits
+ * repeated bytes precisely because a held-down key arrives that way. React does not
+ * re-render between those calls, so every handler in the batch closes over the same state
+ * and a value-form `setState` makes N keystrokes behave as one: three backspaces delete one
+ * character, three arrows move one row. A reducer applies each action to the result of the
+ * last, which is the only shape that cannot regress into that.
+ *
+ * `last` and `listRows` ride along on a move because the reducer cannot derive them: the
+ * match count depends on the filter and the row budget on the viewport. Both are constant
+ * across a batch, since neither changes without a re-render.
+ */
+type Action =
+  | { readonly type: "retype"; readonly edit: (query: string) => string }
+  | {
+      readonly type: "move";
+      readonly delta: number;
+      readonly last: number;
+      readonly listRows: number;
+    };
+
+/** Applies one keystroke. See {@link Action} for why this is a reducer. */
+function reduce(state: State, action: Action): State {
+  if (action.type === "retype") {
+    // A changed query invalidates the selection: the row under the cursor is probably not
+    // in the new result set, and "wherever the cursor happened to be" is not a selection a
+    // user made.
+    return { query: action.edit(state.query), cursor: 0, top: 0 };
+  }
+
+  const cursor = Math.min(Math.max(state.cursor + action.delta, 0), Math.max(action.last, 0));
+
+  return {
+    ...state,
+    cursor,
+    top: Math.min(Math.max(state.top, cursor - action.listRows + 1, 0), cursor),
+  };
+}
+
 /** What {@link Picker} needs beyond {@link PickOptions}. */
 interface PickerProps<T> extends PickOptions<T> {
-  /** Called with the chosen payload, before the app unmounts. Not called on dismissal. */
-  readonly onPick: (payload: T) => void;
+  /**
+   * Called once with the outcome — the chosen payload, or `null` for a dismissal — while the
+   * frame is still on screen, so the caller can erase it before the app unmounts.
+   */
+  readonly onDone: (payload: T | null) => void;
 }
 
 /** The component itself. */
-function Picker<T>({ rows, prompt, onPick }: PickerProps<T>): ReactElement {
+function Picker<T>({ rows, prompt, onDone }: PickerProps<T>): ReactElement {
   const { exit } = useApp();
   const { rows: viewportRows } = useWindowSize();
-  const [query, setQuery] = useState("");
-  const [cursor, setCursor] = useState(0);
-  const [top, setTop] = useState(0);
+  const [{ query, cursor, top }, dispatch] = useReducer(reduce, { query: "", cursor: 0, top: 0 });
 
   const prepared = useMemo(() => prepare(rows), [rows]);
   const matches = useMatches(prepared, query);
@@ -407,52 +483,44 @@ function Picker<T>({ rows, prompt, onPick }: PickerProps<T>): ReactElement {
   // is the threshold EXC-1009 measured.
   const listRows = Math.max(1, Math.floor(viewportRows * HEIGHT_BUDGET) - 1);
 
-  // Derived rather than stored, so the cursor stays visible even when a resize has changed
-  // `listRows` under a `top` that was correct for the old one.
+  // Derived rather than taken from state, so the cursor stays visible even when a resize has
+  // changed `listRows` under a `top` that was correct for the old one.
   const windowTop = Math.min(Math.max(top, cursor - listRows + 1, 0), cursor);
 
-  const retype = useCallback((next: string) => {
-    setQuery(next);
-    setCursor(0);
-    setTop(0);
-  }, []);
+  const finish = (payload: T | null) => {
+    onDone(payload);
+    exit();
+  };
 
   useInput((input, key) => {
-    if (key.escape) {
-      exit();
-      return;
-    }
-
-    if (key.return) {
-      const chosen = matches[cursor];
-      if (chosen) onPick(chosen.row.payload);
-      exit();
-      return;
-    }
+    if (key.escape) return finish(null);
+    if (key.return) return finish(matches[cursor]?.row.payload ?? null);
 
     if (key.upArrow || key.downArrow) {
-      const next = Math.min(
-        Math.max(cursor + (key.upArrow ? -1 : 1), 0),
-        Math.max(matches.length - 1, 0),
-      );
-      setCursor(next);
-      setTop(Math.min(Math.max(windowTop, next - listRows + 1, 0), next));
+      dispatch({ type: "move", delta: key.upArrow ? -1 : 1, last: matches.length - 1, listRows });
       return;
     }
 
     if (key.backspace || key.delete) {
-      retype(query.slice(0, -1));
+      dispatch({ type: "retype", edit: (current) => current.slice(0, -1) });
       return;
     }
 
     if (input !== "" && !key.ctrl && !key.meta && !CONTROL.test(input)) {
-      retype(query + input);
+      dispatch({ type: "retype", edit: (current) => current + input });
     }
   });
 
   return (
     <Box flexDirection="column">
-      <Text wrap="truncate">{`${prompt ?? DEFAULT_PROMPT}${query}`}</Text>
+      <Text wrap="truncate">{`${sanitize(prompt ?? DEFAULT_PROMPT)}${query}`}</Text>
+      {/* A filter that empties the list has to say so. Without this the frame collapses to
+          the query line alone, which reads the same as a picker that stopped working — and
+          Enter there resolves `null`, which a caller maps to a cancellation and prints
+          nothing at all, so the mistyped query would end in silence. */}
+      {matches.length === 0 && (
+        <Text dimColor={COLOUR} wrap="truncate">{`${GUTTER[0]}${NO_MATCHES}`}</Text>
+      )}
       {matches.slice(windowTop, windowTop + listRows).map((match, index) => (
         <Row
           key={match.row.key}
@@ -468,8 +536,14 @@ function Picker<T>({ rows, prompt, onPick }: PickerProps<T>): ReactElement {
 /**
  * Shows the picker and resolves what the user chose.
  *
+ * The picker erases its own frame on the way out, the way `fzf` does. A `wrk wt` wrapped in
+ * a shell function is run dozens of times a day, and a picker that left its list behind
+ * would push the user's prompt down twenty lines on every one of them.
+ *
  * @param options - The rows and the prompt; see {@link PickOptions}.
- * @returns The chosen row's payload, or `null` if the picker was dismissed with Escape.
+ * @returns The chosen row's payload, or `null`. `null` covers all three ways a run ends
+ *   without a choice: Escape, `Ctrl-C` (Ink's own `exitOnCtrlC`), and Enter on an empty
+ *   result set. A caller mapping this onto a cancellation should map all three.
  * @throws {@link NotATerminal} if stdin or stderr is not a TTY — see this module's header
  *   for why that is a refusal rather than a fallback.
  */
@@ -483,30 +557,38 @@ export async function pick<T>(options: PickOptions<T>): Promise<T | null> {
 
   let picked: T | null = null;
 
-  // Chalk's own level is derived from stdout; the frames go to stderr. Borrowed for the
-  // picker's lifetime and handed back, because a library that permanently retunes a shared
-  // singleton is a library that surprises its host.
-  // The `?? 1` floor rather than `Math.max`: stderr is a TTY by the check above, so a
-  // detected level of "none" is a detection that has already been wrong once — and
-  // `Math.max` widens the union to `number`, which is not what `level` accepts.
+  // Chalk derives its own level from stdout; the frames go to stderr, and `chalkStderr` is
+  // the instance chalk builds for that stream. Borrowed for the picker's lifetime and handed
+  // back, because a library that permanently retunes a shared singleton surprises its host.
+  // Taken as-is rather than floored: a level of zero on a TTY means `FORCE_COLOR=0`,
+  // `TERM=dumb` or `--no-color`, each of which is a person saying no.
   const level = chalk.level;
-  chalk.level = COLOUR ? (chalkStderr.level === 0 ? 1 : chalkStderr.level) : 0;
 
-  const instance = render(
-    <Picker
-      rows={options.rows}
-      prompt={options.prompt}
-      onPick={(payload) => {
-        picked = payload;
-      }}
-    />,
-    // stderr, because stdout is the machine channel. `patchConsole: false` because a
-    // library has no business rerouting its host's `console`, and `packages/wrk` writes its
-    // human output through its own `note()` rather than through `console` anyway.
-    { stdout: process.stderr, patchConsole: false },
-  );
+  // A holder rather than a `let`, because the callback needs the instance that the call
+  // creating it returns. `clear()` only erases while the app is still mounted — after
+  // `waitUntilExit` the log has been finalised and it is a no-op — so it is called from the
+  // keystroke that ends the run, not from around the await.
+  const control = { clear: () => {} };
 
   try {
+    chalk.level = COLOUR ? chalkStderr.level : 0;
+
+    const instance = render(
+      <Picker
+        rows={options.rows}
+        prompt={options.prompt}
+        onDone={(payload) => {
+          picked = payload;
+          control.clear();
+        }}
+      />,
+      // stderr, because stdout is the machine channel. `patchConsole: false` because a
+      // library has no business rerouting its host's `console`, and `packages/wrk` writes its
+      // human output through its own `note()` rather than through `console` anyway.
+      { stdout: process.stderr, patchConsole: false },
+    );
+    control.clear = instance.clear;
+
     await instance.waitUntilExit();
     return picked;
   } finally {
