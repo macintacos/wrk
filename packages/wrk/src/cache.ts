@@ -24,8 +24,9 @@
  *   cached here.
  * - **Single-flight refresh.** A burst of invocations against an existing entry — a shell
  *   that redraws its prompt three times in a second, or three shells doing it at once —
- *   starts one refresh, not one each. A lock directory serialises them across processes;
- *   the entry's mtime is stamped so a *failed* refresh is not retried for a full TTL.
+ *   starts one refresh, not one each. A lock directory serialises them across processes —
+ *   the mutex itself lives in [`./lock`](./lock) — and the entry's mtime is stamped so a
+ *   *failed* refresh is not retried for a full TTL.
  *
  * The root is XDG's, resolved by hand. `conf` and `env-paths` both answer
  * `~/Library/Caches` on macOS, which would quietly move the cache off the path the rest of
@@ -37,10 +38,11 @@
  * @packageDocumentation
  */
 
-import { mkdir, open, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { mkdir, open, rename, rm, utimes, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
 
+import { claim } from "./lock";
 import { cacheSlug } from "./naming";
 
 /**
@@ -157,71 +159,6 @@ async function readEntry(path: string): Promise<CacheEntry | null> {
   } finally {
     await handle.close();
   }
-}
-
-/** How long a lock may be held before it is assumed to belong to a process that died. */
-const LOCK_STALE_MS = 60_000;
-
-/**
- * What {@link claim} found.
- *
- * `held` and `abandoned` both mean "refresh, and clear the lock afterwards"; they are
- * distinguished only because the second is the accepted ceiling and reads as one at the
- * call site. `lost` means someone else is already refreshing.
- */
-type Claim = "held" | "lost" | "abandoned";
-
-/**
- * Takes the refresh lock for an entry, or reports who else has a claim on it.
- *
- * A bare `mkdir` — no `recursive` — is the whole mechanism. It is one syscall that either
- * creates the directory or fails `EEXIST`, so an arbitrary number of processes arriving
- * together agree on a single winner with nothing to coordinate. It is the same move
- * {@link writeCache} makes with `rename`: lean on one atomic call rather than assemble the
- * guarantee in userspace.
- *
- * A lock needs a bound, or a process killed mid-refresh wedges the entry into serving
- * stale contents forever — strictly worse than the duplicated refresh this exists to stop.
- * One older than {@link LOCK_STALE_MS} is therefore treated as `abandoned`: **ignored, not
- * broken.** Breaking it would need a protocol of its own, because deleting it and
- * re-creating it is a check-then-act split across two syscalls — two callers can both
- * delete, both create, both believe they won, and then each remove the other's lock on the
- * way out. Ignoring needs no protocol, and degrades to something this module already
- * accepts and documents: for one burst, an entry with an abandoned lock behaves like a
- * cold start. Every caller in that burst clears the lock as it leaves, so the next one
- * locks normally.
- *
- * `ENOENT` — the per-repo directory vanished under us, a cache clear or a stray `rm -rf` —
- * is `abandoned` rather than a fault: there is nothing to lock, and {@link writeCache}
- * re-creates the tree. Any other failure propagates rather than degrading to an unlocked
- * refresh, because a permanently unwritable cache directory would otherwise serve stale
- * contents forever with no signal anywhere, which is the one outcome worse than the race.
- *
- * @param lock - Path the lock directory should occupy.
- * @returns Whether this call may refresh, and whether it owns the lock's removal.
- * @throws If the lock cannot be created for a reason other than already existing or its
- * parent having gone away.
- */
-// ponytail: an abandoned lock is ignored rather than broken, so a burst arriving on one
-// refreshes in full before the next burst locks again. Give the lock a real
-// break-and-take protocol only if abandoned locks stop being rare.
-async function claim(lock: string): Promise<Claim> {
-  try {
-    await mkdir(lock);
-
-    return "held";
-  } catch (error) {
-    const { code } = error as NodeJS.ErrnoException;
-    if (code === "ENOENT") return "abandoned";
-    if (code !== "EEXIST") throw error;
-  }
-
-  // A lock that vanished between those two calls counts as someone else's: `lost` costs a
-  // stale read, and racing to re-create it is the check-then-act above in miniature.
-  const existing = await stat(lock).catch(() => null);
-  if (existing === null || Date.now() - existing.mtimeMs < LOCK_STALE_MS) return "lost";
-
-  return "abandoned";
 }
 
 /**
