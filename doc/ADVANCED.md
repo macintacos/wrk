@@ -281,8 +281,10 @@ medians of five runs:
 
 | | idle | under eight spinning CPU burners |
 | --- | --- | --- |
-| `wrk wt` | 256 ms | 312 ms (worst run 384 ms) |
-| `wrk pr` | 279 ms | 322 ms (worst run 384 ms) |
+| `wrk wt` | 256 ms | 312 ms |
+| `wrk pr` | 279 ms | 322 ms |
+
+No single loaded run exceeded 384 ms.
 
 The gap between the two is deliberate. A budget pinned just above the observed figure
 fails on a loaded machine for a reason that is not a regression, and a suite that fails
@@ -293,9 +295,9 @@ enough to stay under it.
 **Two things sit outside the budget, both by construction.**
 
 The **first run in a repository** has nothing cached, and for `wrk pr` the pull requests
-*are* the rows — so it waits for `gh` once, measured at the full stub delay. `wrk wt` does
-not: its rows come from git, so a cold cache costs it nothing at the draw (293 ms) and
-only delays the annotation.
+*are* the rows — so it waits for `gh` once, measured at 4426 ms against the four-second
+stub. `wrk wt` does not: its rows come from git, so a cold cache costs it nothing at the
+draw (293 ms) and only delays the annotation.
 
 **Dismissing does not stop an in-flight `gh`.** Nothing kills the fetch, so a run that is
 still waiting on one stays alive until it answers — measured at the full four seconds

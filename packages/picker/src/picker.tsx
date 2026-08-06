@@ -403,8 +403,9 @@ function prepare<T>(rows: readonly PickerRow<T>[]): Prepared<T>[] {
 // time. EXC-1020 measured it rather than guessing, and the answer is that it does not
 // matter at the sizes this component is used at: 0.05–0.17 ms per keystroke at 12–50 rows
 // and 0.2–0.7 ms at 200, against 6–9 ms at 5,000. `compileQuery(query) -> (textCodePoints)
-// => match`, with each row's code points cached, is still the fix — it is worth building at
-// the point a caller lists low thousands of rows, where a keystroke starts to cost a frame.
+// => match`, with each row's code points cached, is still the fix. Extrapolating those
+// figures, a keystroke reaches a whole 60 Hz frame somewhere past 10,000 rows, so that is
+// the order of magnitude at which building it starts to buy something.
 // A replacement is the second trigger and the more expensive one, since it re-runs `prepare`
 // over every cell as well as this pass: 0.2 ms at 12 rows, 0.8 ms at 50, 58 ms at 5,000, of
 // which `prepare` is four fifths. It is also far rarer, one or two per run against dozens of
@@ -461,11 +462,12 @@ const NO_LINES: readonly PreviewLine[] = [];
 // passes through, neither debounced. `preview.ts` records the same ceiling from its end and
 // says the fix belongs to the caller, which is this — a timer here would collapse both.
 // EXC-1020 measured a sweep down an eight-row list at seven `gh pr view` spawns, one per row
-// the cursor landed on, and left the debounce out: the pane is off the latency budget by
-// construction — `wrk pr` is interactive in ~280 ms while its first preview `gh` sleeps four
-// seconds — so what this costs is process churn rather than anything a user waits through.
-// The interval stays unchosen for that reason, a guessed one being a delay felt for no
-// measured cause. Revisit if a caller's preview is expensive enough that the churn shows.
+// the cursor landed on, and left the debounce out: none of it is in front of a frame, `wrk pr`
+// being interactive in ~280 ms while its first preview `gh` still has four seconds to run. It
+// is not free, though — a caller that does not `unref` its fetch pays for the last of those
+// spawns on the way *out*, which `preview.ts`'s marker and `doc/ADVANCED.md` both record. The
+// interval stays unchosen because a guessed one is a delay felt for no measured cause; what
+// would settle it is a measurement of the exit, not of the sweep.
 function usePreview<T>(
   preview: ((payload: T, width: number) => string | Promise<string>) | undefined,
   row: Prepared<T> | undefined,

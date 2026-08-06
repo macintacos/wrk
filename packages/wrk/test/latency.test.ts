@@ -10,16 +10,17 @@
  * when a row is on screen, so `bash`, `bun`, the module graph, `git`, the config read and the
  * cache read are all inside the number.
  *
- * **Two numbers, and conflating them is how a timing suite becomes a re-run ritual.**
- * {@link OBSERVED_MS} is what the commands cost — measured, recorded, and asserted on by
- * nothing. {@link INTERACTIVE_MS} is what the suite fails at, and it is set from the stub's
- * own delay rather than from the observed figure: at half of {@link DELAY_SECONDS} it is
- * roughly five times the worst run seen on a machine under eight spinning CPU burners, and
- * still half of what the fastest possible implementation that *waited* for `gh` could
- * achieve. Nothing between the two is a legitimate outcome, so a loaded machine cannot fail
- * these cases and a regression cannot pass them. `pr.test.ts`'s `CEILING_MS` is the same
- * construction, and it says the same thing about why: a regression guard rather than a
- * benchmark.
+ * **Two numbers, and conflating them is how a timing suite becomes a re-run ritual.** What the
+ * commands cost is ~260–320 ms — measured on Apple silicon, medians of five runs, `wrk wt` at
+ * 256 ms and `wrk pr` at 279 ms idle against 312 ms and 322 ms under eight spinning CPU
+ * burners, worst single run 384 ms — and it is recorded in `doc/ADVANCED.md` and asserted on by
+ * nothing. {@link INTERACTIVE_MS} is what the suite fails at, and it is set from the stub's own
+ * delay rather than from that figure: at half of {@link DELAY_SECONDS} it is roughly five times
+ * the worst loaded run, and still half of what the fastest possible implementation that
+ * *waited* for `gh` could achieve. Nothing between the two is a legitimate outcome, so a loaded
+ * machine cannot fail these cases and a regression cannot pass them. `pr.test.ts`'s
+ * `CEILING_MS` is the same construction, and it says the same thing about why: a regression
+ * guard rather than a benchmark.
  *
  * **"Warm cache" means seeded *and stale*, not seeded and fresh.** A fresh entry runs no `gh`
  * at all, so a delay stubbed into one would prove nothing whatever. Back-dating the entry past
@@ -37,15 +38,24 @@
  * `wt.test.ts`'s gated one and `prpick.test.ts`'s logging one. A **delay** rather than a gate
  * because the question is elapsed time; a gate answers ordering, which is EXC-1017's.
  *
+ * **These are the first driven cases to reach the detached refresh**, and each therefore leaves
+ * a `pr.ts` worker and its two sleeping `gh` children running for a few seconds past its own
+ * end — outliving `cleanupFixtures`, which removes the container out from under them. That is
+ * accepted rather than overlooked: the worker writes only through `cached`, which does not
+ * write when the refresh throws, so a container that has been deleted leaves nothing behind and
+ * recreates nothing. Anything here that starts *depending* on the worker's answer needs to wait
+ * for it instead.
+ *
  * @packageDocumentation
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { KEY, SHOW_CURSOR, typeUntil } from "../../picker/test/fixtures/pty";
 import { cachePath } from "../src/cache";
+import { DEFAULTS } from "../src/config";
 import type { PullRequest } from "../src/gh";
 import {
   addRunWorktree,
@@ -80,27 +90,40 @@ const DELAY_SECONDS = 4;
 const INTERACTIVE_MS = (DELAY_SECONDS * 1000) / 2;
 
 /**
- * What the two commands were actually measured at, for the reader comparing the assertion
- * above against reality. Recorded rather than asserted on.
+ * How long a single wait may take, and how long `bun test` gives a whole case.
  *
- * Apple silicon, warm-and-stale cache, `gh` stubbed as below, medians of five runs: `wrk wt`
- * 256 ms and `wrk pr` 279 ms idle; 312 ms and 322 ms under eight spinning CPU burners, worst
- * single run 384 ms. `doc/ADVANCED.md` carries the same figures for a user rather than for a
- * maintainer.
+ * Both sit past {@link DELAY_SECONDS} rather than under it, and the draw wait is the one that
+ * has to: an implementation that blocks on `gh` must be *observed* at the stub's full delay so
+ * it fails on the budget assertion, which names the number, rather than on a timeout, which
+ * does not. Well past, because dismissing does not stop an in-flight `gh` either — `wrk pr`'s
+ * preview pane has one out on the first frame and the process stays alive until it answers.
+ * Not further past: the case timeout has to be able to fire *after* a wait rather than during
+ * one, or `waitUntil`'s "timed out; last frame: …" is swallowed by bun's own message.
+ * `pr.test.ts`'s clock case takes an explicit timeout for the same reason.
  */
-const OBSERVED_MS = "≈260–320 ms";
-
-/**
- * How long a case waits for a run to finish, and how long `bun test` gives it.
- *
- * Both are well past {@link DELAY_SECONDS} because dismissing does not stop an in-flight `gh`:
- * `wrk pr`'s preview pane has one out on the first frame, and the process stays alive until it
- * answers. `pr.test.ts`'s clock case takes an explicit timeout for the same reason.
- */
-const SETTLE_MS = 20_000;
+const SETTLE_MS = 10_000;
 const CASE_TIMEOUT_MS = 30_000;
 
-/** A pull-request row as `gh` reports one. */
+/** Height of the pty every driven case runs in, matching `picker.test.ts`'s. */
+const ROWS = 24;
+
+/**
+ * How far back {@link seedStale} dates the entry it writes: a day, which no TTL comes near.
+ *
+ * `DEFAULTS.cache.ttls["pr-graph"]` is fifteen minutes, and this has to stay clear of whatever
+ * that becomes — {@link seedStale} asserts the gap rather than trusting it.
+ */
+const AGED_MS = 86_400_000;
+
+/**
+ * A pull-request row as `gh` reports one.
+ *
+ * A third copy of `wt.test.ts`'s and `prpick.test.ts`'s, deliberately: `fixtures/repo.ts`
+ * builds repositories and knows nothing of `src/gh`'s types, and moving three trivial builders
+ * into it to save nine lines would give the shared fixture module a dependency on the schema
+ * every suite asserts against. That module's own header states the same rule for the six files
+ * that carry their own copies of *its* helpers.
+ */
 function pull(number: number, head: string, extra: Partial<PullRequest> = {}): PullRequest {
   return {
     number,
@@ -140,10 +163,13 @@ function slowGh(rows: readonly PullRequest[]): string {
       "#!/bin/sh",
       `sleep ${DELAY_SECONDS}`,
       'case "$*" in',
+      `  *"--state open"*) cat "${answer}" ;;`,
+      // A body rather than falling through: nothing asserts on it, but a `gh pr view` answering
+      // `[]` is a stub that lies about the shape of the thing it stands in for, and the next
+      // case to read the pane would be reading the fallback by accident.
+      `  *" view "*) printf 'PREVIEW-BODY %s\\n' "$3" ;;`,
       // The merged query answers `[]` — `gh` saying "none" rather than "could not answer",
       // which is the distinction `gh.ts` documents and what lets an entry be written at all.
-      `  *"--state open"*) cat "${answer}" ;;`,
-      `  *" view "*) printf 'PREVIEW-BODY %s\\n' "$3" ;;`,
       "  *) echo '[]' ;;",
       "esac",
       "",
@@ -162,14 +188,28 @@ function slowGh(rows: readonly PullRequest[]): string {
  * simply never reached, and the case would pass against an implementation that blocks. Aged,
  * the run takes the path that matters: stored rows served immediately, refresh detached.
  * `pr.test.ts` and `preview.test.ts` both age their entries this way.
+ *
+ * That precondition is **asserted rather than assumed**, and it is the one thing here worth
+ * asserting: a TTL raised past a day, or a filesystem that quietly ignores `utimesSync`, would
+ * leave both cases passing at the same ~280 ms while proving nothing whatever. The failure is
+ * silent by construction, so it needs a check that is not. Every other `gh`-shaped fixture in
+ * this suite makes the same property observable, by logging what `gh` was asked; the equivalent
+ * here would race, because the refresh these commands start is a *detached* process that may
+ * not have reached its `gh` by the time the run is over.
  */
 function seedStale(container: string, cacheHome: string, rows: readonly PullRequest[]): void {
   const entry = cachePath({ name: "pr-graph", container, root: join(cacheHome, "wrk") });
   mkdirSync(dirname(entry), { recursive: true });
   writeFileSync(entry, JSON.stringify(rows));
 
-  const when = new Date(Date.now() - 86_400_000);
+  const when = new Date(Date.now() - AGED_MS);
   utimesSync(entry, when, when);
+
+  // The child reads no configuration — `childEnv` points `XDG_CONFIG_HOME` at an empty
+  // directory — so `DEFAULTS` really is the threshold it will compare this mtime against.
+  expect(Date.now() - statSync(entry).mtimeMs).toBeGreaterThan(
+    DEFAULTS.cache.ttls["pr-graph"] ?? 0,
+  );
 }
 
 /** What {@link warmRepo} built: somewhere to run from, a stale entry, and a slow `gh`. */
@@ -199,8 +239,8 @@ function warmRepo(): Fixture {
  * between this line and the spawn is two `mkdtemp` calls, so the figure **over**-counts by
  * well under a millisecond and can never under-count.
  *
- * `drawn` is waited for rather than the first row: it names the **last** row the frame holds,
- * so a frame still being written cannot satisfy it and be read as an interactive picker.
+ * `drawn` names the **last** row the frame holds, never the first: a needle drawn earlier would
+ * let the clock stop on a frame still being written and read it as an interactive picker.
  *
  * The dismissal is two steps rather than `quit`. `quit` waits for the script's exit line, and
  * an escape re-typed past Ink's unmount is echoed by the line discipline into a `bash` that
@@ -208,6 +248,13 @@ function warmRepo(): Fixture {
  * whatever the in-flight `gh` has left. So the keystroke is aimed at the unmount, and the exit
  * is waited for separately. `wt.test.ts`'s "a refresh still running when the picker closes"
  * case established the pattern.
+ *
+ * **`exit` is timed from the unmount, not from the start**, and the distinction is the
+ * difference between a guard and a flake. `typeUntil` re-types on a 200 ms interval up to
+ * twelve times, so a run whose unmount was slow to appear can spend 2.4 s in there — more than
+ * {@link INTERACTIVE_MS} on its own, on a machine that is merely loaded. Measuring from the
+ * keystroke that landed puts that budget outside the number and leaves the assertion aimed at
+ * the thing it is about: whether anything is still being waited on once the pick is over.
  */
 async function timeToInteractive(
   fixture: Fixture,
@@ -215,6 +262,7 @@ async function timeToInteractive(
   drawn: string,
 ): Promise<{ interactive: number; exit: number }> {
   let interactive = 0;
+  let exit = 0;
   const started = Date.now();
 
   const { capture } = await driveCli(
@@ -225,35 +273,43 @@ async function timeToInteractive(
       interactive = Date.now() - started;
 
       await typeUntil(session, KEY.escape, (text) => text.includes(SHOW_CURSOR), "closed");
+      const dismissed = Date.now();
+
       await session.waitFor(ENDED, SETTLE_MS);
+      exit = Date.now() - dismissed;
     },
-    { cacheHome: fixture.cacheHome, path: fixture.path, rows: 24 },
+    { cacheHome: fixture.cacheHome, path: fixture.path, rows: ROWS },
   );
 
   // Dismissed, so the run must have taken the cancellation path — a case that measured a fast
   // frame from a command that then failed would be measuring a refusal being printed.
   expect(status(capture)).toBe(130);
 
-  return { interactive, exit: Date.now() - started };
+  return { interactive, exit };
 }
 
-describe(`the picker latency budget — interactive within ${INTERACTIVE_MS} ms, observed ${OBSERVED_MS}`, () => {
+describe(`the picker latency budget — interactive within ${INTERACTIVE_MS} ms`, () => {
   test(
     "wrk wt draws its worktrees, annotated from the stale entry, without waiting for gh",
     async () => {
-      // The needle is the **annotated** frame rather than the bare one, which is strictly the
-      // later of the two and therefore a conservative clock — and it is what makes this a
-      // *warm-cache* claim rather than a claim about an empty picker: the `#11` on screen came
-      // off disk while the only `gh` on `PATH` has answered nothing. That the bare list precedes
-      // it at all is `wt.test.ts`'s claim, proved there with a gate rather than a delay.
+      // The needle is the last cell of the last row, and it exists only on an **annotated**
+      // frame — a title comes from the pull request, where a bare row is its branch name alone.
+      // So one needle does both jobs: it cannot be satisfied by a half-written frame, and it
+      // cannot be satisfied by a picker drawing on nothing, which is what makes this a
+      // *warm-cache* claim. That the bare list precedes the annotation at all is `wt.test.ts`'s
+      // claim, proved there with a gate rather than a delay.
       const fixture = warmRepo();
-      const { interactive, exit } = await timeToInteractive(fixture, "wt", "#11");
+      const { interactive, exit } = await timeToInteractive(
+        fixture,
+        "wt",
+        "the EXC-2/thing-2 change",
+      );
 
       expect(interactive).toBeLessThan(INTERACTIVE_MS);
 
-      // The whole run, not just the frame: `wt`'s refresh is detached, so a slow `gh` costs the
-      // *process* nothing either. This is the half `pr.test.ts` proves for one child call and
-      // this file proves for the command a person actually types.
+      // And the run ends when the pick does: `wt`'s refresh is detached, so a slow `gh` costs
+      // the *process* nothing either. This is the half `pr.test.ts` proves for one child call
+      // and this file proves for the command a person actually types.
       expect(exit).toBeLessThan(INTERACTIVE_MS);
     },
     CASE_TIMEOUT_MS,
@@ -265,7 +321,11 @@ describe(`the picker latency budget — interactive within ${INTERACTIVE_MS} ms,
       // The stronger of the two: `prpick.ts` awaits `pullRequests` *in front of* its draw, so
       // there is nothing behind which a blocking fetch could hide. The preview pane's own
       // `gh pr view` is the same sleeping stub and is deliberately not waited for — a list you
-      // can type into and choose from is interactive whether or not the pane has landed.
+      // can type into and choose from is interactive whether or not the pane has landed, and
+      // waiting on the pane is what would put the stub's delay back inside the clock.
+      //
+      // `#11` is the last row: `openPullRequests` sorts most-recently-updated first and breaks
+      // the timestamp tie on the higher number, so `#12` leads.
       const fixture = warmRepo();
       const { interactive } = await timeToInteractive(fixture, "pr", "#11");
 

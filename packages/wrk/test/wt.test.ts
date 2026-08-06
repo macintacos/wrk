@@ -264,11 +264,11 @@ function repoWith(count: number): { container: string; checkout: string; worktre
  * the process would not exercise it. No network is touched either way — the rows are handed
  * over from disk, per the suite's standing rule that `gh` is never really run.
  *
- * The wait is **bounded**, and that is not defensiveness. `runInPty` propagates a driver's
- * failure without awaiting or killing the child, so a case that throws before opening the gate
- * leaves this script polling — and an unbounded loop would poll until the whole test process
- * exits. Giving up answers as a `gh` that could not answer, which is an outcome `gh.ts` already
- * has a meaning for, rather than a hang.
+ * The wait is **bounded**, and that is not defensiveness. `runInPty` kills its child when a
+ * driver throws, but the signal reaches the foreground process group rather than the tree, so a
+ * copy of this script that a *detached* refresh started outlives it — and an unbounded loop
+ * would poll until the whole test process exits. Giving up answers as a `gh` that could not
+ * answer, which is an outcome `gh.ts` already has a meaning for, rather than a hang.
  *
  * `sleep` and `cat` are symlinked in beside `git` rather than spelled as absolute paths: the
  * script's own `PATH` is this directory, and `/bin` is where they live on this machine rather
