@@ -28,6 +28,7 @@
 import { Command } from "@commander-js/extra-typings";
 
 import { renderConversion, resolveConversion } from "./convert";
+import { resolveRepo } from "./discover";
 import { Cancelled, Refusal } from "./errors";
 import { emit, emitLine, note, reportFailure } from "./output";
 import { preflight } from "./preflight";
@@ -122,7 +123,12 @@ export function buildProgram(): Command {
       getOutHelpWidth: () => process.stderr.columns ?? 80,
     })
     .action(async ({ printPath }) => {
-      const chosen = await chooseWorktree(process.cwd());
+      // `resolveRepo` first, because `chooseWorktree` has no answer at all from outside a
+      // repository — the case a removed worktree leaves the caller in. It hands back the cwd
+      // untouched whenever there *is* one, so on every ordinary run this is one `rev-parse`
+      // and nothing else; when there is not, it recovers a container and `wt` proceeds from
+      // there exactly as it would have. See [`./discover`](./discover).
+      const chosen = await chooseWorktree(await resolveRepo(process.cwd()));
       // Thrown rather than returned, because throwing unwinds: the whole of what the cd
       // protocol promises is that a dismissed picker leaves stdout empty, and control flow
       // enforces that where a checked sentinel would only ask for it. See `./errors`.

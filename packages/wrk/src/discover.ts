@@ -8,45 +8,46 @@
  * whole of that, and it is the first line of a picker command rather than a branch buried
  * inside one.
  *
- * **"Re-enters the normal flow" is a return value, not a recursion.** The fish implementation
- * this replaces ends its recovery with `builtin cd $target; cdwt` — it moves the shell and
- * calls itself. A command that takes its working directory as a parameter needs neither: it
- * asks {@link resolveRepo} where to work and then runs exactly as it would have anywhere else.
- * That is why the answer is a directory, and why a cwd already inside a repository comes back
- * untouched — the recovery is invisible on every run that does not need it.
+ * **"Re-enters the normal flow" is a return value, not a recursion.** The recovery ends by
+ * *answering a directory*, which the caller then works from exactly as it would work from any
+ * other — [`./cli`](./cli) spells that as `chooseWorktree(await resolveRepo(process.cwd()))`.
+ * The shell implementation this replaces has to `cd` and call itself instead, because its
+ * every step reads the shell's own `$PWD`; a module whose functions all take a `cwd` does not.
  *
  * **This module is separate from [`./repo`](./repo) because it can block on a keystroke.**
  * `repo.ts` answers questions about a cwd, and every one of its functions is a pure query over
  * git's output. {@link resolveRepo} opens a picker. Keeping the interactive one out of the
  * module every other module imports is what stops "where am I?" from ever becoming a prompt.
  *
- * **Three things the fish did are deliberately not ported.** Its search path (`~/GitLocal`) and
- * its depth (`find -mindepth 2 -maxdepth 2`) are now `search.roots` and `search.depth`, which
- * [`./config`](./config) has carried since the config layer landed for precisely this caller.
- * And its `while` loop, which walked the cwd upward looking for a path segment named
- * `*worktrees*` and then for one named `*claude*`, is gone entirely: it decoded the old
- * `.claude/worktrees/<name>` nesting, which the bare-repo layout does not have, so under the
- * layout `wrk` actually uses it walked to `/` and found nothing every time. What survives of
- * that guess is its first line — under the bare-repo layout an orphaned cwd is
- * `<container>/<worktree-dir>`, so the parent directory's *name* is the container's name, and
- * that is the hint {@link resolveRepo} prefers a candidate by.
+ * **The search path and depth are configuration, not constants.** `search.roots` and
+ * `search.depth` have sat unread in [`./config`](./config) since the config layer landed, for
+ * precisely this caller; they are what replaces the `find ~/GitLocal -mindepth 2 -maxdepth 2`
+ * the shell implementation hardcodes, and a root whose containers sit at a different nesting is
+ * unusable with either frozen.
+ *
+ * **Which candidate the orphan meant is decided by path containment, not by name.** A cwd that
+ * is no longer a work tree is still *written down* as a path, and the container it lived in is
+ * whichever candidate that path sits inside — at any depth, whether the shell was in the
+ * worktree root or four directories below it. Matching on the directory *name* instead is both
+ * looser and tighter in the ways that hurt: `~/Downloads/wrk/tmp` would silently resolve to the
+ * real `wrk` container, while `<container>/<worktree>/packages/wrk` would match nothing at all.
  *
  * @packageDocumentation
  */
 
 import { readdir, stat } from "node:fs/promises";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, sep } from "node:path";
 
 import { NotATerminal, type PickerRow, pick } from "@macintacos/wrk-picker";
 
 import { type ConfigSources, loadConfig } from "./config";
 import { Cancelled, Refusal } from "./errors";
-import { locate } from "./repo";
+import { containerFor } from "./repo";
 
 /** The bare clone inside a container, as `repoSetup` and the conversion recipe both name it. */
 const BARE_DIR = ".bare";
 
-/** The pointer file beside it, holding `gitdir: ./.bare`. A **file**, which is the whole test. */
+/** The pointer file beside it, holding `gitdir: ./.bare`. */
 const GIT_POINTER = ".git";
 
 /**
@@ -89,8 +90,8 @@ async function isContainer(path: string): Promise<boolean> {
  * Every container sitting exactly `depth` levels below `dir`, unsorted.
  *
  * Dot-directories are skipped, which is what keeps a scan out of `.bare` and `.git` — a deep
- * enough `search.depth` would otherwise walk a repository's object store, and every directory
- * in it would be `stat`ed twice on the way past.
+ * enough `search.depth` would otherwise walk a repository's object store, `readdir`ing
+ * thousands of directories to reach a level that holds no container.
  *
  * A directory that cannot be read contributes nothing rather than raising. That covers a root
  * that does not exist, one the user cannot read, and a *file* where a directory was expected —
@@ -117,12 +118,16 @@ async function containersUnder(dir: string, depth: number): Promise<string[]> {
  * repository. `0` means each root is itself a candidate, which is what
  * [`./config`](./config)'s own schema documents.
  *
- * @param roots - Absolute directories to scan. Overlapping roots are fine; each container is
- *   answered once.
+ * @param roots - Absolute directories to scan. Listing one twice is fine; each container *path*
+ *   is answered once. Two roots reaching the same container by different paths — one of them
+ *   through a symlink — are two answers, because the deduplication is over the strings.
  * @param depth - How far below a root a container sits.
- * @returns The containers' absolute paths, deduplicated and sorted. Sorted because the answer
- *   becomes picker rows, and `readdir` order is whatever the filesystem felt like — an
- *   unsorted list would put the same repositories in a different order on two machines.
+ * @returns The containers' absolute paths, deduplicated and sorted. Built by `join` and
+ *   therefore **not** realpath-resolved, unlike every path [`./repo`](./repo) returns: what
+ *   comes back is a directory to work *from*, spelled the way the user's own config spells it,
+ *   and a caller keying a cache off the repository still goes through `containerFor`. Sorted
+ *   because the answer becomes picker rows, and `readdir` order is whatever the filesystem felt
+ *   like — an unsorted list would order the same repositories differently on two machines.
  *
  * @example
  * ```ts
@@ -153,22 +158,26 @@ function containerRow(container: string): PickerRow<string> {
  *
  * The first call of a picker command. A cwd that is already in a repository — a checkout, a run
  * worktree, or the container itself — comes straight back, and nothing else in this module runs:
- * no config is read and no directory is scanned, so the cost on the ordinary path is the two
- * `rev-parse` spawns {@link locate} makes anyway.
+ * no config is read and no directory is scanned, so the ordinary path costs one `rev-parse`
+ * spawn and one `stat`.
  *
- * Outside a repository, the configured roots are scanned and the answer is narrowed the way the
- * fish implementation narrowed it. Candidates whose directory name matches the orphaned cwd's
- * parent are preferred — under the bare-repo layout that parent *is* the container the deleted
- * worktree lived in — and if none match, every candidate is offered. Either way a single
- * remaining choice is taken without opening anything, which is what makes recovery from a
- * removed worktree silent in the case that matters.
+ * Outside a repository, the configured roots are scanned and the candidates narrowed to the one
+ * `cwd` sits inside, if any — see this module's header for why containment rather than the
+ * directory's name. A single remaining choice is taken without opening anything, which is what
+ * makes recovery from a removed worktree silent in the case that matters; several open the
+ * picker; and when nothing contains `cwd` the whole set is offered rather than nothing.
  *
  * The config is loaded with the caller's `sources` and therefore with no container, which is
  * correct rather than a shortcut: `ConfigSources.container` documents `null` as what a caller
  * outside any repository has, so only the machine-wide layer applies. There is no container
  * whose per-repo layer could be read — finding one is the point of the call.
  *
- * @param cwd - Where the command was run.
+ * @param cwd - Where the command was run. A path that **does not exist** is accepted and is the
+ *   removed-worktree case — but reaching it takes care on the caller's side, because
+ *   `process.cwd()` cannot produce one: Bun refuses to start a script at all when its working
+ *   directory has been unlinked, and Node's `process.cwd()` throws `ENOENT`. A caller that wants
+ *   the shell's own idea of where it stands, which survives the unlink, passes `$PWD` through
+ *   rather than reading it back from the process.
  * @param sources - Which config layers to read; see `ConfigSources`. Defaults to the
  *   machine-wide file alone.
  * @returns An absolute directory inside a repository: `cwd` itself, or the chosen container.
@@ -187,13 +196,11 @@ function containerRow(container: string): PickerRow<string> {
  * ```
  */
 export async function resolveRepo(cwd: string, sources: ConfigSources = {}): Promise<string> {
-  // A directory that is not there is `outside` by definition, and is the issue's headline case
-  // — the worktree you were standing in was removed. It is checked here rather than left to
-  // {@link locate} because git would fail to *spawn* rather than answer: `run` rejects with
-  // `ENOENT` on a cwd that does not exist, and that rejection is a missing-git report, so
-  // nothing downstream maps it to a "no repository" answer.
+  // The existence check is not redundant with `containerFor`: git would fail to *spawn* on a
+  // directory that is not there, and `run` rejects that as `ENOENT` — a report that git is
+  // missing, which nothing downstream maps back to "no repository".
   const here = await stat(cwd).catch(() => null);
-  if (here?.isDirectory() === true && (await locate(cwd)).kind !== "outside") return cwd;
+  if (here?.isDirectory() === true && (await containerFor(cwd)) !== null) return cwd;
 
   const { roots, depth } = (await loadConfig(sources)).search;
   const found = await findContainers(roots, depth);
@@ -203,18 +210,18 @@ export async function resolveRepo(cwd: string, sources: ConfigSources = {}): Pro
     );
   }
 
-  const hint = basename(dirname(cwd));
-  const named = found.filter((container) => basename(container) === hint);
-  const choices = named.length > 0 ? named : found;
+  const inside = found.filter((c) => cwd === c || cwd.startsWith(`${c}${sep}`));
+  const choices = inside.length > 0 ? inside : found;
 
-  // Indexed through a ternary rather than guarded after the fact, so `noUncheckedIndexedAccess`
-  // is satisfied by the one narrowing below instead of by a branch that cannot be reached.
+  // Indexed through a ternary so `noUncheckedIndexedAccess` is satisfied by one narrowing
+  // rather than by a branch that cannot be reached.
   const only = choices.length === 1 ? choices[0] : undefined;
   if (only !== undefined) return only;
 
   const chosen = await pick({ rows: choices.map(containerRow), prompt: PROMPT }).catch(
     (error: unknown) => {
-      if (error instanceof NotATerminal) throw new Refusal(error.message);
+      if (error instanceof NotATerminal)
+        throw new Refusal(`no repository here, and ${error.message}`);
       throw error;
     },
   );

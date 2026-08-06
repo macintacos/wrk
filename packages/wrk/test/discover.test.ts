@@ -13,6 +13,7 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
+import { symlinkSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
@@ -94,12 +95,24 @@ describe("findContainers", () => {
     expect(await findContainers([join(root, "nowhere"), root], 2)).toEqual([container]);
   });
 
-  test("answers each container once, sorted, when roots overlap", async () => {
+  test("answers each container once, sorted, when a root is listed twice", async () => {
     const root = tempDir();
     const first = makeContainer("main", join(root, "group", "alpha")).container;
     const second = makeContainer("main", join(root, "group", "beta")).container;
 
-    expect(await findContainers([root, root, join(root, "group")], 2)).toEqual([first, second]);
+    expect(await findContainers([root, root], 2)).toEqual([first, second]);
+  });
+
+  test("finds a container through a symlinked root, spelled as the root spells it", async () => {
+    const real = tempDir();
+    makeContainer("main", join(real, "group", "project"));
+    const link = join(tempDir(), "via-link");
+    symlinkSync(real, link);
+
+    // The answer carries the symlinked prefix rather than the resolved one: `join` builds it and
+    // nothing re-resolves, which is what `findContainers` documents and what lets a user `cd`
+    // into the path they configured rather than into one they have never seen.
+    expect(await findContainers([link], 2)).toEqual([join(link, "group", "project")]);
   });
 });
 
@@ -125,18 +138,36 @@ describe("resolveRepo", () => {
     expect(await resolveRepo(tempDir(), sources)).toBe(container);
   });
 
-  test("takes the candidate whose name matches the orphaned worktree's container", async () => {
+  test("takes the container the removed worktree sat inside, at any depth below it", async () => {
     const root = tempDir();
     makeContainer("main", join(root, "group", "alpha"));
     const wanted = makeContainer("main", join(root, "group", "beta")).container;
     const sources = await withSearch(tempDir(), [root], 2);
 
-    // Deliberately a path that does **not** exist: this is the case the issue is named for, so
-    // the fixture is the removed worktree itself rather than a stand-in that is merely outside a
-    // repository. Its parent still names the container it lived in, which is the whole hint.
-    const orphan = join(tempDir(), "beta", "EXC-1+add-thing");
+    // Deliberately paths that do **not** exist: this is the case the issue is named for, so the
+    // fixture is the removed worktree itself rather than a stand-in that is merely outside a
+    // repository. `rm -rf` takes the subdirectories too, so the shell is as likely to be left
+    // deep inside the worktree as at its root — both still sit inside the container.
+    for (const depth of [["EXC-1+add-thing"], ["EXC-1+add-thing", "packages", "wrk"]]) {
+      expect(await resolveRepo(join(wanted, ...depth), sources)).toBe(wanted);
+    }
+  });
 
-    expect(await resolveRepo(orphan, sources)).toBe(wanted);
+  test("does not mistake a directory merely named like a container for that container", async () => {
+    const root = tempDir();
+    makeContainer("main", join(root, "group", "alpha"));
+    makeContainer("main", join(root, "group", "beta"));
+    const sources = await withSearch(tempDir(), [root], 2);
+
+    // `<somewhere-else>/beta/tmp` shares a name with a real container and sits inside none, so
+    // both candidates stand and the choice is the user's. Silently resolving it would send the
+    // shell to a repository it was never in.
+    const failure = await resolveRepo(join(tempDir(), "beta", "tmp"), sources).catch(
+      (error: unknown) => error,
+    );
+
+    expect(failure).toBeInstanceOf(Refusal);
+    expect((failure as Refusal).message).toContain("terminal");
   });
 
   test("refuses, naming the configured roots, when the roots hold no container", async () => {
@@ -184,6 +215,9 @@ describe("resolveRepo in a terminal", () => {
    */
   const WIDE = 140;
 
+  /** The picker's selected-row gutter, as `packages/picker/src/picker.tsx` draws it. */
+  const CURSOR = "▌ ";
+
   /** Where the probe's stdout is sent, so the pty capture holds only what was drawn. */
   function stdoutPath(purpose: string): string {
     return join(tempDir(), `EXC-1019-${purpose}-stdout.txt`);
@@ -192,14 +226,13 @@ describe("resolveRepo in a terminal", () => {
   /**
    * A shell script that runs the probe from `cwd` against `config`, with stdout redirected.
    *
-   * The git environment variables are shed first, for the reason `fixtures/repo.ts` sheds
-   * them: this suite runs under the repository's own pre-push hook, which exports `GIT_DIR`
-   * to every child — under which the probe's cwd would resolve to *this* repository and every
-   * case would find itself comfortably inside one.
+   * Nothing sheds `GIT_DIR` here, unlike `fixtures/repo.ts`, and nothing needs to: `git.ts`'s
+   * own `git()` unsets every repository-binding variable for each child it spawns, so the
+   * probe's `cwd` alone decides which repository answers even under the pre-push hook that
+   * exports one.
    */
   function scenario(cwd: string, config: string, stdout: string): string {
     return [
-      "unset $(git rev-parse --local-env-vars)",
       `cd "${cwd}"`,
       `PROBE_CONFIG="${config}" "${process.execPath}" "${probe}" > "${stdout}"`,
     ].join("\n");
@@ -229,9 +262,14 @@ describe("resolveRepo in a terminal", () => {
         await Bun.sleep(150);
         frame = frameLines(pty.capture());
         // Sorted, so the second row is `beta` — chosen by moving rather than by typing, since
-        // a fuzzy query would also match the temp path every row shares.
+        // a fuzzy query would also match the temp path every row shares. The move is waited on
+        // rather than slept through: a guessed interval is how this suite would go flaky on a
+        // loaded machine, and a cursor that had not moved yet would choose `alpha` and fail as
+        // if the picker were broken.
         pty.write(KEY.down);
-        await Bun.sleep(100);
+        await pty.waitUntil((capture) =>
+          frameLines(capture).some((line) => line.startsWith(`${CURSOR}beta`)),
+        );
         pty.write(KEY.enter);
       },
     });
