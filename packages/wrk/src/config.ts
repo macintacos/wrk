@@ -51,8 +51,8 @@
  * repository anywhere in sight. One consequence is inherited rather than fought: on a git
  * older than 2.31, `rev-parse` echoes the unrecognised `--path-format` flag to stdout and
  * exits 0 (see `doc/ADVANCED.md`'s git version floor), so `containerFor` answers with a
- * path derived from that echo rather than with a real container. Handed one, this module reads a file
- * that is not the container's and degrades — so an unsupported git costs the per-repo
+ * path derived from that echo rather than with a real container. Handed one, this module
+ * reads a file that is not the container's and degrades — so an unsupported git costs the per-repo
  * layer silently, which is what the acceptance criteria ask for anyway. Note the derived
  * path can be as innocuous as `.`, so the file read may be a `.project-meta.json` relative
  * to the process cwd; it is still not the repository's, and the answer is still defaults.

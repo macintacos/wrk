@@ -116,7 +116,7 @@ describe("globalConfigPath", () => {
 
   test("is where loadConfig looks when it is given no globalPath", async () => {
     // Without this, nothing exercises `loadConfig`'s default argument — the module's main
-    // user-facing path, and the one `doc/ADVANCED.md` tells people to create.
+    // user-facing path, and the one `README.md` tells people to create.
     // `XDG_CONFIG_HOME` is redirected at the temp dir so the case cannot read a real
     // ~/.config/wrk.
     await withTemp(async (dir) => {
