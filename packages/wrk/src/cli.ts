@@ -3,9 +3,11 @@
  *
  * This module owns three things and deliberately nothing else — the program's identity,
  * the global `--json` flag, and the top-level failure handler that turns a thrown value
- * into an exit status. Commands are registered by the issues that build them, so the tree
- * here is still empty; until the first one lands, a bare `wrk` parses successfully and
- * does nothing, and `wrk --help` is the only output it has to give.
+ * into an exit status. Commands are registered by the issues that build them, and each is
+ * wired here rather than exported as a builder from its own module: the work a command does
+ * lives in a module of its own, but the handful of lines that name it, describe it and pick
+ * its output channel are the tree's business, and one command per module does not earn an
+ * indirection to say so.
  *
  * It follows [`scripts/tasks/cli.ts`](../../../scripts/tasks/cli.ts), this repository's
  * existing commander tree, in the ways that matter: `@commander-js/extra-typings`, a
@@ -25,18 +27,51 @@
 
 import { Command } from "@commander-js/extra-typings";
 
-import { reportFailure } from "./output";
+import { renderConversion, resolveConversion } from "./convert";
+import { emit, note, Refusal, reportFailure } from "./output";
 
 /**
  * Assembles the commander tree.
  *
- * @returns The configured program, not yet parsed and carrying no subcommands.
+ * `repo convert` **prints and never runs** the conversion recipe: its first step renames the
+ * checkout the caller is standing in, so executing it under them is the one thing the
+ * command must not do. See [`./convert`](./convert)'s header.
+ *
+ * Its human output goes to stderr through {@link note}, not to stdout. That is
+ * [`./output`](./output)'s rule rather than a preference — `emit` owns stdout so that a
+ * run's stdout is one JSON document, and the only stdout this program allows past it are
+ * commander's own `--help` and an interactive component's escape sequences, neither of which
+ * a printed recipe is. `--json` is what puts the same answer on the envelope instead.
+ *
+ * @returns The configured program, not yet parsed.
  */
 export function buildProgram(): Command {
-  return new Command()
+  const program = new Command()
     .name("wrk")
     .description("Worktree, PR-stack and agent-workflow tooling.")
     .option("--json", "Emit machine-readable JSON on stdout instead of human output");
+
+  program
+    .command("repo")
+    .description("Operations on the repository as a whole.")
+    .command("convert")
+    .description("Print the recipe for converting this repository to the bare-repo layout")
+    .action(async (_options, command) => {
+      const conversion = await resolveConversion();
+      if (conversion === null) {
+        throw new Refusal(
+          "not a git repository; run this from inside the repository you want to convert",
+        );
+      }
+
+      const recipe = renderConversion(conversion);
+      // Spread rather than a rebuilt literal: `envelope` inherits key order from the payload's
+      // own insertion order, and `Conversion` is built as one literal, so this preserves it.
+      if (wantsJson(command)) emit({ ...conversion, recipe });
+      else note(recipe);
+    });
+
+  return program;
 }
 
 /**
