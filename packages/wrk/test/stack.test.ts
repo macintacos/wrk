@@ -11,9 +11,9 @@
  * draws from — a lone layer, a straight chain, a chain whose bottom has merged — and they pin the
  * arithmetic behind the `top` / `bottom` / `merged` glyphs `config.ts` carries. The **fork cases**
  * pin a decision rather than an inheritance: which nodes are tops when a stack branches, and what
- * height the short arm reports. The **cycle cases** are the ones the fixed hop cap this replaces
- * gets wrong in both directions — a two-node cycle, which the cap renders at full depth instead of
- * refusing, and a chain deeper than the cap, which it silently truncates.
+ * height the short arm reports. The **cycle cases** are the ones the fish implementation's fixed
+ * hop cap gets wrong in both directions — a two-node cycle, which the cap renders at full depth
+ * instead of refusing, and a chain deeper than the cap, which it silently truncates.
  *
  * The last case feeds one fixture set in two insertion orders. The walk memoises, so a memo keyed
  * or seeded by the order nodes are first visited in would pass every case above while producing a
@@ -25,16 +25,21 @@ import { describe, expect, test } from "bun:test";
 import type { PullRequest, PullRequestState } from "../src/gh";
 import { type StackNode, stackGraph } from "../src/stack";
 
-/** Distinct pull-request numbers across the suite. The graph never reads one; a duplicate would
- * still make a fixture a lie, and lying fixtures are how a suite stops describing reality. */
+/**
+ * Distinct pull-request numbers across the suite.
+ *
+ * The graph never reads one; a duplicate would still make a fixture a lie, and lying fixtures are
+ * how a suite stops describing reality.
+ */
 let counter = 0;
 
 /**
- * One pull-request row, with only the two fields the graph reads spelled out.
+ * One pull-request row, with the three things that decide the graph spelled out: the head ref it
+ * is keyed under, the base ref that is its edge, and the state that decides whether it is in the
+ * graph at all.
  *
- * `number`, `title` and `updatedAt` are filled with anything valid: they are what
- * {@link PullRequest} requires and what `pr.ts` deduplicates on, and neither is an input to a
- * single question this module answers.
+ * `number`, `title` and `updatedAt` are filled with anything valid: {@link PullRequest} requires
+ * them and `pr.ts` deduplicates on two of them, but `stack.ts` reads none.
  */
 function pr(
   headRefName: string,
@@ -164,8 +169,9 @@ describe("stackGraph", () => {
   });
 
   test("omits a two-node cycle instead of capping it", () => {
-    // The case the hop cap gets exactly backwards: it renders both rows at the cap, which reads as
-    // a very deep stack. Neither node has an honest depth, so neither gets one, and the picker
+    // The case the fish implementation's hop cap gets exactly backwards: it renders both rows at
+    // the cap, which reads as a very deep stack. Neither node has an honest depth, so neither
+    // gets one, and the picker
     // draws them the way it draws a branch with no pull request at all.
     expect(graphOf(pr("ping", "pong"), pr("pong", "ping")).size).toBe(0);
   });
@@ -206,7 +212,17 @@ describe("stackGraph", () => {
   });
 
   test("answers the same graph whichever order the rows arrive in", () => {
-    const rows = [pr("one", "trunk"), pr("two", "one"), pr("three", "one"), pr("four", "two")];
+    // The cycle is in the fixture on purpose: the cyclic verdict is memoised like any other, so an
+    // order-dependent memo would show up here as one order resolving `hangs-on` and the other not.
+    const rows = [
+      pr("one", "trunk"),
+      pr("two", "one"),
+      pr("three", "one"),
+      pr("four", "two"),
+      pr("ping", "pong"),
+      pr("pong", "ping"),
+      pr("hangs-on", "ping"),
+    ];
 
     expect(graphOf(...rows)).toEqual(graphOf(...[...rows].reverse()));
   });

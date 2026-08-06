@@ -30,11 +30,11 @@
  *
  * **A cycle is detected, not capped.** A pull request can be retargeted at a branch further up its
  * own chain, and the result is a base chain that never reaches a root. Such a node has no honest
- * depth, so it is **omitted from the answer entirely** — a case every consumer already handles,
- * because it is indistinguishable from a branch carrying no pull request at all, and it renders
- * un-annotated rather than wrong. This replaces a fixed hop cap, which got both halves backwards:
- * it rendered a two-node cycle at full depth, reading as a very deep stack, and it truncated a
- * legitimately deep one. There is no cap here, so a stack resolves however tall it is.
+ * depth, so it is **omitted from the answer entirely** — indistinguishable from a branch carrying
+ * no pull request at all, so it renders un-annotated rather than wrong. This replaces the fixed hop
+ * cap the fish implementation carries, which gets both halves backwards: it renders a two-node
+ * cycle at full depth, reading as a very deep stack, and it truncates a legitimately deep one.
+ * There is no cap here, so a stack resolves however tall it is.
  *
  * @packageDocumentation
  */
@@ -96,9 +96,12 @@ interface Position {
  *
  * Each node is walked through once across the whole build, since the memo is consulted before any
  * step, so the graph costs one pass over the open pull requests rather than one per stack.
+ *
+ * `edges` is head ref to base ref and carries no pull request, because none of the three cases
+ * above turns on anything else a row holds — the walk is a question about strings.
  */
 function resolve(
-  open: ReadonlyMap<string, PullRequest>,
+  edges: ReadonlyMap<string, string>,
   start: string,
   resolved: Map<string, Position | null>,
 ): void {
@@ -122,8 +125,8 @@ function resolve(
 
     // Annotated rather than inferred: `head` is assigned from this line and this line reads
     // `head`, so leaving it to inference makes the two circular and TypeScript gives up (TS7022).
-    const base: string | undefined = open.get(head)?.baseRefName;
-    head = base !== undefined && open.has(base) ? base : undefined;
+    const base: string | undefined = edges.get(head);
+    head = base !== undefined && edges.has(base) ? base : undefined;
   }
 
   if (anchor === null) {
@@ -158,31 +161,33 @@ function resolve(
  * @example
  * ```ts
  * const stack = stackGraph(await pullRequests(container, ttl));
- * const here = stack.get(await currentBranch());
+ * // `currentBranch` answers null on a detached HEAD, which is no branch and so in no stack.
+ * const here = stack.get((await currentBranch()) ?? "");
  * // A one-layer stack has no position worth drawing, per StackNode.height.
  * const position = here === undefined || here.height === 1 ? "" : `${here.depth}/${here.height}`;
  * ```
  */
 export function stackGraph(prs: ReadonlyMap<string, PullRequest>): Map<string, StackNode> {
-  const open = new Map<string, PullRequest>();
+  // Head ref to base ref, open rows only: the whole edge set, and the point at which merged layers
+  // stop existing as far as everything below is concerned.
+  const edges = new Map<string, string>();
   for (const [head, row] of prs) {
-    if (row.state === "OPEN") open.set(head, row);
+    if (row.state === "OPEN") edges.set(head, row.baseRefName);
   }
 
   const resolved = new Map<string, Position | null>();
-  for (const head of open.keys()) resolve(open, head, resolved);
+  for (const head of edges.keys()) resolve(edges, head, resolved);
+
+  // Every ref an open pull request bases on, which is every ref that is not a tip. Refs no open
+  // pull request carries — the default branch, a merged layer — land here too and are never looked
+  // up, since the only refs asked about below are open head refs.
+  const bases = new Set(edges.values());
 
   const heights = new Map<string, number>();
-  const covered = new Set<string>();
-  for (const [head, position] of resolved) {
+  for (const position of resolved.values()) {
     if (position === null) continue;
 
     heights.set(position.root, Math.max(heights.get(position.root) ?? 0, position.depth));
-
-    // A resolved node's base is resolved too — its chain terminates — so this can never mark a
-    // cyclic node as covered, and `covered` needs no filtering afterwards.
-    const base = open.get(head)?.baseRefName;
-    if (base !== undefined && open.has(base)) covered.add(base);
   }
 
   const graph = new Map<string, StackNode>();
@@ -195,7 +200,7 @@ export function stackGraph(prs: ReadonlyMap<string, PullRequest>): Map<string, S
       // — and is spelled as the node's own depth rather than asserted away, since a node is at
       // least as tall as itself whatever else is in its stack.
       height: heights.get(position.root) ?? position.depth,
-      top: !covered.has(head),
+      top: !bases.has(head),
     });
   }
 
