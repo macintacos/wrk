@@ -111,10 +111,12 @@ const SGR = new RegExp(SGR_SOURCE, "gu");
  *
  * Anchored, and only ever applied to a whole match {@link SEQUENCE} already found, so it
  * never has to locate its own boundaries. Neither segment may contain a `;`, which is what
- * stops a crafted parameter field from carrying a second URI past {@link hyperlink}'s check.
- * The terminator is optional because the seven-bit `ESC \` form never reaches here — the
- * OSC branch stops before an `ESC`, and {@link hyperlink} re-emits what it keeps with a
- * `BEL` for exactly that reason.
+ * stops a crafted parameter field from carrying a second URI past {@link hyperlink}'s check
+ * — and is also why there is nothing here to backtrack over: each segment has exactly one
+ * possible extent.
+ *
+ * The terminator is optional because {@link SEQUENCE}'s OSC branch ends in `BEL?`: a sequence
+ * running to the end of the line arrives with no terminator at all.
  */
 const OSC8 = new RegExp(`^${ESC}\\]8;([^;]*);([^;]*?)(?:${BEL})?$`, "u");
 
@@ -138,32 +140,43 @@ const OSC8_PARAMS = /^[\w=:.-]*$/u;
  */
 const SCHEMES = new Set(["http:", "https:", "mailto:"]);
 
+/** The close sequence: OSC 8 carrying no URI, which is how a hyperlink ends. */
+const CLOSE = `${ESC}]8;;${BEL}`;
+
 /**
- * The hyperlink `match` should be replaced by, or `null` if it is not one worth keeping.
+ * The hyperlink `match` should be replaced by, and whether it leaves one open.
  *
- * The kept form is always `BEL`-terminated, whatever arrived: {@link SEQUENCE}'s OSC branch
- * stops before an `ESC`, so an `ESC \` terminator is a *separate* match on the next pass and
- * would be dropped — leaving an opener the terminal never sees closed, and every character
- * after it hyperlinked. Canonicalising the terminator is one substitution and removes that
- * whole class.
+ * `null` for anything not worth keeping. Two normalisations happen here, and each closes a
+ * hole rather than tidying:
+ *
+ * The URI is re-emitted from `URL`'s **`href`**, never as it arrived. {@link SEQUENCE}'s OSC
+ * branch admits any byte but `ESC` and `BEL`, and the parser accepts a `U+009B` or a `U+202E`
+ * sitting inside a perfectly good `https:` URI without complaint — so echoing the input would
+ * put an eight-bit CSI and a bidi override through this filter inside a sequence it had just
+ * approved, which is the one thing this module exists to stop. `href` percent-encodes every
+ * one of them and is ASCII-printable for each scheme on the allowlist.
+ *
+ * The terminator is always `BEL`, whatever arrived. The `ESC \` form is a *separate* match on
+ * the next pass of the same alternation and would be dropped, leaving an opener the terminal
+ * never sees closed.
  */
-function hyperlink(match: string): string | null {
+function hyperlink(match: string): { readonly sequence: string; readonly open: boolean } | null {
   const parts = OSC8.exec(match);
   if (!parts) return null;
 
   const [, params = "", uri = ""] = parts;
   if (!OSC8_PARAMS.test(params)) return null;
 
-  // The empty URI is the close sequence, which is always safe and must always survive — a
-  // dropped opener whose close was also dropped would leak the link into the text after it.
-  if (uri !== "") {
-    // `URL` is the parser already in the runtime, and it rejects a relative reference for
-    // free: a hyperlink is absolute or it is not one a terminal can open.
-    const parsed = URL.parse(uri);
-    if (!parsed || !SCHEMES.has(parsed.protocol)) return null;
-  }
+  // An empty URI is the close, which is always safe and must always survive: dropping one
+  // whose opener was also dropped is fine, but dropping one whose opener was kept is not.
+  if (uri === "") return { sequence: `${ESC}]8;${params};${BEL}`, open: false };
 
-  return `${ESC}]8;${params};${uri}${BEL}`;
+  // `URL` is the parser already in the runtime, and it rejects a relative reference for free:
+  // a hyperlink is absolute or it is not one a terminal can open.
+  const parsed = URL.parse(uri);
+  if (!parsed || !SCHEMES.has(parsed.protocol)) return null;
+
+  return { sequence: `${ESC}]8;${params};${parsed.href}${BEL}`, open: true };
 }
 
 /**
@@ -231,17 +244,31 @@ export function sanitize(text: string): string {
  * Newlines are dropped here exactly as they are for a row — the pane splits its text on them
  * *before* filtering, so a document keeps its lines and no line can grow one. Tabs go with
  * them, which costs a code block its indentation; expanding them would mean choosing a tab
- * stop for a pane whose width changes, and a dropped tab is at least the same width as the
- * cell it left.
+ * stop for a pane whose width changes, and dropping one costs an indent rather than a line.
+ *
+ * A line that leaves a hyperlink open gets a close appended. Ink's own truncation happens to
+ * balance one today, but a hyperlink is terminal state that outlives the string carrying it —
+ * an unclosed one puts every row below the pane, and the shell prompt after the picker erases
+ * itself, inside a link an untrusted document chose. A boundary does not hold that on trust.
  *
  * @param text - One line of untrusted pre-rendered ANSI.
- * @returns The line with everything but SGR and safe hyperlinks removed. A kept hyperlink is
- *   `BEL`-terminated whatever terminator it arrived with — see {@link hyperlink}.
+ * @returns The line with everything but SGR and safe hyperlinks removed, and any hyperlink it
+ *   still has open closed at the end.
  */
 export function sanitizePreview(text: string): string {
-  return text.replace(SEQUENCE, (match) =>
-    SGR_ONLY.test(match) ? match : (hyperlink(match) ?? ""),
-  );
+  let open = false;
+
+  const safe = text.replace(SEQUENCE, (match) => {
+    if (SGR_ONLY.test(match)) return match;
+
+    const link = hyperlink(match);
+    if (!link) return "";
+
+    open = link.open;
+    return link.sequence;
+  });
+
+  return open ? `${safe}${CLOSE}` : safe;
 }
 
 /**

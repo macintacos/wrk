@@ -158,25 +158,56 @@ describe("the preview pane keeps hyperlinks, and only hyperlinks", () => {
   });
 
   test("so do http and mailto", () => {
-    expect(sanitizePreview(link("http://example.com"))).toBe(link("http://example.com"));
-    expect(sanitizePreview(link("mailto:someone@example.com"))).toBe(
-      link("mailto:someone@example.com"),
+    // `http://example.com` comes back as `http://example.com/` because the URI is re-emitted
+    // from `URL`'s own normalisation rather than echoed — see the control-character case for
+    // why. The trailing close is what an opener with nothing after it earns.
+    expect(sanitizePreview(link("http://example.com"))).toBe(
+      `${link("http://example.com/")}${CLOSE}`,
     );
+    expect(sanitizePreview(link("mailto:someone@example.com"))).toBe(
+      `${link("mailto:someone@example.com")}${CLOSE}`,
+    );
+  });
+
+  test("a control character inside the URI does not ride in on a valid scheme", () => {
+    // The hole an echoed URI leaves open, and the sharpest one in this module: an OSC payload
+    // may hold any byte but ESC and BEL, and `URL` accepts an eight-bit CSI or a bidi override
+    // inside an otherwise perfectly good https URI. Echoing it would put both through a filter
+    // that had just approved the sequence carrying them.
+    const hostile = sanitizePreview(link(`https://example.com/${C1_CSI}2J${ctrl(0x202e)}`));
+
+    expect(hostile).not.toContain(C1_CSI);
+    expect(hostile).not.toContain(ctrl(0x202e));
+    expect(hostile).toBe(`${link("https://example.com/%C2%9B2J%E2%80%AE")}${CLOSE}`);
   });
 
   test("an id parameter rides along", () => {
     // The params field is what a renderer uses to join two runs into one link.
-    const linked = link("https://example.com", "id=1-42");
+    const linked = link("https://example.com/", "id=1-42");
 
-    expect(sanitizePreview(linked)).toBe(linked);
+    expect(sanitizePreview(linked)).toBe(`${linked}${CLOSE}`);
   });
 
   test("the ST-terminated form survives, canonicalised to BEL", () => {
     // Kept as `ESC \` the opener would lose its terminator to the two-character-escape
     // branch on the next pass and leave the terminal waiting for one that never comes.
     expect(sanitizePreview(`${ESC}]8;;https://example.com${ST}x`)).toBe(
-      `${link("https://example.com")}x`,
+      `${link("https://example.com/")}x${CLOSE}`,
     );
+  });
+
+  test("a line that leaves a link open has it closed", () => {
+    // A hyperlink is terminal state that outlives the string carrying it: unclosed, it takes
+    // in every row drawn below the pane and the shell prompt after the picker erases itself.
+    expect(sanitizePreview(`${link("https://example.com/")}click me`)).toBe(
+      `${link("https://example.com/")}click me${CLOSE}`,
+    );
+    // A line that closes its own link is not closed twice.
+    expect(sanitizePreview(`${link("https://example.com/")}ok${CLOSE}`)).toBe(
+      `${link("https://example.com/")}ok${CLOSE}`,
+    );
+    // And a line whose only hyperlink was rejected leaves nothing open to close.
+    expect(sanitizePreview(`${link("javascript:alert(1)")}x`)).toBe("x");
   });
 
   test("a scheme a terminal should never be handed is dropped whole", () => {

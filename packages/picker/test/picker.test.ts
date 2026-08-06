@@ -671,6 +671,241 @@ describe("the row set can be replaced while the picker is open", () => {
   });
 });
 
+describe("the preview pane sits beside the list", () => {
+  /** The seam between the two panes — one column, and the only glyph that marks the split. */
+  const SEAM = "│";
+
+  /** The pane's share of the terminal, which the component splits 60/40. */
+  const SHARE = 0.4;
+
+  /**
+   * The frame as one searchable string, list column and pane alike.
+   *
+   * Deliberately not pane-scoped: the two columns share every rendered line, so nothing short
+   * of splitting on the seam separates them, and none of the markers below (`w=`, `p=`, `n=`)
+   * can appear in a generated row.
+   */
+  const frameText = (frame: string): string => frameLines(frame).join("\n");
+
+  /** The width the pane reported having been rendered at, read back off its own first line. */
+  function reportedWidth(frame: string): number {
+    const stated = /w=(\d+)/.exec(frameText(frame));
+    if (!stated?.[1]) throw new Error(`the pane never stated a width; frame: ${frameText(frame)}`);
+    return Number(stated[1]);
+  }
+
+  /** The document's first filler line, which is the sixth thing the pane shows. */
+  const FIRST_FILLER = "n=001";
+
+  /**
+   * The filler line that reaches the pane's top after one PageDown.
+   *
+   * `listRows` is 18 and the document opens with six header lines, so a page starts at
+   * document line 19 — the thirteenth filler line.
+   */
+  const AFTER_A_PAGE = "n=013";
+
+  /** Opens a picker with a preview pane and waits for the pane's first line to arrive. */
+  function withPane(
+    options: {
+      env?: string;
+      cols?: number;
+      quit?: string;
+      act?: (pty: PtySession) => Promise<void>;
+    } = {},
+  ): Promise<Session> {
+    return driven(scenario(`PROBE_PREVIEW=1 ${options.env ?? ""}`), {
+      cols: options.cols,
+      quit: options.quit,
+      act: async (pty) => {
+        // `wt-0` rather than the second column, which the narrow cases truncate away.
+        await opened(pty, "wt-0");
+        await pty.waitFor("w=");
+        await options.act?.(pty);
+      },
+    });
+  }
+
+  test("the split is roughly 60/40, at whatever width the terminal is", async () => {
+    // Asserted as a ratio at four widths rather than as one column count, so the claim is
+    // about the split being proportional and not about 80 columns happening to divide well.
+    // 40 and 30 are the ones that earn their place: a row's cells are sized from the whole
+    // row set, so below roughly 60 columns the list is wider than its share and only the
+    // list Box's `overflowX` keeps it from pushing the seam right and shrinking the pane
+    // below the width the caller was told it had.
+    for (const cols of [30, 40, 80, 120]) {
+      const { frame } = await withPane({ cols });
+      const seam = frameLines(frame)[1]?.indexOf(SEAM) ?? -1;
+
+      expect(reportedWidth(frame) / cols).toBeCloseTo(SHARE, 1);
+      expect(seam / cols).toBeCloseTo(1 - SHARE, 1);
+    }
+  });
+
+  test("a resize re-renders the pane at the new width", async () => {
+    // The width-aware criterion. `previewPullRequest` keys its cache on the width it is
+    // handed, so a pane that kept asking for the old one would replay text wrapped for a
+    // terminal that no longer exists.
+    const { frame } = await withPane({
+      act: async (pty) => {
+        pty.resize(120, ROWS);
+        await pty.waitUntil((capture) => /w=4\d/.test(frameText(capture)));
+      },
+    });
+
+    expect(reportedWidth(frame) / 120).toBeCloseTo(SHARE, 1);
+  });
+
+  test("a resize that shortens the document brings the scrolled pane back into it", async () => {
+    // A widened pane wraps into fewer lines, so an offset that was inside the old document
+    // can be past the end of the new one — which renders as a pane gone blank with no cue,
+    // on the same criterion the case above covers from the other side. The probe's document
+    // is a fixed length, so the shortening here comes from the *rows* growing instead: a
+    // taller viewport is a bigger `listRows` and therefore a smaller last offset.
+    const { frame } = await withPane({
+      act: async (pty) => {
+        pty.write(KEY.pageDown.repeat(5));
+        await pty.waitUntil((capture) => frameText(capture).includes("n=060"));
+        pty.resize(80, 40);
+        await pty.waitUntil((capture) => frameLines(capture).length === 32);
+      },
+    });
+
+    // The last line of the document is still on screen; the pane did not scroll off its end.
+    expect(frameText(frame)).toContain("n=060");
+  });
+
+  test("the pane follows the selection", async () => {
+    const { frame } = await withPane({
+      act: async (pty) => {
+        pty.write(KEY.down);
+        await pty.waitUntil((capture) => frameText(capture).includes("p=/worktrees/wt-1"));
+      },
+    });
+
+    expect(frameText(frame)).toContain("p=/worktrees/wt-1");
+    expect(frameText(frame)).not.toContain("p=/worktrees/wt-0");
+  });
+
+  test("a slow preview for a row the user has left never lands on the row they are on", async () => {
+    // The stale-read guard. `wt-0`'s answer is held back half a second, so pressing Down
+    // leaves a render in flight for a row that is no longer selected; the settled frame is
+    // read well after it resolves.
+    const { frame } = await withPane({
+      env: "PROBE_PREVIEW=slow",
+      act: async (pty) => {
+        pty.write(KEY.down);
+        await pty.waitUntil((capture) => frameText(capture).includes("p=/worktrees/wt-1"));
+        await Bun.sleep(700);
+      },
+    });
+
+    expect(frameText(frame)).toContain("p=/worktrees/wt-1");
+    expect(frameText(frame)).not.toContain("p=/worktrees/wt-0");
+  });
+
+  test("the pane scrolls on its own, leaving the list where it was", async () => {
+    // "Independently scrollable": the page keys move the document, the arrows move the
+    // cursor, and neither reaches into the other.
+    const { frame } = await withPane({
+      act: async (pty) => {
+        pty.write(KEY.pageDown);
+        await pty.waitUntil((capture) => frameText(capture).includes(AFTER_A_PAGE));
+      },
+    });
+
+    expect(frameText(frame)).toContain(AFTER_A_PAGE);
+    expect(frameText(frame)).not.toContain("w=");
+    // The list did not move with it.
+    expect(frameLines(frame).some((line) => line.startsWith("▌ wt-0"))).toBe(true);
+  });
+
+  test("a burst of page keys in one chunk is a burst of pages, not one", async () => {
+    // Why the offset is reducer state rather than a fourth `useState`: Ink calls the
+    // `useInput` handler once per event in a chunk with no re-render between, so a value-form
+    // setter would collapse three pages into one. Written as a single `write` for exactly
+    // that reason — spacing them out is what hides it.
+    const { frame } = await withPane({
+      act: async (pty) => {
+        pty.write(KEY.pageDown.repeat(3));
+        await pty.waitUntil((capture) => frameText(capture).includes("n=049"));
+      },
+    });
+
+    // Three pages of 18 from a six-line header: document line 55, the forty-ninth filler.
+    expect(frameText(frame)).toContain("n=049");
+  });
+
+  test("and scrolls back", async () => {
+    const { frame } = await withPane({
+      act: async (pty) => {
+        pty.write(KEY.pageDown);
+        await pty.waitUntil((capture) => frameText(capture).includes(AFTER_A_PAGE));
+        pty.write(KEY.pageUp);
+        await pty.waitUntil((capture) => frameText(capture).includes("w="));
+      },
+    });
+
+    expect(frameText(frame)).toContain(FIRST_FILLER);
+  });
+
+  test("the pane costs the frame no height at all", async () => {
+    // EXC-1009's threshold is the one thing a second pane could quietly break: the list is
+    // already budgeted to ~80% of the viewport, and a pane taller than it would push the
+    // frame to `outputHeight >= viewportRows`, where Ink stops rendering inline.
+    const { frame, capture } = await withPane();
+
+    expect(frameHeight(frame)).toBe(FRAME);
+    expect(capture).not.toContain(ERASE_SCREEN);
+    expect(capture).not.toContain(ALTERNATE_SCREEN);
+    expect(hasAbsoluteAddressing(capture)).toBe(false);
+  });
+
+  test("colour and hyperlinks reach the terminal; hostile sequences do not", async () => {
+    // The third criterion, and the finding EXC-1011's review left for this issue: `sanitize`
+    // drops all OSC, so a pane reusing it would take every hyperlink out of the document.
+    const { frame, capture } = await withPane();
+
+    // The trailing slash is `URL`'s: the pane re-emits a kept hyperlink from the parse rather
+    // than echoing what arrived, which is what keeps a control character out of the URI.
+    expect(lastFrame(frame)).toContain(`${ctrl(0x1b)}]8;;https://example.com/${ctrl(0x07)}`);
+    expect(lastFrame(frame)).toMatch(new RegExp(`${ctrl(0x1b)}\\[[\\d;]*mcoloured`));
+    expect(frameText(frame)).toContain("linked");
+
+    expect(capture).not.toContain(ERASE_SCREEN);
+    expect(capture).not.toContain("pwned");
+    expect(capture).not.toContain(ctrl(0x202e));
+    // The eight-bit CSI, which the probe hides inside a hyperlink's URI rather than in the
+    // open — the one path a line of raw escapes cannot reach.
+    expect(capture).not.toContain(ctrl(0x9b));
+    expect(frameText(frame)).toContain("in-uri");
+    expect(frameText(frame)).toContain("hostile-kept");
+  });
+
+  test("NO_COLOR reaches the pane's content too", async () => {
+    // A caller's pre-rendered colour is still colour, exactly as a row's own is.
+    const { capture, frame } = await withPane({ env: "NO_COLOR=1" });
+
+    expect(hasColour(capture)).toBe(false);
+    expect(frameText(frame)).toContain("coloured");
+  });
+
+  test("a preview that throws says so and leaves the picker working", async () => {
+    // An unhandled rejection would take the process down with the terminal in raw mode,
+    // which is the one failure a picker must not have.
+    const stdout = payloadPath("preview-throws");
+
+    const { frame, exitCode } = await driven(scenario("PROBE_PREVIEW=throw", { stdout }), {
+      quit: KEY.enter,
+      act: (pty) => opened(pty, "preview exploded"),
+    });
+
+    expect(exitCode).toBe(0);
+    expect(frameLines(frame).join("\n")).toContain("preview exploded");
+    expect(await Bun.file(stdout).text()).toBe(`"/worktrees/wt-0"`);
+  });
+});
+
 describe("it degrades rather than crashing or hanging", () => {
   test("piped stdin is refused, with nothing drawn and nothing waiting", async () => {
     // The decision `ink-gotchas.test.ts` group one demanded and deliberately left open.

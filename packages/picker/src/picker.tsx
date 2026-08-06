@@ -91,12 +91,35 @@
  * enforce. [`../test/reducer.test.ts`](../test/reducer.test.ts) pins the behaviour either
  * way, since a driven terminal cannot put two writers in one batch on purpose.
  *
+ * ## The preview pane costs the budget nothing
+ *
+ * {@link PickOptions.preview} adds a second pane beside the list, taking 40% of the
+ * terminal's columns behind a one-column seam. It is optional: without it the component
+ * renders exactly what it rendered before there was one.
+ *
+ * Its **height** is the list's own `listRows`, which is what keeps the frame the same height
+ * with a pane as without one — the row Box is as tall as its taller child, and neither child
+ * may exceed the number the budget above already settled. Nothing new is spent, so nothing
+ * new can push the frame to `outputHeight >= viewportRows`.
+ *
+ * Its **width** is a number the caller is handed rather than one it infers. `previewPullRequest`
+ * in `packages/wrk` keys its cache on the column count it renders at, so a resize is a cache
+ * miss by construction and the pane re-renders instead of replaying text wrapped for a
+ * terminal that no longer exists. That is the whole of the width-aware behaviour: this
+ * component reads `columns` off the same `useWindowSize()` it reads `rows` off, and passes it
+ * on.
+ *
+ * Its **content** is pre-rendered ANSI, and it goes through {@link sanitizePreview} rather
+ * than {@link sanitize} — the row filter drops all OSC, which would take every hyperlink out
+ * of a rendered document. That module states why the two filters exist and why the widening
+ * is the pane's alone.
+ *
  * ## What is not here
  *
- * The preview pane (EXC-1012) and the latency budget (EXC-1020) each belong to their own
- * issue. The filter loop calls {@link fuzzyMatch} once per row per keystroke and does not
- * pre-compile the query; see the `ponytail:` note on {@link useMatches} for when that stops
- * being the right call.
+ * The latency budget (EXC-1020) belongs to its own issue. The filter loop calls
+ * {@link fuzzyMatch} once per row per keystroke and does not pre-compile the query; see the
+ * `ponytail:` note on {@link useMatches} for when that stops being the right call, and the
+ * one on {@link usePreview} for the redraw the pane does not debounce.
  *
  * @packageDocumentation
  */
@@ -104,11 +127,11 @@
 import chalk, { chalkStderr } from "chalk";
 import { Box, render, Text, useApp, useInput, useWindowSize } from "ink";
 import type { ReactElement } from "react";
-import { useEffect, useMemo, useReducer } from "react";
+import { useEffect, useMemo, useReducer, useState } from "react";
 import stringWidth from "string-width";
 
 import { fuzzyMatch } from "./fuzzy";
-import { sanitize, stripSgr } from "./sanitize";
+import { sanitize, sanitizePreview, stripSgr } from "./sanitize";
 
 /** What precedes the query on the first line, unless a caller says otherwise. */
 const DEFAULT_PROMPT = "❯ ";
@@ -130,6 +153,19 @@ const NO_MATCHES = "no matches";
 
 /** The fraction of the viewport the whole frame is allowed to occupy. */
 const HEIGHT_BUDGET = 0.8;
+
+/** The fraction of the terminal's columns the preview pane occupies, seam included. */
+const PREVIEW_SHARE = 0.4;
+
+/**
+ * The seam between the panes: one column, drawn as the pane's left border.
+ *
+ * A rule rather than a box. A full border would cost two of the frame's rows, and rows are
+ * the budget's scarce resource where columns are not — the picker has no border of its own
+ * for that same reason. Ink's `borderStyle="single"` draws it as `│`, deliberately lighter
+ * than {@link GUTTER}'s `▌`, so the split and the selection do not read as the same mark.
+ */
+const SEAM = 1;
 
 /**
  * Whether this run may emit colour at all.
@@ -196,6 +232,7 @@ export interface PickOptions<T> {
    * and one shared rule is easier to keep than two.
    */
   readonly prompt?: string;
+
   /**
    * Called once, when the picker opens, with a function that replaces the whole row set.
    *
@@ -215,6 +252,24 @@ export interface PickOptions<T> {
    * channel here yet; see EXC-1014, which settles this surface before the first publish.
    */
   readonly onOpen?: (replace: (rows: readonly PickerRow<T>[]) => void) => void;
+
+  /**
+   * What to show beside the list for the selected row. Omit it and there is no second pane.
+   *
+   * Called with the row's `payload` — its identity, not its text — and the pane's exact width
+   * in terminal cells, and called again whenever either changes. Answering the width is the
+   * caller's half of the resize contract: `previewPullRequest` in `packages/wrk` keys its
+   * cache on that number, so a resized pane re-renders rather than replaying text wrapped for
+   * the width it used to be.
+   *
+   * The text is displayed as given — pre-rendered ANSI, colour and hyperlinks intact — after
+   * the sanitizing every string reaching this terminal goes through. It is split on newlines
+   * and the pane shows one screenful, scrolled with the page keys.
+   *
+   * A rejection is displayed rather than thrown: an unhandled one would take the process down
+   * with the terminal still in raw mode.
+   */
+  readonly preview?: (payload: T, width: number) => string | Promise<string>;
 }
 
 /**
@@ -352,6 +407,91 @@ function useMatches<T>(rows: readonly Prepared<T>[], query: string): Match<T>[] 
   }, [rows, query]);
 }
 
+/** One line of a preview: sanitized, and carrying the identity Ink renders it under. */
+interface PreviewLine {
+  /**
+   * Stable React key — the line's place in the document, as {@link Prepared} does for a row.
+   * The window slides, so keying by the window's own offset would move text between keys on
+   * every scroll.
+   */
+  readonly key: string;
+  readonly text: string;
+}
+
+/** What an unloaded pane shows, hoisted so its identity is stable across renders. */
+const NO_LINES: readonly PreviewLine[] = [];
+
+/**
+ * The selected row's preview, sanitized and split into lines, or nothing while it loads.
+ *
+ * `useState` rather than the reducer, and the distinction is the reducer's whole reason for
+ * existing: {@link Action} carries the actions of a *keystroke batch*, which React does not
+ * re-render between. A resolved promise is not in that batch — it arrives with a render of
+ * its own — so the hazard the reducer answers does not reach here.
+ *
+ * The stored value carries the row and the width it answers, and is read back only when both
+ * still match. That is what the effect's own cleanup does *not* give: cleanup stops a stale
+ * write, and what is also wanted is to stop a stale *read* of whatever the last write left
+ * behind — a slow render for a row the user has already left, still on screen under the row
+ * they are on now. The pane is blank until the current one lands, which is what `fzf` does
+ * and the honest reading of "no answer yet".
+ *
+ * The row is compared by identity rather than by a key built from it. {@link Prepared} is
+ * memoised on the row set, so its identity already changes exactly when the content should
+ * be re-fetched — including across a replacement — and a stringified proxy for that is one
+ * more thing to keep in step with the effect it guards.
+ */
+// ponytail: one call per row the cursor passes through and one per column count a drag
+// passes through, neither debounced. `preview.ts` records the same ceiling from its end and
+// says the fix belongs to the caller, which is this — a timer here would collapse both. Left
+// out until EXC-1020's latency budget says what the interval should be, since a guessed one
+// is a delay a user feels for no measured reason.
+function usePreview<T>(
+  preview: ((payload: T, width: number) => string | Promise<string>) | undefined,
+  row: Prepared<T> | undefined,
+  width: number,
+): readonly PreviewLine[] {
+  const [loaded, setLoaded] = useState<{
+    readonly row: Prepared<T>;
+    readonly width: number;
+    readonly lines: readonly PreviewLine[];
+  } | null>(null);
+
+  useEffect(() => {
+    if (!preview || !row) return;
+
+    let live = true;
+    const show = (text: string) => {
+      if (!live) return;
+      setLoaded({
+        row,
+        width,
+        // Split before sanitizing, so the document keeps its lines: the filter drops a
+        // newline exactly as the row one does, and for the same height-budget reason.
+        lines: text.split("\n").map((line, index) => {
+          const safe = sanitizePreview(line);
+          return { key: String(index), text: COLOUR ? safe : stripSgr(safe) };
+        }),
+      });
+    };
+
+    // A rejection is content: `previewPullRequest` already answers a failed lookup with
+    // `gh`'s own complaint, so what reaches here is the cache failing to write — which is
+    // worth saying in the pane and fatal to say by letting it escape.
+    Promise.resolve(preview(row.payload, width)).then(show, (error: unknown) => {
+      show(String(error));
+    });
+
+    return () => {
+      live = false;
+    };
+  }, [preview, row, width]);
+
+  // `loaded !== null` rather than optional chaining: with no row selected, `loaded?.row` and
+  // `row` are both `undefined` and the comparison would pass on a value that is not there.
+  return loaded !== null && loaded.row === row && loaded.width === width ? loaded.lines : NO_LINES;
+}
+
 /** A run of characters that the query either matched or did not. */
 interface Segment {
   /** Where the run starts, in code points. Also its stable React key. */
@@ -482,6 +622,8 @@ interface State<T> {
    * from outside, which means that prop cannot change and there is nothing to sync back to.
    */
   readonly rows: readonly PickerRow<T>[];
+  /** The preview's first visible line. Unlike {@link top}, the pane's alone to move. */
+  readonly previewTop: number;
 }
 
 /**
@@ -507,6 +649,9 @@ interface State<T> {
  * not freshness**. A move sitting behind a replacement answers the row list it was built
  * from, and if that answer is not in the new rows the cursor falls to the top for one
  * frame, exactly as a dropped row does.
+ *
+ * A `scroll` carries its own `last` for the same reason `move` carries `payloads`: the
+ * preview's length is a property of text the reducer never sees.
  */
 type Action<T> =
   | { readonly type: "retype"; readonly edit: (query: string) => string }
@@ -516,7 +661,8 @@ type Action<T> =
       readonly payloads: readonly T[];
       readonly listRows: number;
     }
-  | { readonly type: "replace"; readonly rows: readonly PickerRow<T>[] };
+  | { readonly type: "replace"; readonly rows: readonly PickerRow<T>[] }
+  | { readonly type: "scroll"; readonly delta: number; readonly last: number };
 
 /**
  * Where `selected` sits in the list currently on screen — the cursor.
@@ -559,14 +705,32 @@ export function reduce<T>(state: State<T>, action: Action<T>): State<T> {
     // cursor at the top either way.
     const kept = action.rows.some((row) => row.payload === state.selected);
 
-    return { ...state, rows: action.rows, selected: kept ? state.selected : undefined };
+    return {
+      ...state,
+      rows: action.rows,
+      selected: kept ? state.selected : undefined,
+      // A dropped selection puts the cursor on a different row, and therefore under a
+      // different document; a kept one is still looking at the same text it scrolled.
+      previewTop: kept ? state.previewTop : 0,
+    };
   }
 
   if (action.type === "retype") {
     // A changed query invalidates the selection: the row under the cursor is probably not
     // in the new result set, and "wherever the cursor happened to be" is not a selection a
     // user made.
-    return { ...state, query: action.edit(state.query), selected: undefined, top: 0 };
+    return {
+      ...state,
+      query: action.edit(state.query),
+      selected: undefined,
+      top: 0,
+      previewTop: 0,
+    };
+  }
+
+  if (action.type === "scroll") {
+    const previewTop = state.previewTop + action.delta;
+    return { ...state, previewTop: Math.min(Math.max(previewTop, 0), Math.max(action.last, 0)) };
   }
 
   const last = Math.max(action.payloads.length - 1, 0);
@@ -575,11 +739,17 @@ export function reduce<T>(state: State<T>, action: Action<T>): State<T> {
     last,
   );
 
+  const landed = action.payloads[cursor];
+
   return {
     ...state,
     // `undefined` on an empty list, which is exactly right: there is nothing to select.
-    selected: action.payloads[cursor],
+    selected: landed,
     top: Math.min(Math.max(state.top, cursor - action.listRows + 1, 0), cursor),
+    // A different row is a different document, so the pane starts at its top again. An arrow
+    // that changed nothing — the last row, pressed down — leaves the pane where the reader
+    // scrolled it.
+    previewTop: landed === state.selected ? state.previewTop : 0,
   };
 }
 
@@ -593,13 +763,14 @@ interface PickerProps<T> extends PickOptions<T> {
 }
 
 /** The component itself. */
-function Picker<T>({ rows, prompt, onOpen, onDone }: PickerProps<T>): ReactElement {
+function Picker<T>({ rows, prompt, preview, onOpen, onDone }: PickerProps<T>): ReactElement {
   const { exit } = useApp();
-  const { rows: viewportRows } = useWindowSize();
-  const [{ query, selected, top, rows: current }, dispatch] = useReducer(reduce, {
+  const { columns, rows: viewportRows } = useWindowSize();
+  const [{ query, selected, top, previewTop, rows: current }, dispatch] = useReducer(reduce, {
     query: "",
     selected: undefined,
     top: 0,
+    previewTop: 0,
     rows,
   });
 
@@ -626,6 +797,19 @@ function Picker<T>({ rows, prompt, onOpen, onDone }: PickerProps<T>): ReactEleme
   // replacement has moved the selected row somewhere the old window does not reach.
   const windowTop = Math.min(Math.max(top, cursor - listRows + 1, 0), cursor);
 
+  // The share, less the seam that is drawn inside it, so the number the caller renders at is
+  // the number of cells its text actually gets. Never below one: it reaches `gh` as a forced
+  // terminal width, where zero is not a render.
+  const previewWidth = Math.max(1, Math.floor(columns * PREVIEW_SHARE) - SEAM);
+
+  const previewLines = usePreview(preview, matches[cursor]?.row, previewWidth);
+
+  // Derived for `windowTop`'s reason, one line up: a widened terminal wraps the preview into
+  // fewer lines, and an offset that was inside the old document can be past the end of the
+  // new one — which renders as a pane gone blank with no cue.
+  const lastPaneTop = Math.max(0, previewLines.length - listRows);
+  const paneTop = Math.min(previewTop, lastPaneTop);
+
   const finish = (payload: T | null) => {
     onDone(payload);
     exit();
@@ -637,6 +821,13 @@ function Picker<T>({ rows, prompt, onOpen, onDone }: PickerProps<T>): ReactEleme
 
     if (key.upArrow || key.downArrow) {
       dispatch({ type: "move", delta: key.upArrow ? -1 : 1, payloads, listRows });
+      return;
+    }
+
+    // The pane's own keys, and only when there is a pane. The arrows stay the list's, so the
+    // two never contend for one binding — which is what "independently scrollable" asks for.
+    if (preview && (key.pageUp || key.pageDown)) {
+      dispatch({ type: "scroll", delta: key.pageUp ? -listRows : listRows, last: lastPaneTop });
       return;
     }
 
@@ -653,21 +844,53 @@ function Picker<T>({ rows, prompt, onOpen, onDone }: PickerProps<T>): ReactEleme
   return (
     <Box flexDirection="column">
       <Text wrap="truncate">{`${sanitize(prompt ?? DEFAULT_PROMPT)}${query}`}</Text>
-      {/* A filter that empties the list has to say so. Without this the frame collapses to
-          the query line alone, which reads the same as a picker that stopped working — and
-          Enter there resolves `null`, which a caller maps to a cancellation and prints
-          nothing at all, so the mistyped query would end in silence. */}
-      {matches.length === 0 && (
-        <Text dimColor={COLOUR} wrap="truncate">{`${GUTTER[0]}${NO_MATCHES}`}</Text>
-      )}
-      {matches.slice(windowTop, windowTop + listRows).map((match, index) => (
-        <Row
-          key={match.row.key}
-          row={match.row}
-          positions={match.positions}
-          selected={windowTop + index === cursor}
-        />
-      ))}
+      <Box>
+        {/* `overflowX="hidden"` is load-bearing rather than defensive. A flex item's automatic
+            minimum size is its min-content width while its overflow is visible, and a row's
+            cells are sized from the whole row set — so on a narrow terminal the list would
+            refuse to shrink into its 60%, push the seam right, and hand the caller a pane
+            width wider than the cells it actually got. Hidden resolves that minimum to zero,
+            which is what makes the split hold at every width rather than only wide ones. */}
+        <Box flexDirection="column" flexGrow={1} flexShrink={1} overflowX="hidden">
+          {/* A filter that empties the list has to say so. Without this the frame collapses
+              to the query line alone, which reads the same as a picker that stopped working
+              — and Enter there resolves `null`, which a caller maps to a cancellation and
+              prints nothing at all, so the mistyped query would end in silence. */}
+          {matches.length === 0 && (
+            <Text dimColor={COLOUR} wrap="truncate">{`${GUTTER[0]}${NO_MATCHES}`}</Text>
+          )}
+          {matches.slice(windowTop, windowTop + listRows).map((match, index) => (
+            <Row
+              key={match.row.key}
+              row={match.row}
+              positions={match.positions}
+              selected={windowTop + index === cursor}
+            />
+          ))}
+        </Box>
+        {preview && (
+          <Box
+            flexDirection="column"
+            // Yoga counts a border inside the width it is given, so the seam is added back
+            // here to leave `previewWidth` cells for the text itself. Rigid, because that
+            // number is what the caller rendered its text for: a pane squeezed narrower than
+            // it asked for would show text wrapped for a width it never had.
+            width={previewWidth + SEAM}
+            flexShrink={0}
+            borderStyle="single"
+            borderTop={false}
+            borderRight={false}
+            borderBottom={false}
+            borderDimColor={COLOUR}
+          >
+            {previewLines.slice(paneTop, paneTop + listRows).map((line) => (
+              <Text key={line.key} wrap="truncate">
+                {line.text}
+              </Text>
+            ))}
+          </Box>
+        )}
+      </Box>
     </Box>
   );
 }
@@ -716,6 +939,7 @@ export async function pick<T>(options: PickOptions<T>): Promise<T | null> {
       <Picker
         rows={options.rows}
         prompt={options.prompt}
+        preview={options.preview}
         onOpen={options.onOpen}
         onDone={(payload) => {
           picked = payload;
