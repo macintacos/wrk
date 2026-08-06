@@ -1,0 +1,150 @@
+{
+  "_README": [
+    "The frozen agent contracts, as data. Derived from agent_exec_worktree.py — the Python",
+    "implementation wrk replaces — and consumed by conformance.test.ts, which drives the real",
+    "CLI and compares what it prints against these objects: same keys, same key order, same",
+    "values, same types.",
+    "",
+    "Key ORDER is significant here and is asserted. JSON.parse preserves a JSON object's key",
+    "order into the parsed object's own-key order, so each entry below IS the wire order the",
+    "contract promises. Reordering two keys in this file is a contract change.",
+    "",
+    "Tokens are substituted before parsing: <container>, <checkout>, <worktree>, <clone>.",
+    "",
+    "Three values below deliberately DIVERGE from what the Python prints. Each is marked with a",
+    "DIVERGENCE note in conformance.test.ts and is expected, not a defect. Do not 'fix' them. A",
+    "fourth divergence — `repo convert` naming 'the preflight that refused' rather than the Python",
+    "script — is not an envelope value, so it is pinned in the test file rather than here.",
+    "",
+    "Keys starting with an underscore are notes on the entry below them; nothing looks them up."
+  ],
+
+  "preflight.proceed": {
+    "verdict": "proceed",
+    "reason": null,
+    "repo_root": "<checkout>",
+    "default_branch": "main",
+    "base": "main",
+    "current_branch": "main",
+    "worktree_root": "<container>",
+    "current_worktree": null,
+    "conversion_reference": null
+  },
+
+  "preflight.proceed-base": {
+    "verdict": "proceed",
+    "reason": null,
+    "repo_root": "<checkout>",
+    "default_branch": "main",
+    "base": "EXC-0/parent",
+    "current_branch": "main",
+    "worktree_root": "<container>",
+    "current_worktree": null,
+    "conversion_reference": null
+  },
+
+  "_preflight.proceed-base-empty": "DIVERGENCE 4: Python's `base or default_branch` replaces an explicitly empty --base with the default branch; wrk's `??` reports it back. Observable in the envelope, so not an internal difference despite preflight.ts's header filing it as one.",
+  "preflight.proceed-base-empty": {
+    "verdict": "proceed",
+    "reason": null,
+    "repo_root": "<checkout>",
+    "default_branch": "main",
+    "base": "",
+    "current_branch": "main",
+    "worktree_root": "<container>",
+    "current_worktree": null,
+    "conversion_reference": null
+  },
+
+  "preflight.resumed": {
+    "verdict": "resumed",
+    "reason": null,
+    "repo_root": "<worktree>",
+    "default_branch": null,
+    "base": null,
+    "current_branch": "EXC-1/thing",
+    "worktree_root": null,
+    "current_worktree": "<worktree>",
+    "conversion_reference": null
+  },
+
+  "_preflight.blocked.container-cwd": "DIVERGENCE 1: Python reports current_branch \"\" here, a consequence of a non-optional dataclass field rather than a meaning. wrk reports null.",
+  "preflight.blocked.container-cwd": {
+    "verdict": "blocked",
+    "reason": "container-cwd",
+    "repo_root": "<container>",
+    "default_branch": null,
+    "base": null,
+    "current_branch": null,
+    "worktree_root": null,
+    "current_worktree": null,
+    "conversion_reference": null
+  },
+
+  "preflight.blocked.unconverted-repo": {
+    "verdict": "blocked",
+    "reason": "unconverted-repo",
+    "repo_root": "<clone>",
+    "default_branch": null,
+    "base": null,
+    "current_branch": "main",
+    "worktree_root": null,
+    "current_worktree": null,
+    "conversion_reference": "repo-setup"
+  },
+
+  "preflight.blocked.unrelated-worktree": {
+    "verdict": "blocked",
+    "reason": "unrelated-worktree",
+    "repo_root": "<worktree>",
+    "default_branch": null,
+    "base": null,
+    "current_branch": "EXC-2/other",
+    "worktree_root": null,
+    "current_worktree": "<worktree>",
+    "conversion_reference": null
+  },
+
+  "preflight.blocked.dirty-checkout": {
+    "verdict": "blocked",
+    "reason": "dirty-checkout",
+    "repo_root": "<checkout>",
+    "default_branch": "main",
+    "base": "main",
+    "current_branch": "main",
+    "worktree_root": null,
+    "current_worktree": null,
+    "conversion_reference": null
+  },
+
+  "_preflight.proceed-base-detached": "DIVERGENCE 2: Python reports current_branch \"HEAD\" on a detached HEAD; wrk reports null, since \"HEAD\" is not a branch a caller can act on. --base skips the sync, which is what leaves the detached HEAD standing to be reported — on the syncing path the switch lands first and the envelope names the default branch instead.",
+  "preflight.proceed-base-detached": {
+    "verdict": "proceed",
+    "reason": null,
+    "repo_root": "<checkout>",
+    "default_branch": "main",
+    "base": "EXC-0/parent",
+    "current_branch": null,
+    "worktree_root": "<container>",
+    "current_worktree": null,
+    "conversion_reference": null
+  },
+
+  "_preflight.proceed-detached": "Not a divergence: the syncing path switches off the detached HEAD before the envelope is built, so this reports the default branch. It pins EXC-997's 'post-sync branch assigned rather than re-read' difference, together with the independent git re-read in the case that uses it.",
+  "preflight.proceed-detached": {
+    "verdict": "proceed",
+    "reason": null,
+    "repo_root": "<checkout>",
+    "default_branch": "main",
+    "base": "main",
+    "current_branch": "main",
+    "worktree_root": "<container>",
+    "current_worktree": null,
+    "conversion_reference": null
+  },
+
+  "create.envelope": {
+    "worktree_path": "<worktree>",
+    "branch": "EXC-1/thing"
+  }
+}
