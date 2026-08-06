@@ -22,11 +22,32 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 
+import {
+  ERASE_SCREEN,
+  frameLines,
+  KEY,
+  maxCursorRise,
+  type PtySession,
+  typeUntil,
+} from "../../picker/test/fixtures/pty";
+import { cachePath } from "../src/cache";
 import type { PullRequest } from "../src/gh";
 import type { Worktree } from "../src/git";
 import { holderFor, openPullRequests, pullRequestRows } from "../src/prpick";
-import { cleanupFixtures } from "./fixtures/repo";
+import {
+  addRunWorktree,
+  childEnv,
+  cleanupFixtures,
+  driveCli,
+  ENDED,
+  ghlessWith,
+  makeContainer,
+  runCli,
+  tempDir,
+} from "./fixtures/repo";
 
 afterAll(cleanupFixtures);
 
@@ -131,5 +152,389 @@ describe("holderFor", () => {
 
   test("never matches a detached worktree, which has no branch to join on", () => {
     expect(holderFor([worktree("/c/spike", null)], "EXC-1/thing")).toBeUndefined();
+  });
+});
+
+/** Height of the pty every driven case runs in, matching `picker.test.ts`'s. */
+const ROWS = 24;
+
+/** The cache entry the command reads its rows out of, spelled as `pr.ts` files them. */
+const ENTRY = "pr-graph";
+
+/**
+ * The confirmation's prompt, copied from `prpick.ts` rather than imported.
+ *
+ * The acceptance criterion is about what a *user reads*, so the assertion has to fail when the
+ * wording changes rather than move with it. An import would make the two agree by construction
+ * and pin nothing at all.
+ */
+const PRUNE_PROMPT = "prune every stale worktree record in this repository?";
+
+/** What the fake `gh` renders for a preview, chosen to carry no `#` of its own. */
+const PREVIEW = "PREVIEW-BODY-FOR";
+
+/**
+ * A fake `gh` on a `PATH` holding it and `git` alone, plus the log it appends to.
+ *
+ * One `<cwd>\t<argv>` line per invocation, which is where the "checkout goes through the
+ * GitHub CLI" criterion actually lives: the resulting worktree looks the same whether `gh` or
+ * `git switch` put the branch there, so only the argv distinguishes them. `gh.test.ts`
+ * established this shape and this one is deliberately much smaller — it answers three
+ * subcommands rather than asserting on the environment, which that suite already owns.
+ *
+ * The `read` is not decoration: `proc.ts` closes a child's stdin, so this returns at EOF. Were
+ * stdin ever left as an open pipe, every call here would block until bun's timeout killed it,
+ * which is how this suite would notice.
+ *
+ * @param checkoutExit - What `gh pr checkout` exits with. A nonzero value is deliberately not
+ *   `1`, so a status that is *inherited* is distinguishable from one that was flattened.
+ */
+function fakeGh(checkoutExit = 0): { bin: string; log: string } {
+  const log = join(tempDir(), "gh.log");
+  const script = [
+    "#!/bin/sh",
+    `printf '%s\\t%s\\n' "$(pwd)" "$*" >> '${log}'`,
+    "read -r _ignored",
+    `if [ "$2" = view ]; then printf '${PREVIEW} %s\\n' "$3"; exit 0; fi`,
+    `if [ "$2" = checkout ]; then`,
+    `  printf 'the fake gh declined\\n' >&2`,
+    `  exit ${checkoutExit}`,
+    "fi",
+    "printf '[]'",
+    "",
+  ].join("\n");
+
+  return { bin: ghlessWith(script), log };
+}
+
+/** Every argv the fake `gh` was called with, cwd first. Absent log means it was never run. */
+function ghCalls(log: string): string[] {
+  return existsSync(log) ? readFileSync(log, "utf8").split("\n").filter(Boolean) : [];
+}
+
+/** Writes `rows` into the `pr-graph` entry the command will read, as `pr.ts` stores them. */
+function seed(container: string, cacheHome: string, rows: readonly PullRequest[]): void {
+  const entry = cachePath({ name: ENTRY, container, root: join(cacheHome, "wrk") });
+  mkdirSync(dirname(entry), { recursive: true });
+  writeFileSync(entry, JSON.stringify(rows));
+}
+
+/** What {@link repoWithPrs} built: a container, somewhere to run from, and the fake's log. */
+interface Fixture {
+  container: string;
+  checkout: string;
+  bin: string;
+  log: string;
+  cacheHome: string;
+}
+
+/**
+ * A bare-repo container whose `pr-graph` entry already holds `rows`, and a fake `gh` beside it.
+ *
+ * The entry is written directly rather than through a `gh` that answers a listing, which is
+ * what keeps the network out of every case: the command reads the cache, finds it fresh
+ * against the default fifteen-minute threshold, and never asks `gh` for a list at all.
+ */
+function repoWithPrs(rows: readonly PullRequest[], checkoutExit = 0): Fixture {
+  const { container, checkout } = makeContainer("trunk");
+  const cacheHome = tempDir();
+  const { bin, log } = fakeGh(checkoutExit);
+  seed(container, cacheHome, rows);
+
+  return { container, checkout, bin, log, cacheHome };
+}
+
+/** `driveCli`, with `pr` already in the argv and this fixture's shielded environment. */
+function drivePr(
+  fixture: Fixture,
+  args: string[],
+  drive: (session: PtySession) => Promise<void>,
+): ReturnType<typeof driveCli> {
+  return driveCli(
+    fixture.checkout,
+    ["pr", ...args],
+    drive,
+    childEnv(fixture.cacheHome, fixture.bin),
+    ROWS,
+  );
+}
+
+/** `runCli`, with the same fixture-private cache, config and `PATH` the driven cases use. */
+function prCli(fixture: Fixture, args: string[]): ReturnType<typeof runCli> {
+  return runCli(args, fixture.checkout, childEnv(fixture.cacheHome, fixture.bin));
+}
+
+/** The exit status the driving script echoed, since the shell's own status is bash's. */
+function status(capture: string): number {
+  return Number(new RegExp(`${ENDED}(\\d+)`).exec(capture)?.[1] ?? Number.NaN);
+}
+
+/** {@link typeUntil}, with the condition most cases share: the run has ended. */
+function quit(session: PtySession, key: string): Promise<void> {
+  return typeUntil(session, key, (text) => text.includes(ENDED));
+}
+
+/**
+ * The picker's frame, read while it is still on screen, then dismissed.
+ *
+ * Snapshotting from inside the driver is the whole point: `frameLines` answers the **last**
+ * frame in a capture and the picker erases its own frame on the way out, so a capture read
+ * after the run has ended reports the shell's next line rather than the list.
+ *
+ * The wait is on the preview's text as well as the list's, because the pane arrives on a frame
+ * of its own — `previewPullRequest` is async — and a snapshot taken between the two would
+ * report a list with no pane beside it and pass the "no pane" assertions for free.
+ */
+async function frameWhileOpen(fixture: Fixture, lastRow: string): Promise<string[]> {
+  let lines: string[] = [];
+  await drivePr(fixture, ["--print-path"], async (session) => {
+    await session.waitUntil((text) => text.includes(lastRow) && text.includes(PREVIEW));
+    lines = frameLines(session.capture());
+    await quit(session, KEY.escape);
+  });
+
+  return lines;
+}
+
+describe("wrk pr — the cd protocol", () => {
+  test("a dismissed pick exits 130 with stdout empty", async () => {
+    const fixture = repoWithPrs([pull(1, "feat/one")]);
+    const { capture, stdout } = await drivePr(fixture, ["--print-path"], async (session) => {
+      await session.waitFor("#1");
+      await quit(session, KEY.escape);
+    });
+
+    expect(status(capture)).toBe(130);
+    expect(stdout).toBe("");
+  });
+
+  test("the frame stays inline, never taking the screen", async () => {
+    const fixture = repoWithPrs([pull(1, "feat/one"), pull(2, "feat/two")]);
+    let capture = "";
+    await drivePr(fixture, ["--print-path"], async (session) => {
+      await session.waitUntil((text) => text.includes("#1") && text.includes(PREVIEW));
+      capture = session.capture();
+      await quit(session, KEY.escape);
+    });
+
+    expect(capture).not.toContain(ERASE_SCREEN);
+    expect(maxCursorRise(capture)).toBeLessThan(ROWS);
+  });
+});
+
+describe("wrk pr — what it draws", () => {
+  test("lists open pull requests most-recently-updated first", async () => {
+    const fixture = repoWithPrs([
+      pull(1, "feat/old", { updatedAt: "2026-01-01T00:00:00Z" }),
+      pull(2, "feat/newest", { updatedAt: "2026-03-01T00:00:00Z" }),
+      pull(3, "feat/middle", { updatedAt: "2026-02-01T00:00:00Z" }),
+    ]);
+
+    const rendered = (await frameWhileOpen(fixture, "#1")).join("\n");
+
+    expect(rendered.indexOf("#2")).toBeLessThan(rendered.indexOf("#3"));
+    expect(rendered.indexOf("#3")).toBeLessThan(rendered.indexOf("#1"));
+  });
+
+  test("a merged pull request is not offered, having nowhere to go and nothing to review", async () => {
+    const fixture = repoWithPrs([
+      pull(1, "feat/live"),
+      pull(2, "feat/landed", { state: "MERGED" }),
+    ]);
+
+    const rendered = (await frameWhileOpen(fixture, "#1")).join("\n");
+
+    expect(rendered).toContain("#1");
+    expect(rendered).not.toContain("#2");
+  });
+
+  test("the preview pane renders gh's own answer beside the list", async () => {
+    const fixture = repoWithPrs([pull(7, "feat/one")]);
+
+    const lines = await frameWhileOpen(fixture, "#7");
+
+    // Beside, not below: the same rendered line carries the row and the pane's first line, so
+    // a pane that had become a second list would fail this while a substring search would not.
+    expect(lines.some((line) => line.includes("#7") && line.includes(`${PREVIEW} 7`))).toBe(true);
+  });
+
+  test("no open pull request is a refusal, not an empty picker", async () => {
+    // Refused before anything is drawn, so a pipe is enough to observe it.
+    const fixture = repoWithPrs([pull(2, "feat/landed", { state: "MERGED" })]);
+    const result = await prCli(fixture, ["pr", "--print-path"]);
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("wrk: ");
+    expect(result.stderr).not.toMatch(/^\s+at /m);
+  });
+});
+
+describe("wrk pr — a branch that already has a worktree", () => {
+  test("goes there, and never runs gh pr checkout", async () => {
+    const fixture = repoWithPrs([pull(5, "EXC-1/thing")]);
+    const live = addRunWorktree(fixture.container, "EXC-1/thing");
+
+    const { capture, stdout } = await drivePr(fixture, ["--print-path"], async (session) => {
+      await session.waitFor("#5");
+      await quit(session, KEY.enter);
+    });
+
+    expect(status(capture)).toBe(0);
+    expect(stdout).toBe(`${live}\n`);
+    expect(ghCalls(fixture.log).some((line) => line.includes("pr checkout"))).toBe(false);
+  });
+
+  test("without --print-path the answer is the envelope", async () => {
+    const fixture = repoWithPrs([pull(5, "EXC-1/thing")]);
+    const live = addRunWorktree(fixture.container, "EXC-1/thing");
+
+    const { stdout } = await drivePr(fixture, [], async (session) => {
+      await session.waitFor("#5");
+      await quit(session, KEY.enter);
+    });
+
+    expect(JSON.parse(stdout)).toEqual({ worktree_path: live, number: 5 });
+    // `toEqual` is indifferent to key order, and order is one of the envelope's two guarantees
+    // — the same assertion `conformance.test.ts` makes for `agent create`.
+    expect(Object.keys(JSON.parse(stdout))).toEqual(["worktree_path", "number"]);
+  });
+});
+
+describe("wrk pr — a branch that has none", () => {
+  test("creates the worktree detached and checks the pull request out into it", async () => {
+    const fixture = repoWithPrs([pull(8, "feat/fresh")]);
+    const expected = join(fixture.container, "feat+fresh");
+
+    const { capture, stdout } = await drivePr(fixture, ["--print-path"], async (session) => {
+      await session.waitFor("#8");
+      await quit(session, KEY.enter);
+    });
+
+    expect(status(capture)).toBe(0);
+    expect(stdout).toBe(`${expected}\n`);
+    expect(existsSync(expected)).toBe(true);
+    // The constraint the issue states outright, and the only place it is observable: the argv,
+    // and the directory it was run in.
+    expect(ghCalls(fixture.log)).toContain(`${expected}\tpr checkout 8`);
+  });
+
+  test("a failed checkout force-removes the worktree and inherits gh's status", async () => {
+    const fixture = repoWithPrs([pull(8, "feat/fresh")], 4);
+    const expected = join(fixture.container, "feat+fresh");
+
+    const { capture, stdout } = await drivePr(fixture, ["--print-path"], async (session) => {
+      await session.waitFor("#8");
+      await quit(session, KEY.enter);
+    });
+
+    expect(status(capture)).toBe(4);
+    // Nothing on stdout is what keeps the shim from moving anyone, which is the whole of "the
+    // original working directory is restored" at the level a shell can see.
+    expect(stdout).toBe("");
+    expect(existsSync(expected)).toBe(false);
+    expect(capture).toContain("wrk: ");
+  });
+});
+
+describe("wrk pr — a worktree record whose directory is gone", () => {
+  /** A fixture whose chosen pull request's branch is held by a prunable record. */
+  function repoWithStaleRecord(): { fixture: Fixture; gone: string } {
+    const fixture = repoWithPrs([pull(9, "feat/gone")]);
+    const gone = addRunWorktree(fixture.container, "feat/gone");
+    rmSync(gone, { recursive: true, force: true });
+
+    return { fixture, gone };
+  }
+
+  test("asks before pruning, and says the prune is repo-wide", async () => {
+    const { fixture, gone } = repoWithStaleRecord();
+    let confirm: string[] = [];
+
+    const { capture, stdout } = await drivePr(fixture, ["--print-path"], async (session) => {
+      await session.waitFor("#9");
+      await typeUntil(session, KEY.enter, (text) => text.includes(PRUNE_PROMPT));
+      confirm = frameLines(session.capture());
+      await quit(session, KEY.escape);
+    });
+
+    // The disclosure is in the prompt, and the record it is about is named on the line above.
+    expect(confirm.some((line) => line.includes(PRUNE_PROMPT))).toBe(true);
+    expect(capture).toContain(gone);
+    // Declining is a dismissal, not a failure: nothing was pruned and nobody moved.
+    expect(status(capture)).toBe(130);
+    expect(stdout).toBe("");
+  });
+
+  test("declining leaves the record standing", async () => {
+    const { fixture, gone } = repoWithStaleRecord();
+
+    await drivePr(fixture, ["--print-path"], async (session) => {
+      await session.waitFor("#9");
+      await typeUntil(session, KEY.enter, (text) => text.includes(PRUNE_PROMPT));
+      await quit(session, KEY.escape);
+    });
+
+    const records = await runCli(["agent", "preflight", "--issue", "EXC-1"], fixture.checkout);
+    expect(records.code).toBe(0);
+    // Read from git rather than from `wrk`, so the assertion is about the repository itself.
+    expect(existsSync(gone)).toBe(false);
+    expect(
+      Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
+        cwd: fixture.container,
+      }).stdout.toString(),
+    ).toContain(gone);
+  });
+
+  test("accepting prunes, then creates the worktree and checks the pull request out", async () => {
+    const { fixture, gone } = repoWithStaleRecord();
+
+    const { capture, stdout } = await drivePr(fixture, ["--print-path"], async (session) => {
+      await session.waitFor("#9");
+      await typeUntil(session, KEY.enter, (text) => text.includes(PRUNE_PROMPT));
+      // The gutter is the only cue that the cursor moved, and it survives `frameLines`'
+      // escape-stripping because it is a character rather than a code.
+      await typeUntil(session, KEY.down, (text) =>
+        frameLines(text).some((line) => line.includes("▌ prune")),
+      );
+      await quit(session, KEY.enter);
+    });
+
+    expect(status(capture)).toBe(0);
+    expect(stdout).toBe(`${gone}\n`);
+    expect(existsSync(gone)).toBe(true);
+    expect(ghCalls(fixture.log)).toContain(`${gone}\tpr checkout 9`);
+  });
+});
+
+describe("wrk pr — the help carve-out and the non-terminal refusal", () => {
+  test("--help writes nothing to stdout, because stdout is a path the shim cds into", async () => {
+    const fixture = repoWithPrs([pull(1, "feat/one")]);
+    const result = await prCli(fixture, ["pr", "--help"]);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("--print-path");
+  });
+
+  test("the rest of the tree keeps its help on stdout", async () => {
+    // The carve-out is now two commands wide rather than one, and no wider.
+    const fixture = repoWithPrs([pull(1, "feat/one")]);
+    const result = await prCli(fixture, ["agent", "create", "--help"]);
+
+    expect(result.stdout).toContain("--branch");
+    expect(result.stderr).toBe("");
+  });
+
+  test("a non-terminal is a refusal, not a hang and not a dismissal", async () => {
+    // `runCli` gives the child pipes, so the picker's door check fires. Exit 1 rather than 130:
+    // nobody dismissed anything, there was nowhere to draw.
+    const fixture = repoWithPrs([pull(1, "feat/one")]);
+    const result = await prCli(fixture, ["pr", "--print-path"]);
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("wrk: ");
+    expect(result.stderr).toContain("not a terminal");
   });
 });
