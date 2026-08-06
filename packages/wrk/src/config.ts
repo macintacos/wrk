@@ -31,7 +31,7 @@
  * It also has no TOML loader, so it would sit on top of this dependency rather than replace
  * it. `c12` does layer natively and does read TOML, but it is in beta for a module a shell
  * prompt calls on every redraw, it pulls a substantial dependency graph into a package that
- * otherwise has three, and it merges *whole layers* — the wrong granularity for the
+ * otherwise has five, and it merges *whole layers* — the wrong granularity for the
  * per-field degradation below, which would have had to stay hand-written underneath it
  * anyway. In fairness to that last argument, `zod` is now the largest thing in this
  * package's own graph; what it buys is the per-field degradation itself, which is the part
