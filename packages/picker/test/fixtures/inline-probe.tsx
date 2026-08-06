@@ -99,8 +99,28 @@ function UnguardedInput() {
   return <List />;
 }
 
-/** The same window, with the guard Ink's own error message points at. */
+/**
+ * The same window, with the guard Ink's own error message points at — **coerced**.
+ *
+ * `isRawModeSupported` is declared `boolean` but is really `stdin.isTTY`, which Node
+ * leaves `undefined` rather than `false` on a pipe. Ink's own early return is
+ * `options.isActive === false`, a strict comparison, so handing the raw value straight to
+ * `isActive` type-checks, reads as a guard, and guards nothing. `Boolean` is the whole
+ * difference between this component and the one above.
+ */
 function GuardedInput() {
+  const { isRawModeSupported } = useStdin();
+  useInput(() => {}, { isActive: Boolean(isRawModeSupported) });
+  return <List />;
+}
+
+/**
+ * The guard as anyone would first write it, and as the type signature invites.
+ *
+ * Kept as its own scenario because it is the trap rather than a typo: it compiles, it
+ * reads correctly, and it crashes exactly where the unguarded version does.
+ */
+function UncoercedGuardInput() {
   const { isRawModeSupported } = useStdin();
   useInput(() => {}, { isActive: isRawModeSupported });
   return <List />;
@@ -129,6 +149,7 @@ function FixedWidth() {
 const scenarios: Record<string, () => React.ReactElement> = {
   list: List,
   "input-unguarded": UnguardedInput,
+  "input-guard-uncoerced": UncoercedGuardInput,
   "input-guarded": GuardedInput,
   "fixed-width": FixedWidth,
 };
