@@ -38,6 +38,30 @@ import { createWorktree } from "./worktree";
 import { chooseWorktree } from "./wt";
 
 /**
+ * The output configuration a picker command is registered with, and no other command is.
+ *
+ * Commander renders help on stdout, and [`./output`](./output)'s header calls that right — a
+ * caller asking for help is a human. It is wrong for exactly the picker commands: under the
+ * documented `cd` shim their stdout is fed straight to `cd`, so a usage block there is a
+ * directory name rather than a document.
+ *
+ * **Applying it stays one command wide.** `configureOutput` spreads its argument into a *new*
+ * object owned by the command it was called on, so this literal is read and never written, two
+ * commands can share it, and `wrk --help` and every `agent` command keep stdout.
+ *
+ * The width has to move with the text: commander reads it from `process.stdout` by default,
+ * which under the shim is a pipe, so help would wrap at 80 columns on a terminal twice that
+ * wide. `80` is spelled out rather than left to `undefined` because the typing declares a
+ * `number` — it is commander's own fallback, so a non-TTY stderr wraps exactly as it did
+ * before. Colour is deliberately left alone: its default routes through commander's `NO_COLOR`
+ * / `FORCE_COLOR` handling, worth more than matching the stream.
+ */
+const PICKER_HELP = {
+  writeOut: (text: string) => process.stderr.write(text),
+  getOutHelpWidth: () => process.stderr.columns ?? 80,
+};
+
+/**
  * Assembles the commander tree.
  *
  * `repo convert` **prints and never runs** the conversion recipe: its first step renames the
@@ -70,11 +94,12 @@ import { chooseWorktree } from "./wt";
  * the one feeding stdout to `cd`.
  *
  * `pr` is the second picker and repeats every one of those decisions verbatim: `--print-path`
- * or the envelope, `wantsJson` never consulted, `--print-path` winning if both are given, and
- * {@link PICKER_HELP} taking its usage block off stdout. It differs from `wt` in one place
- * only, and not here — `wt` answers with a worktree that already exists, while `pr` may
- * **create** one and run `gh pr checkout` in it before it has a path to print. That is
- * [`./prpick`](./prpick)'s to own; what this tree sees is the same `Chosen | null` either way.
+ * or the envelope, `wantsJson` never consulted, `--print-path` winning if both are given,
+ * {@link PICKER_HELP} taking its usage block off stdout, and `resolveRepo` ahead of the cwd.
+ * It differs from `wt` in one place only, and not here — `wt` answers with a worktree that
+ * already exists, while `pr` may **create** one and run `gh pr checkout` in it before it has a
+ * path to print. That is [`./prpick`](./prpick)'s to own; what this tree sees is the same
+ * `Chosen | null` either way.
  *
  * `--branch` is a `requiredOption` rather than validated in the action, which puts its
  * absence on the route this module's own `main` documents as already correct: commander
@@ -83,30 +108,6 @@ import { chooseWorktree } from "./wt";
  *
  * @returns The configured program, not yet parsed.
  */
-/**
- * The output configuration a picker command is registered with, and no other command is.
- *
- * Commander renders help on stdout, and [`./output`](./output)'s header calls that right — a
- * caller asking for help is a human. It is wrong for exactly the picker commands: under the
- * documented `cd` shim their stdout is fed straight to `cd`, so a usage block there is a
- * directory name rather than a document.
- *
- * **Applying it stays one command wide.** `configureOutput` spreads its argument into a *new*
- * object owned by the command it was called on, so this literal is read and never written, two
- * commands can share it, and `wrk --help` and every `agent` command keep stdout.
- *
- * The width has to move with the text: commander reads it from `process.stdout` by default,
- * which under the shim is a pipe, so help would wrap at 80 columns on a terminal twice that
- * wide. `80` is spelled out rather than left to `undefined` because the typing declares a
- * `number` — it is commander's own fallback, so a non-TTY stderr wraps exactly as it did
- * before. Colour is deliberately left alone: its default routes through commander's `NO_COLOR`
- * / `FORCE_COLOR` handling, worth more than matching the stream.
- */
-const PICKER_HELP = {
-  writeOut: (text: string) => process.stderr.write(text),
-  getOutHelpWidth: () => process.stderr.columns ?? 80,
-};
-
 export function buildProgram(): Command {
   const program = new Command()
     .name("wrk")
@@ -160,7 +161,10 @@ export function buildProgram(): Command {
     .option("--print-path", "Print the chosen path alone, for the cd shim")
     .configureOutput(PICKER_HELP)
     .action(async ({ printPath }) => {
-      const chosen = await choosePullRequest(process.cwd());
+      // Through `resolveRepo` for `wt`'s reason, which applies here unchanged: `choosePullRequest`
+      // has no answer at all from outside a repository, and it hands the cwd back untouched
+      // whenever there is one. See [`./discover`](./discover).
+      const chosen = await choosePullRequest(await resolveRepo(process.cwd()));
       // A declined prune reaches here as the same `null` a dismissed list does, and takes the
       // same route out: the user said no, so nothing is printed and nobody moves.
       if (chosen === null) throw new Cancelled("the pull-request picker was dismissed");

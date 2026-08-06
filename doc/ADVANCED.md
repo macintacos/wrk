@@ -144,13 +144,12 @@ and sends you to your home directory.
 **A picker's own `--help` renders on stderr**, which is the one place `wrk` departs from
 the rule above it. Commander writes help to stdout, and for every other command that is
 right — but a picker's stdout is a path being fed to `cd`, so a usage block there is a
-directory name. `wrk wt` is the only such command today, so it is the only one carved out:
-`wrk --help` and every `agent` command keep stdout. What a shim sees is therefore an empty
-stdout, which its emptiness guard turns into a `1` while the help itself lands on the
-terminal.
+directory name. `wrk wt` and `wrk pr` are carved out and nothing else is: `wrk --help` and
+every `agent` command keep stdout. What a shim sees is therefore an empty stdout, which
+its emptiness guard turns into a `1` while the help itself lands on the terminal.
 
-`wrk pr` arrives in [EXC-1018](https://linear.app/macintacos/issue/EXC-1018); the shims
-above and the keybindings that call them live in the dotfiles repo rather than here.
+The shims above and the keybindings that call them live in the dotfiles repo rather than
+here.
 
 ## The worktree picker
 
@@ -202,6 +201,63 @@ all of it, and a row chosen before that round trip finishes waits for it on the 
 `--print-path` selects the bare-path stdout shape the `cd` protocol above consumes.
 Without it the answer is the usual envelope, `{worktree_path, branch}`, with `branch` null
 on a detached HEAD.
+
+## The pull-request picker
+
+`wrk pr` lists the repository's open pull requests and answers where to go for the one you
+pick — creating a worktree and checking the pull request out into it if there is not one
+already.
+
+```bash
+wrk pr [--print-path]
+```
+
+**Open pull requests only, most-recently-updated first.** A merged one is neither
+somewhere to go nor something to review, so it is not a row — which is the one place this
+list and `wrk wt`'s annotation disagree about the pull-request cache they share. Ties on
+the timestamp are broken by the higher number, so the same repository always draws in the
+same order.
+
+Each row is `#number`, the title, then the head branch. Type to filter, exactly as in
+`wrk wt`. Beside the list is a preview pane holding `gh`'s own rendering of the selected
+pull request — markdown as ANSI, links intact, wrapped to the pane's width — scrolled
+independently with `PageUp` and `PageDown`.
+
+Choosing a row resolves to one of three destinations:
+
+| The head branch                       | What happens                                                          |
+| ------------------------------------- | ---------------------------------------------------------------------- |
+| already has a worktree                | That is the answer. Nothing is created and `gh` is never run.           |
+| has a worktree record but no directory | You are asked to confirm a prune, then it is created as below.          |
+| has neither                           | A worktree is created detached and the pull request checked out into it. |
+
+**The prune is repo-wide, and the prompt says so.** `git worktree prune` discards the
+administrative record of *every* worktree whose directory is gone, not just the one in the
+way — so the confirmation asks about all of them, and the record that provoked the
+question is named on the line above it. Declining is a dismissal like any other: exit
+`130`, nothing on stdout, nothing pruned.
+
+**Checkout goes through `gh`, not `git`.** `gh pr checkout` resolves a fork's remote and
+sets the branch's upstream from a pull-request number, neither of which plain git can do —
+so the worktree is created **detached** first and `gh` decides its branch a moment later.
+Detached rather than on a DWIM'd branch named after the directory, which `gh` would then
+leave behind as a ref nobody asked for.
+
+**If the checkout fails, the worktree is force-removed** and `gh`'s own exit status
+becomes `wrk`'s. Nothing reaches stdout, so the shim's guards leave you exactly where you
+were.
+
+**With no open pull requests it refuses**: exit `1`, nothing on stdout. Unlike `wrk wt`, a
+single candidate does **not** skip the picker — choosing it may create a worktree and run
+a checkout, so `Enter` on a list of one is the confirmation that deserves.
+
+The rows are read through the shared `pr-graph` cache, so once it has been filled the
+refresh runs behind the draw rather than in front of it. The very first run in a
+repository is the exception: with nothing stored there is nothing to draw, so it waits for
+`gh` once.
+
+`--print-path` selects the bare-path stdout shape the `cd` protocol above consumes.
+Without it the answer is the usual envelope, `{worktree_path, number}`.
 
 ## Agent commands
 
