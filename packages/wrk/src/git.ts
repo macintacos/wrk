@@ -417,18 +417,34 @@ export interface WorktreeAddOptions {
 
   /** Commit-ish the worktree starts at. Defaults to the current `HEAD`. */
   startPoint?: string;
+
+  /**
+   * Leave the new worktree on a detached HEAD rather than on any branch.
+   *
+   * The way to say "no branch at all", which is otherwise unsayable: omitting `branch` does
+   * not mean none, it means git's DWIM picks one — see this function's own doc. For the
+   * caller that creates a worktree *before* deciding what belongs in it, a DWIM'd branch is
+   * minted only to be abandoned a moment later, and it outlives the worktree that named it.
+   *
+   * Mutually exclusive with {@link branch}, which git enforces rather than this module: the
+   * two spell contradictory instructions and `git worktree add` rejects the pair with its own
+   * message, which is the more useful error than one invented here.
+   */
+  detach?: boolean;
 }
 
 /**
  * Creates a worktree at `path`.
  *
- * **With neither option set, git's own convenience DWIM takes over** and creates a branch
- * named after `path`'s basename — or, where `worktree.guessRemote` is configured, tracks a
- * same-named remote branch instead. Pass `branch` to decide the name rather than inheriting
- * it from a directory name and a config setting.
+ * **With none of the options set, git's own convenience DWIM takes over** and creates a
+ * branch named after `path`'s basename — or, where `worktree.guessRemote` is configured,
+ * tracks a same-named remote branch instead. Pass `branch` to decide the name rather than
+ * inheriting it from a directory name and a config setting, or `detach` to have no branch at
+ * all.
  *
- * @throws If git refused — the path is taken, the branch already exists, or the branch is
- *   checked out somewhere else. The message carries git's own stderr.
+ * @throws If git refused — the path is taken, the branch already exists, the branch is
+ *   checked out somewhere else, or `branch` and `detach` were both given. The message carries
+ *   git's own stderr.
  */
 export async function addWorktree(
   path: string,
@@ -437,6 +453,7 @@ export async function addWorktree(
 ): Promise<void> {
   const args = ["worktree", "add"];
   if (options.branch !== undefined) args.push("-b", options.branch);
+  if (options.detach === true) args.push("--detach");
   args.push(path);
   if (options.startPoint !== undefined) args.push(options.startPoint);
   await gitOk(args, cwd);
