@@ -477,11 +477,11 @@ describe("wrk pr — a worktree record whose directory is gone", () => {
 
     // Read from git rather than from `wrk`, so the assertion is about the repository itself.
     expect(existsSync(gone)).toBe(false);
-    expect(
-      Bun.spawnSync(["git", "worktree", "list", "--porcelain"], {
-        cwd: fixture.container,
-      }).stdout.toString(),
-    ).toContain(gone);
+    // Through `fixtureGit`, never a bare `git` spawn: this suite runs under the repository's
+    // own pre-push hook, which exports `GIT_DIR`, and that outranks `cwd` — so a raw spawn
+    // lists *this* repository's worktrees and the assertion silently stops being about the
+    // fixture. `FIXTURE_ENV` sheds it; nothing else does.
+    expect(fixtureGit(["worktree", "list", "--porcelain"], fixture.container)).toContain(gone);
   });
 
   test("an unconverted repository refuses before asking to prune, not after", async () => {
