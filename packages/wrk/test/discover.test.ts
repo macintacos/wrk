@@ -218,6 +218,16 @@ describe("resolveRepo in a terminal", () => {
   /** The picker's selected-row gutter, as `packages/picker/src/picker.tsx` draws it. */
   const CURSOR = "▌ ";
 
+  /**
+   * Whether the gutter marks the row for `name`.
+   *
+   * Over `frameLines` rather than the raw capture, because the gutter and the row it marks are
+   * separated by the escape sequences that colour them.
+   */
+  function onRow(name: string): (capture: string) => boolean {
+    return (capture) => frameLines(capture).some((line) => line.startsWith(`${CURSOR}${name}`));
+  }
+
   /** Where the probe's stdout is sent, so the pty capture holds only what was drawn. */
   function stdoutPath(purpose: string): string {
     return join(tempDir(), `EXC-1019-${purpose}-stdout.txt`);
@@ -257,19 +267,19 @@ describe("resolveRepo in a terminal", () => {
       cols: WIDE,
       drive: async (pty) => {
         await pty.waitFor("alpha");
+        // `beta` is chosen by moving rather than by typing, since a fuzzy query would also
+        // match the temp path every row shares. Reached from the bottom rather than by one
+        // arrow from the top: the first key of a session can be swallowed by the effect that
+        // enables raw mode, and `typeUntil` re-types until one lands — which is only safe at
+        // the end of a list, where the reducer clamps a repeat into a no-op instead of carrying
+        // the cursor past the row being waited for. Stepping back up is then a single key on a
+        // terminal already known to be raw.
+        await typeUntil(pty, KEY.down, onRow("gamma"), "reached the last row");
+        // Snapshotted here rather than at the first row's appearance: the cursor having reached
+        // the last row is proof the whole list is drawn, where a fixed settle is a guess.
         frame = frameLines(pty.capture());
-        // Sorted, so the second row is `beta` — chosen by moving rather than by typing, since
-        // a fuzzy query would also match the temp path every row shares. `typeUntil` covers
-        // both hazards at once: the keystroke handler attaches in an effect that can swallow
-        // the first key, and a cursor that had not moved yet would choose `alpha` and fail as
-        // if the picker were broken.
-        await typeUntil(
-          pty,
-          KEY.down,
-          (capture) => frameLines(capture).some((line) => line.startsWith(`${CURSOR}beta`)),
-          "moved",
-        );
-        // Unguarded, and safe: raw mode is on by the time a key has been seen to land.
+        pty.write(KEY.up);
+        await pty.waitUntil(onRow("beta"));
         pty.write(KEY.enter);
       },
     });

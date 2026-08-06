@@ -190,24 +190,39 @@ const ATTEMPTS = 12;
  * which is the same rule {@link PtySession.waitUntil} states: a guessed sleep is both slower
  * than it needs to be and still too short on a loaded machine.
  *
+ * **`key` must be one whose repetition is harmless, and that is a real constraint rather
+ * than a caution.** Nothing here can tell a key that was swallowed from one that landed while
+ * the frame it caused was still being written, so a busy machine gets a second keystroke sent
+ * after the first has already taken effect. For a key that ends the run the extra one falls on
+ * the shell and costs nothing. For an arrow it does not: aiming at a row with another row
+ * below it, the second press moves the cursor *past* the row `ready` is watching for, and no
+ * later press can bring it back — the loop then spends every attempt and fails, having itself
+ * caused the failure. Use this to reach the **last** row of a list, where the reducer clamps
+ * and further presses are no-ops, and put the cursor somewhere else by some other means.
+ *
  * **Only the first key of a session needs this.** Raw mode is enabled once and stays on, so a
  * key sent after any other key has been observed to land cannot fall into the gap — which is
  * why a driver typically reaches for this once and then writes directly.
  *
  * What the condition *is* belongs to the caller, because what a key causes is observed in
  * different places: a cursor moving is visible only in the frame, while a run ending is
- * whatever the driving script announces.
+ * whatever the driving script announces. It also has to be about the frame the key was aimed
+ * at: a condition naming something a *later* screen shows leaves this typing into the gap
+ * between the two, and a tty buffers those keystrokes for whoever goes raw next.
  *
  * @param session - The live terminal, as {@link PtyOptions.drive} is handed one.
- * @param key - The bytes to send; see {@link KEY}.
+ * @param key - The bytes to send. Repetition must be harmless — see above.
  * @param ready - What the capture looks like once the key has landed.
  * @param what - How the failure reads: "the program never `<what>` after N keystrokes".
  * @throws If `ready` never held, which is the genuine hang this is not allowed to hide.
  *
  * @example
  * ```ts
- * await typeUntil(pty, KEY.down, selects("beta"), "moved");
- * pty.write(KEY.enter); // safe unguarded: raw mode is on by now
+ * const onLastRow = (capture: string) =>
+ *   frameLines(capture).some((line) => line.startsWith("▌ gamma"));
+ *
+ * await typeUntil(pty, KEY.down, onLastRow, "reached the last row");
+ * pty.write(KEY.up); // safe unguarded: raw mode is on by now
  * ```
  */
 export async function typeUntil(
@@ -227,7 +242,12 @@ export async function typeUntil(
     }
   }
 
-  throw new Error(`the program never ${what} after ${ATTEMPTS} keystrokes`);
+  // The frame is quoted because `waitUntil`'s own message — the one that names it — was
+  // swallowed by the `catch` above on every attempt, and "never moved" alone sends a reader to
+  // re-drive the scenario by hand to find out where the cursor actually is.
+  throw new Error(
+    `the program never ${what} after ${ATTEMPTS} keystrokes; last frame: ${frameLines(session.capture())}`,
+  );
 }
 
 /** Options for {@link runInPty}. */

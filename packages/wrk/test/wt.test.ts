@@ -10,12 +10,16 @@
  * [`../../picker/test/fixtures/pty.ts`](../../picker/test/fixtures/pty.ts) and
  * [`./fixtures/repo.ts`](./fixtures/repo.ts) — both existing harnesses, neither rebuilt here.
  *
- * `gh` never runs in any of these cases, and it is not stubbed either. A fixture container's
- * remote is a path in `/tmp`, so `gh` has nothing to answer about and `listPullRequests`
- * reports its "could not answer" `null` — which is the un-annotated case, and exactly the one
- * an acceptance criterion asks about. The annotated case is reached from the other side, by
- * seeding the `pr-graph` cache entry the picker reads through, so no network and no `gh` are
- * involved in either direction.
+ * **No case here touches the network, and most never run `gh` at all.** A fixture container's
+ * remote is a path in `/tmp`, and the `PATH` these children run with holds `git` alone, so
+ * `listPullRequests` reports its "could not answer" `null` — the un-annotated case, and
+ * exactly the one an acceptance criterion asks about. The annotated case is reached from the
+ * other side, by seeding the `pr-graph` cache entry the picker reads through.
+ *
+ * The annotation-timing cases are the one exception, and they run `gh` on purpose: proving the
+ * rows are drawn *before* `gh` answers takes a `gh` that has demonstrably not answered yet. It
+ * is a shell script on that same `PATH`, blocked on a gate the driver opens and answering from
+ * a file when it does — see {@link gatedGh}.
  *
  * @packageDocumentation
  */
@@ -242,30 +246,40 @@ function repoWith(count: number): { container: string; checkout: string; worktre
 }
 
 /**
- * A `PATH` holding `git` and nothing else, so a child cannot spawn `gh` at all.
+ * A directory holding `git` and nothing else, to be used as a child's whole `PATH`.
  *
- * Every CLI child below runs with it, and that is a property of the suite rather than of one
- * case. `gh.ts` makes the spawn itself the presence gate, so an unreachable `gh` is answered
+ * `gh.ts` makes the spawn itself the presence gate, so an unreachable `gh` is answered
  * instantly and locally — where leaving the real `gh` reachable puts an authenticating,
  * possibly networked binary on the critical path of every one of these cases, with latency
  * nothing here can bound. It is also the more faithful fixture: "absent" is one of the four
  * conditions the un-annotated acceptance criterion names, and it is the only one of the four
  * that can be produced without a network.
  *
- * `git` is symlinked rather than the directory being prepended to the real `PATH`, because
- * prepending would leave `gh` findable further along it.
+ * Binaries are symlinked into a fresh directory rather than the directory being prepended to
+ * the real `PATH`, because prepending would leave `gh` findable further along it.
+ *
+ * @param also - Further binaries to make reachable, by the name they are spelled on `PATH`.
+ *   {@link gatedGh} needs the two its script runs, since the script's own `PATH` is this
+ *   directory.
+ * @returns The directory.
  */
-const GHLESS: string = (() => {
+function shedGh(...also: string[]): string {
   const dir = tempDir();
-  const git = Bun.which("git");
-  if (git === null) throw new Error("git is not on PATH, so no fixture can shed gh from it");
-  symlinkSync(git, join(dir, "git"));
+  for (const name of ["git", ...also]) {
+    const binary = Bun.which(name);
+    if (binary === null) throw new Error(`${name} is not on PATH, so no fixture can shed gh`);
+    symlinkSync(binary, join(dir, name));
+  }
 
   return dir;
-})();
+}
+
+/** The `PATH` every case runs with unless it says otherwise: `git`, and no `gh` at all. */
+const GHLESS: string = shedGh();
 
 /**
- * Environment for one `wrk wt` child: no `gh`, a cache of its own, and no config at all.
+ * Environment for one `wrk wt` child: a cache of its own, no config at all, and no `gh` unless
+ * `path` says otherwise.
  *
  * Neither redirection is tidiness. Without `XDG_CACHE_HOME` these runs read and write the
  * developer's real `~/.cache/wrk`, so a case would depend on what a previous *real* `wrk wt`
@@ -274,9 +288,20 @@ const GHLESS: string = (() => {
  * against `DEFAULTS.glyphs`, so anyone who has ever set `[glyphs]` would fail this suite for a
  * reason that has nothing to do with the code. `config.test.ts` shields the same variable for
  * the same reason.
+ *
+ * `WRK_DEBUG` is shed for that same reason and is the sharpest of the three, because it is the
+ * variable a developer working on *this* feature exports: `debug()` writes its lines to stderr,
+ * which is the channel the picker draws on, and two cases below assert that nothing prefixed
+ * `wrk: ` reaches the terminal. Empty rather than absent, since `debug()` tests the value for
+ * truthiness and a `Record<string, string>` has no way to spell "unset".
+ *
+ * @param cacheHome - `XDG_CACHE_HOME` for the child. A private empty directory by default,
+ *   which is the cold-cache case; pass one that has been seeded to get a warm one.
+ * @param path - `PATH` for the child, {@link GHLESS} by default. {@link gatedGh} answers the
+ *   one the annotation-timing cases pass instead.
  */
 function childEnv(cacheHome: string = tempDir(), path: string = GHLESS): Record<string, string> {
-  return { PATH: path, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: tempDir() };
+  return { PATH: path, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: tempDir(), WRK_DEBUG: "" };
 }
 
 /**
@@ -293,8 +318,15 @@ function childEnv(cacheHome: string = tempDir(), path: string = GHLESS): Record<
  * the process would not exercise it. No network is touched either way — the rows are handed
  * over from disk, per the suite's standing rule that `gh` is never really run.
  *
- * `sleep` and `cat` are absolute paths because the child's own `PATH` is this directory, which
- * holds `git` and `gh` and nothing else.
+ * The wait is **bounded**, and that is not defensiveness. `runInPty` propagates a driver's
+ * failure without awaiting or killing the child, so a case that throws before opening the gate
+ * leaves this script polling — and an unbounded loop would poll until the whole test process
+ * exits. Giving up answers as a `gh` that could not answer, which is an outcome `gh.ts` already
+ * has a meaning for, rather than a hang.
+ *
+ * `sleep` and `cat` are symlinked in beside `git` rather than spelled as absolute paths: the
+ * script's own `PATH` is this directory, and `/bin` is where they live on this machine rather
+ * than everywhere.
  *
  * @param rows - What the `--state open` query answers with. The merged query answers `[]`,
  *   which is `gh` saying "none" rather than "could not answer" — the distinction `gh.ts`
@@ -302,11 +334,7 @@ function childEnv(cacheHome: string = tempDir(), path: string = GHLESS): Record<
  * @returns The directory to run with as `PATH`, and the call that lets `gh` answer.
  */
 function gatedGh(rows: readonly PullRequest[]): { path: string; open: () => void } {
-  const dir = tempDir();
-  const git = Bun.which("git");
-  if (git === null) throw new Error("git is not on PATH, so no fixture can shed gh from it");
-  symlinkSync(git, join(dir, "git"));
-
+  const dir = shedGh("sleep", "cat");
   const gate = join(dir, "gate");
   const answer = join(dir, "open.json");
   writeFileSync(answer, JSON.stringify(rows));
@@ -314,9 +342,13 @@ function gatedGh(rows: readonly PullRequest[]): { path: string; open: () => void
     join(dir, "gh"),
     [
       "#!/bin/sh",
-      `while [ ! -f "${gate}" ]; do /bin/sleep 0.02; done`,
+      // Ten seconds, well past the picker's own 3 s waits: reaching the bound means the case
+      // failed. Counted with shell arithmetic rather than `seq`, which is not on this `PATH`.
+      "n=0",
+      `while [ ! -f "${gate}" ] && [ "$n" -lt 500 ]; do sleep 0.02; n=$((n + 1)); done`,
+      `[ -f "${gate}" ] || exit 1`,
       'case "$*" in',
-      `  *"--state open"*) /bin/cat "${answer}" ;;`,
+      `  *"--state open"*) cat "${answer}" ;;`,
       "  *) echo '[]' ;;",
       "esac",
       "",
@@ -345,17 +377,20 @@ const ENDED = "EXIT:";
  *
  * The restricted `PATH` is applied inside the script rather than through `runInPty`'s `env`,
  * so it reaches the CLI child without also deciding where `bash` itself is found.
+ *
+ * @param options - {@link childEnv}'s two, as an object rather than trailing positionals —
+ *   `RunOptions`, `PullRequestOptions`, `PtyOptions`, `PickOptions` and `CacheKey` all take
+ *   this shape, and a caller wanting only the second would otherwise pass `undefined` first.
  */
 async function driveWt(
   cwd: string,
   args: string[],
   drive: (session: PtySession) => Promise<void>,
-  cacheHome?: string,
-  path?: string,
+  options: { cacheHome?: string; path?: string } = {},
 ): Promise<{ capture: string; exitCode: number; stdout: string }> {
   const out = join(tempDir(), "stdout");
   const argv = args.map((argument) => `"${argument}"`).join(" ");
-  const env = childEnv(cacheHome, path);
+  const env = childEnv(options.cacheHome, options.path);
   const exports = Object.entries(env)
     .map(([name, value]) => `${name}="${value}"`)
     .join(" ");
@@ -418,7 +453,7 @@ async function frameWhileOpen(
       lines = frameLines(session.capture());
       await quit(session, KEY.escape);
     },
-    cacheHome,
+    { cacheHome },
   );
 
   return { lines, capture };
@@ -555,9 +590,9 @@ describe("wrk wt — the annotation arrives behind the draw", () => {
   ];
 
   test("the rows are on screen before gh answers, and take the annotation once it does", async () => {
-    // A cold cache and a `gh` that has not answered: a frame here is the claim in full, and the
-    // one this issue exists for. Before EXC-1017 the annotation was awaited in front of `pick`,
-    // so this wait timed out with nothing ever drawn.
+    // A cold cache and a `gh` that has not answered, so this wait is the claim in full: an
+    // annotation reached in front of the draw leaves the terminal blank until `gh` speaks, and
+    // there would be no frame here to read.
     const { checkout } = repoWith(2);
     const gh = gatedGh(stacked);
     let opening: string[] = [];
@@ -575,8 +610,7 @@ describe("wrk wt — the annotation arrives behind the draw", () => {
         annotated = frameLines(session.capture());
         await quit(session, KEY.escape);
       },
-      undefined,
-      gh.path,
+      { path: gh.path },
     );
 
     // Drawn from the worktrees alone: every branch, and not one pull-request column.
@@ -594,32 +628,34 @@ describe("wrk wt — the annotation arrives behind the draw", () => {
     // The criterion `PickerRow.payload` is a path for: the cursor is restored by matching the
     // payload with `===`, so a row set rebuilt around the same worktrees keeps it, even though
     // every row grew four columns underneath it.
-    const { checkout, worktrees } = repoWith(3);
-    const gh = gatedGh([...stacked, pull(13, "EXC-3/thing-3", { baseRefName: "EXC-2/thing-2" })]);
+    // Two worktrees, so the row moved onto is the **last** one: `typeUntil` may send a second
+    // arrow after the first has landed, and only at the end of the list does the reducer clamp
+    // that into a no-op instead of carrying the cursor past the row being aimed at.
+    const { checkout, worktrees } = repoWith(2);
+    const gh = gatedGh(stacked);
     let beforeSwap: string[] = [];
-    let afterSwap: string[] = [];
+    let afterSwap = "";
 
     const { capture, stdout } = await driveWt(
       checkout,
       ["--print-path"],
       async (session) => {
-        await session.waitFor("EXC-3/thing-3");
+        await session.waitFor("EXC-2/thing-2");
         await typeUntil(session, KEY.down, selects("EXC-2/thing-2"), "moved");
         beforeSwap = frameLines(session.capture());
 
         gh.open();
-        await session.waitUntil(drawn("#13"));
-        afterSwap = frameLines(session.capture());
+        await session.waitUntil(drawn("#12"));
+        afterSwap = session.capture();
         await quit(session, KEY.enter);
       },
-      undefined,
-      gh.path,
+      { path: gh.path },
     );
 
     // The move really did happen while the rows were still bare, so the swap this asserts about
     // is a swap rather than a redraw of something already annotated.
     expect(beforeSwap.join("\n")).not.toContain("#");
-    expect(afterSwap.some((line) => line.startsWith("▌ EXC-2/thing-2 "))).toBe(true);
+    expect(selects("EXC-2/thing-2")(afterSwap)).toBe(true);
     expect(status(capture)).toBe(0);
     expect(stdout).toBe(`${worktrees[1]}\n`);
   });
@@ -641,8 +677,7 @@ describe("wrk wt — the annotation arrives behind the draw", () => {
         gh.open();
         await session.waitFor(ENDED);
       },
-      undefined,
-      gh.path,
+      { path: gh.path },
     );
 
     expect(status(capture)).toBe(130);

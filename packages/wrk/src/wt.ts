@@ -31,6 +31,13 @@
  * terminal stays blank. The cursor rides across the replacement because the payload is a path;
  * {@link worktreeRows} states that obligation from the row's end.
  *
+ * What that costs, on a cold cache only: the `gh` round trip is in flight while the user is
+ * choosing, and choosing does not stop it. `cli.ts` sets `process.exitCode` rather than calling
+ * `process.exit` — `output.ts` says why — and `proc.ts`'s `run` does not `unref` its child, so
+ * a pick made before `gh` answers keeps the process alive until it does. The wait moved from in
+ * front of the draw to after the choice; the total is the same. Dropping it needs a
+ * cancellation channel `PickOptions.onOpen` does not have, which is EXC-1014's to settle.
+ *
  * **An un-annotated row carries one column, not five empty ones.** The picker sizes each
  * column across the whole row set and tolerates rows holding fewer of them, so a branch with
  * no pull request emits `[branch]` and renders identically to a picker that never looked —
@@ -245,11 +252,16 @@ export function worktreeRows(
 /**
  * The repository's pull requests, or an empty map if they could not be read at all.
  *
- * `background` because this draws on a keystroke: a stale graph now beats a fresh one in three
- * seconds, and `pr.ts` names a picker as the caller that option exists for. It is nonetheless
- * never awaited *in front of* a frame — {@link chooseWorktree} calls this from the picker's
- * `onOpen`, so the one case `background` cannot cover, a cold cache falling through to `gh` in
- * the foreground, costs the annotation its arrival time rather than the list its draw.
+ * `background` still, now that {@link chooseWorktree} calls this from behind the draw rather
+ * than in front of it: nothing is waiting on the answer, so the detached refresh costs this run
+ * nothing and leaves the entry warm for the next one. `pr.ts` names a picker as the caller that
+ * option exists for.
+ *
+ * ponytail: under `WRK_DEBUG` this path's own diagnostics — `pr.ts`'s foreground-refresh and
+ * spawn lines, and the `catch` below — reach stderr while the picker owns it, and Ink sizes its
+ * erase to its own render, so the frame drifts a row per line. Harmless with the flag unset,
+ * which is every real run. Gate `debug` on whether a picker is mounted, or route it through the
+ * picker, if the diagnostics ever need to be readable at the same time as the frame.
  *
  * The `catch` covers the one failure `pullRequests` documents as its own — an unreadable cache
  * directory — and deliberately not `gh` being unable to answer, which never reaches here.
@@ -332,22 +344,26 @@ export async function chooseWorktree(cwd: string): Promise<Chosen | null> {
 
   try {
     const path = await pick({
-      // Drawn from the worktrees alone, and annotated from `onOpen` once the graph answers.
-      // The list is what the user came for and `git` already has it, so nothing about a pull
-      // request may stand in front of the first frame — not `gh` on a cold cache, and not the
-      // cache read either. The replacement keeps the cursor because the payload is a path,
-      // unchanged across the swap; `worktreeRows` records that obligation from its end.
-      //
-      // The `if` skips a replacement that would say nothing — an absent, logged-out, offline
-      // or rate-limited `gh`, which is the un-annotated case the module header describes — and
-      // one that would say nothing still costs a re-measure of every column and a redraw.
+      // The empty map is the point: these rows are the un-annotated ones, and the pull requests
+      // arrive through `onOpen` below. See this module's header for why nothing about them may
+      // stand in front of the first frame.
       rows: worktreeRows(offered, new Map(), config),
       onOpen: (replace) => {
-        // `annotations` absorbs its own failures, so there is nothing here to reject. It is
-        // deliberately not awaited: this callback fires from the picker's first effect, and
-        // awaiting it there is the very wait being removed. A refresh that outlives the pick
-        // dispatches into an unmounted component, which React makes a no-op — `pick` promises
-        // that, and it is the only stopping cue it offers; see EXC-1014.
+        // Not awaited, deliberately: this callback fires from the picker's first effect, and
+        // awaiting it here is the very wait being removed.
+        //
+        // Nothing in the chain is expected to reject. `annotations` absorbs its own failures,
+        // and `replace` is the picker's own dispatch — a throw out of it would be a bug in the
+        // picker, which is why it is left to surface rather than caught. That is the opposite
+        // call from `PickOptions.preview`, and for the opposite reason: that callback is a
+        // caller's own function reaching for `gh`, so a rejection there is ordinary.
+        //
+        // A refresh that outlives the pick dispatches into an unmounted component, which React
+        // makes a no-op — `pick` promises that, and it is the only stopping cue it offers.
+        //
+        // The `if` skips a replacement that would say nothing — an absent, logged-out, offline
+        // or rate-limited `gh` — which would still cost a re-measure of every column and a
+        // redraw.
         void annotations(container, config).then((prs) => {
           if (prs.size > 0) replace(worktreeRows(offered, prs, config));
         });
