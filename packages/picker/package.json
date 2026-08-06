@@ -16,6 +16,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "chalk": "^5.6.2",
     "ink": "^7.1.1",
     "react": "^19.2.8"
   }
