@@ -167,6 +167,22 @@ describe("reportFailure", () => {
     expect(result.code).toBe(1);
   });
 
+  test("answers 130 for a cancellation, and says nothing on either channel", async () => {
+    const result = await inChild(
+      "process.exitCode = output.reportFailure(new errors.Cancelled());",
+    );
+
+    // 128 + SIGINT, the shell's own convention and fzf's, so a keybinding written against
+    // fzf tells "the user pressed escape" from "wrk broke" without being re-taught.
+    expect(result.code).toBe(130);
+    // stdout empty is the half the cd protocol rests on — a cancelled run that printed
+    // anything would be a directory the shell function then tries to enter.
+    expect(result.stdout).toBe("");
+    // stderr empty is the half that separates this from a refusal: a refusal's line exists
+    // to explain something the user did not already know, and pressing escape is not that.
+    expect(result.stderr).toBe("");
+  });
+
   test("rethrows anything else, before writing a word", () => {
     // An unexpected error is a bug in wrk, and its stack is the only useful thing about
     // it. Laundering it into a tidy one-line message and an exit code would hide that.
