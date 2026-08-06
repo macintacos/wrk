@@ -17,6 +17,7 @@ const repoRoot = join(import.meta.dir, "..");
 interface Manifest {
   name?: string;
   private?: boolean;
+  version?: string;
   workspaces?: string[];
   dependencies?: Record<string, string>;
 }
@@ -49,6 +50,53 @@ describe("workspace layout", () => {
     // carrying the literal `workspace:*` fails every install with
     // EUNSUPPORTEDPROTOCOL while the publish itself reports success.
     expect(cli.dependencies?.["@macintacos/wrk-picker"]).toStartWith("workspace:");
+  });
+});
+
+describe("the picker's published tarball", () => {
+  /**
+   * The paths `bun pm pack` would ship, read from the packer rather than from the
+   * manifest.
+   *
+   * `--dry-run` writes no tarball and still lists every file, which is the only
+   * form of this assertion that cannot pass while the real publish ships something
+   * else: an allowlist read back out of `package.json` would only prove the field
+   * says what it says.
+   */
+  function packed(): string[] {
+    const run = spawnSync("bun", ["pm", "pack", "--dry-run"], {
+      cwd: join(repoRoot, "packages", "picker"),
+    });
+
+    expect(run.status).toBe(0);
+
+    return run.stdout
+      .toString()
+      .split("\n")
+      .flatMap((line) => line.match(/^packed \S+ (.+)$/)?.[1] ?? []);
+  }
+
+  test("carries the source, the manifest and the README, and nothing else", () => {
+    // Asserted as a shape rather than as a file list, so a new source module does
+    // not turn this red. What it pins is the `files` allowlist existing at all:
+    // without one the tarball also carries `tools/fzf-golden` and the 0.33 MB
+    // golden corpus, which is a Go program and its fixtures shipped to every
+    // consumer of a terminal picker.
+    for (const path of packed()) {
+      expect(path).toMatch(/^(package\.json|README\.md|src\/)/);
+    }
+  });
+
+  test("carries the entry point its exports map names", () => {
+    expect(packed()).toContain("src/index.ts");
+  });
+
+  test("is versioned, since a semver policy needs a version to start from", async () => {
+    // `0.0.0` is the scaffold's placeholder. The README's semver policy is written
+    // against a real `0.x`, where a minor may still move the surface.
+    const picker = await readManifest("packages", "picker");
+
+    expect(picker.version).not.toBe("0.0.0");
   });
 });
 
