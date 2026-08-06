@@ -166,8 +166,12 @@ export interface PullRequest {
  * The two refs are required **and non-empty**, which is the schema stating a precondition
  * rather than a case expected to fire: a row whose head ref is `""` would join against every
  * other empty value in a caller's map.
+ *
+ * Exported because [`./pr`](./pr) stores these rows and parses them back out of its cache: the
+ * same schema on both sides is what stops the on-disk shape and `gh`'s answer from drifting
+ * apart, and {@link FIELDS} ties the query to it as well.
  */
-const PULL_REQUEST = z.object({
+export const PULL_REQUEST = z.object({
   number: z.number().int().positive(),
   title: z.string(),
   headRefName: z.string().min(1),
