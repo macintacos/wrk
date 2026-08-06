@@ -22,7 +22,7 @@
 import { describe, expect, test } from "bun:test";
 import { join } from "node:path";
 
-import { FZF_VERSION, fuzzyMatch } from "../src/fuzzy";
+import { FZF_VERSION, fuzzyMatch, GO_UNICODE_VERSION } from "../src/fuzzy";
 
 /** One frozen case. Mirrors the `record` struct in `tools/fzf-golden/main.go`. */
 interface GoldenRecord {
@@ -35,13 +35,23 @@ interface GoldenRecord {
   positions: number[];
 }
 
-const corpusLines = (await Bun.file(join(import.meta.dir, "fixtures", "fzf-golden.jsonl")).text())
+const corpusLines = (await Bun.file(join(import.meta.dir, "golden", "fzf.jsonl")).text())
   .trim()
   .split("\n");
 
-/** The corpus's first line is a header naming the fzf release it was cut from. */
-const header = JSON.parse(corpusLines[0] ?? "{}") as { fzf?: string };
+/** The corpus's first line is a header naming the two versions it was cut against. */
+const header = JSON.parse(corpusLines[0] ?? "{}") as { fzf?: string; unicode?: string };
 const corpus = corpusLines.slice(1).map((line) => JSON.parse(line) as GoldenRecord);
+
+/** Code points of a record's text — the coordinate system `positions` indexes. */
+function codePointsOf(text: string): string[] {
+  return Array.from(text);
+}
+
+/** Records whose query matched, bucketed by query length in code points. */
+function matchesWithQueryLength(predicate: (length: number) => boolean): GoldenRecord[] {
+  return corpus.filter((record) => record.match && predicate(codePointsOf(record.query).length));
+}
 
 /** Renders a case for a failure message; the pair alone is enough to reproduce it. */
 function describeCase(record: GoldenRecord): string {
@@ -49,16 +59,42 @@ function describeCase(record: GoldenRecord): string {
 }
 
 describe("the golden corpus", () => {
-  test("was cut from the fzf release fuzzy.ts documents", () => {
+  test("was cut against the versions fuzzy.ts documents", () => {
     // The resync trigger is prose in fuzzy.ts's module doc; this is what stops the prose
-    // from drifting away from the data silently.
+    // from drifting away from the data silently. The Unicode version matters as much as the
+    // fzf one — it is what decides how the corpus classified every non-ASCII character, and
+    // nothing else in the repository pins it.
     expect(header.fzf).toBe(FZF_VERSION);
+    expect(header.unicode).toBe(GO_UNICODE_VERSION);
   });
 
   test("is broad enough to be worth trusting", () => {
     expect(corpus.length).toBeGreaterThan(800);
     expect(corpus.filter((record) => record.match).length).toBeGreaterThan(500);
     expect(corpus.filter((record) => record.caseSensitive).length).toBeGreaterThan(100);
+  });
+
+  test("covers each path fzf takes that this port does not implement", () => {
+    // These four counts are the equivalence argument, not corpus trivia. fuzzy.ts omits
+    // fzf's ASCII prefilter and its one- and two-character fast paths on the claim that they
+    // are pure optimisations; the only evidence for that claim is cases where fzf actually
+    // took them and agreed. A resync that narrows `groups()` would keep the volume
+    // assertions above green while quietly deleting the evidence, so assert the shape.
+    expect(matchesWithQueryLength((length) => length === 1)).not.toBeEmpty();
+    expect(matchesWithQueryLength((length) => length === 2)).not.toBeEmpty();
+    expect(matchesWithQueryLength((length) => length >= 3)).not.toBeEmpty();
+
+    // Non-ASCII input puts fzf on its rune representation, where it skips the prefilter
+    // outright — the path this port always takes.
+    const nonAscii = corpus.filter((record) => record.match && /[^\p{ASCII}]/u.test(record.text));
+    expect(nonAscii).not.toBeEmpty();
+
+    // And rows long enough for the DP matrix to be worth filling. A picker's rows are PR
+    // titles, which run well past the 50 characters the curated groups alone reach.
+    const longRows = corpus.filter(
+      (record) => record.match && codePointsOf(record.text).length >= 100,
+    );
+    expect(longRows).not.toBeEmpty();
   });
 
   test("agrees with JavaScript on every smart-case decision", () => {
@@ -112,7 +148,7 @@ describe("fuzzyMatch against the frozen fzf corpus", () => {
       const got = fuzzyMatch(record.text, record.query);
       if (got === null) continue;
 
-      const length = Array.from(record.text).length;
+      const length = codePointsOf(record.text).length;
       const ordered = got.positions.every(
         (position, index) => index === 0 || position > (got.positions[index - 1] ?? -1),
       );

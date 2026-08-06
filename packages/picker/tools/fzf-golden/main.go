@@ -11,13 +11,17 @@
 // Regenerate with:
 //
 //	cd packages/picker/tools/fzf-golden
-//	go run . > ../../test/fixtures/fzf-golden.jsonl
+//	go run . > ../../test/golden/fzf.jsonl
 //
 // Then run `mise run test`. A diff in the corpus with a green test means fzf
 // changed something the port already agrees with; a red test means the port
-// needs the same change. Bump fzfVersion below and the `go get` pin together —
-// the test asserts the corpus header against the version fuzzy.ts documents,
-// so they cannot drift apart silently.
+// needs the same change.
+//
+// Two versions are written into the corpus header and asserted by the test:
+// fzfVersion below, which must move with the `go get` pin; and the Go
+// toolchain's unicode.Version, which is not pinned by anything and silently
+// decides how every non-ASCII character in the corpus is classified. Whichever
+// one moves, the test says so rather than the corpus drifting quietly.
 package main
 
 import (
@@ -28,6 +32,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/junegunn/fzf/src/algo"
 	"github.com/junegunn/fzf/src/util"
@@ -89,8 +94,12 @@ func main() {
 	out := bufio.NewWriter(os.Stdout)
 	defer func() { _ = out.Flush() }()
 
-	// Header line: the pinned upstream, as data the test can assert.
-	if err := writeLine(out, map[string]string{"fzf": fzfVersion}); err != nil {
+	// Header line: the two versions this corpus depends on, as data the test can
+	// assert. `unicode` is the Go toolchain's Unicode table version, which decides
+	// charClassOfNonAscii's answers — the port reads the JavaScript runtime's
+	// tables instead, and the two are released on unrelated schedules.
+	header := map[string]string{"fzf": fzfVersion, "unicode": unicode.Version}
+	if err := writeLine(out, header); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -262,7 +271,26 @@ func groups() []group {
 		// constants were chosen for.
 		{
 			texts:   []string{"fuzzyfinder", "fuzzy-finder", "fuzzy-blurry-finder"},
-			queries: []string{"ff", "ff", "fuzzyf", "fzf", "finder", "fu", "fd"},
+			queries: []string{"ff", "fuzzyf", "fzf", "finder", "fu", "fd"},
+		},
+		// Long rows. Real PR titles run well past the 50 characters the curated
+		// groups above top out at, and length is what grows the DP matrix — so
+		// the corpus has to carry a few or the committed evidence stops short of
+		// the input the picker will actually see.
+		{
+			texts: []string{
+				"EXC-1008 Add width-keyed PR preview renderer so the preview pane reflows instead of truncating on narrow terminals (#26)",
+				"chore(deps-dev): bump @biomejs/biome from 2.5.4 to 2.5.6 in the root workspace and regenerate the lockfile",
+				"packages/wrk/src/preflight.ts, packages/wrk/src/provision.ts: split the worktree provisioning path out of preflight",
+				"revert: \"feat(cache): keep the background refresh alive across a cancelled pick\" — reopened as EXC-1006, see the thread",
+			},
+			queries: []string{
+				"e", "preview", "prv", "reflow", "narrow", "terminals", "26",
+				"biome", "bump", "lockfile", "workspace", "254", "256",
+				"preflight", "provision", "split", "wrk", "src", "ts",
+				"revert", "cache", "cancelled", "pick", "EXC", "thread",
+				"pkgswrksrc", "thepreviewpane", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+			},
 		},
 		{
 			texts:   []string{"fo-bar", "foob-r", "foobar", "foo-bar", "out-of-bound"},
