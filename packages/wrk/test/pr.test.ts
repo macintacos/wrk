@@ -41,9 +41,6 @@ import { pullRequests } from "../src/pr";
 /** Temp roots to delete once the suite finishes. */
 const roots: string[] = [];
 
-/** A container path that never has to exist: nothing here resolves a repository. */
-const CONTAINER = "/Users/me/GitLocal/thing";
-
 /**
  * The cache entry every case reads and writes.
  *
@@ -66,6 +63,16 @@ function tempDir(): string {
 
   return dir;
 }
+
+/**
+ * The container every case is keyed on, and the directory the fake `gh` is run in.
+ *
+ * A real directory rather than a plausible-looking string, because the module runs `gh` in the
+ * container it files the answer under — and `run` rejects on a `cwd` that does not exist, which
+ * would degrade every case here to "gh could not answer" for a reason unrelated to what it is
+ * testing.
+ */
+const CONTAINER = tempDir();
 
 /** Where the log the fake appends to lives inside a fixture root. */
 function logPath(bin: string): string {
@@ -105,6 +112,11 @@ interface GhScript {
  * The fake logs one line of argv per invocation and then branches on `--state`, so the two
  * queries can succeed, fail and answer independently of each other — which is what the
  * write-gate cases need and what a single scripted answer could not express.
+ *
+ * The log line is **one** `printf`, and has to stay one: the module runs both queries
+ * concurrently, so two copies of this fake append to the same file at once, and only a single
+ * `O_APPEND` write keeps their lines whole. Split it in two and {@link recorded} starts
+ * returning interleaved halves on an unlucky run.
  */
 function makeBin(script: GhScript = {}): string {
   const bin = tempDir();
@@ -113,7 +125,7 @@ function makeBin(script: GhScript = {}): string {
     join(bin, "gh"),
     [
       "#!/bin/sh",
-      `printf '%s\\n' "$*" >> ${shQuote(logPath(bin))}`,
+      `printf '%s\\t%s\\n' "$(pwd)" "$*" >> ${shQuote(logPath(bin))}`,
       "read -r _ignored",
       'case "$*" in',
       `  *"--state merged"*)`,
@@ -131,14 +143,25 @@ function makeBin(script: GhScript = {}): string {
   return bin;
 }
 
-/** Every invocation the fake recorded, in order, as the argv it was handed. */
-function recorded(bin: string): string[] {
+/** One recorded invocation of the fake: where it ran, and what it ran as. */
+interface Invocation {
+  cwd: string;
+  argv: string;
+}
+
+/** Every invocation the fake recorded, in order. */
+function recorded(bin: string): Invocation[] {
   const log = logPath(bin);
   if (!existsSync(log)) return [];
 
   return readFileSync(log, "utf8")
     .split("\n")
-    .filter((line) => line !== "");
+    .filter((line) => line !== "")
+    .map((line) => {
+      const [cwd = "", argv = ""] = line.split("\t");
+
+      return { cwd, argv };
+    });
 }
 
 /** One PR as `gh pr list --json` reports it. */
@@ -315,12 +338,25 @@ describe("pullRequests", () => {
   });
 
   test("degrades to an empty map when the stored entry cannot be read", async () => {
-    const { root } = withGh();
+    const { bin, root } = withGh();
     await writeCache({ name: ENTRY, container: CONTAINER, root }, "not json at all");
 
     // Fresh by mtime, so this is the stored text being handed back — a picker drawing against a
     // corrupt or older-format entry gets no rows rather than an exception.
     expect(await pullRequests(CONTAINER, 600_000, { root })).toEqual(new Map());
+    // Without this the case would also pass for an implementation that treated the corrupt
+    // entry as stale and refreshed, since the fake's default answer is an empty listing too.
+    expect(recorded(bin)).toEqual([]);
+  });
+
+  test("reads back what it wrote, without asking gh twice", async () => {
+    const { bin, root } = withGh({ open: [ghRow()] });
+
+    const written = await pullRequests(CONTAINER, 0, { root });
+    const read = await pullRequests(CONTAINER, 600_000, { root });
+
+    expect(read).toEqual(written);
+    expect(recorded(bin)).toHaveLength(2);
   });
 
   test("asks each state in a call of its own", async () => {
@@ -331,9 +367,20 @@ describe("pullRequests", () => {
     // The separate-window rule `gh.ts` rests on is invisible in the returned map: a module that
     // asked for both states at once would produce an identical answer here and lose a long-lived
     // bottom layer to a busy month of merges. What was actually run is the only evidence.
-    const argvs = recorded(bin);
-    expect(argvs).toHaveLength(2);
-    expect(argvs.filter((argv) => argv.includes("--state open"))).toHaveLength(1);
-    expect(argvs.filter((argv) => argv.includes("--state merged"))).toHaveLength(1);
+    const calls = recorded(bin);
+    expect(calls).toHaveLength(2);
+    expect(calls.filter(({ argv }) => argv.includes("--state open"))).toHaveLength(1);
+    expect(calls.filter(({ argv }) => argv.includes("--state merged"))).toHaveLength(1);
+  });
+
+  test("runs gh in the container the answer is filed under", async () => {
+    const { bin, root } = withGh({ open: [ghRow()] });
+
+    await pullRequests(CONTAINER, 0, { root });
+
+    // The one invariant that cannot be seen in the returned map: query the wrong directory and
+    // one repository's pull requests are stored under another's key, on a cache every process
+    // reads, for a full TTL. Nothing downstream could tell.
+    expect(recorded(bin).map(({ cwd }) => cwd)).toEqual([CONTAINER, CONTAINER]);
   });
 });
