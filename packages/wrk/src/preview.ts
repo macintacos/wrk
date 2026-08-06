@@ -136,7 +136,15 @@ export interface PreviewOptions extends Omit<CacheKey, "name"> {
 // resize does not merely leave a file per column count it passed through — it spawns a `gh`
 // per column count, and `cached`'s single-flight lock cannot collapse any of it because each
 // width is a different key. Quantising the width here would contradict the exact-column-count
-// contract, so the fix belongs to the caller: debounce the resize before drawing.
+// contract, so the fix belongs to the caller: debounce the resize before drawing. EXC-1020
+// measured the cursor half of that — seven spawns for a sweep down an eight-row list, one per
+// row landed on — and left the debounce out, because none of it is in front of a frame: the
+// picker is interactive in ~280 ms while the first of those spawns is still running. It is
+// process churn, not latency, and the interval stays unchosen until something makes it visible.
+//
+// One consequence worth knowing before reaching for the debounce: a spawn nobody is waiting on
+// still holds the process open, so dismissing the picker before the pane's `gh` answers waits
+// it out. `doc/ADVANCED.md` states that under Picker latency, with the number.
 export async function previewPullRequest(
   number: number,
   width: number,
