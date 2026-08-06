@@ -93,18 +93,20 @@ printed a partial answer before failing would be read as a success outright.
 
 A picker cannot move the shell that launched it: `cd` changes a process's own working
 directory, and `wrk` is a child. So the pickers take the route `fzf` took before them —
-**`--print-path` writes the chosen path to stdout, alone, and a four-line shell function
-does the `cd`**. The interface itself renders to stderr, so `wrk wt --print-path` is still
-a usable picker with its stdout redirected, and the picker is testable without a shell at
+**`--print-path` writes the chosen path to stdout, alone, and a small shell function does
+the `cd`**. The interface itself renders to stderr, so `wrk wt --print-path` is still a
+usable picker with its stdout redirected, and the picker is testable without a shell at
 all.
 
 Cancelling is neither an answer nor a failure, so it gets neither shape: a dismissed
-picker leaves stdout **empty**, adds no `wrk: …` line to stderr — the interface has
-already torn its own render down — and exits `130`. That is `128 + SIGINT`, the shell's
-own convention for "the user aborted" and what `fzf` exits with on `ESC`, so a keybinding
-already written against `fzf` tells a dismissal from a broken `wrk` without being
-re-taught. The three statuses a caller must separate are therefore `0` with a path, `130`
-with nothing, and anything else with a `wrk: …` line on stderr.
+picker leaves stdout **empty**, adds no `wrk: …` line to stderr — it clears its own render
+on the way out, so there is nothing left to explain — and exits `130`. That is
+`128 + SIGINT`, the shell's own convention for "the user aborted" and what `fzf` exits
+with on `ESC`, so a keybinding already written against `fzf` tells a dismissal from a
+broken `wrk` without being re-taught. What a caller separates is therefore `0` with a path
+on stdout, `130` with nothing, and anything else — which writes something for a human on
+stderr, though not always a `wrk: …` line, since commander answers a malformed argv itself
+and an unexpected error arrives as a stack.
 
 The shell function is the whole of the caller's side. In fish:
 
@@ -112,6 +114,7 @@ The shell function is the whole of the caller's side. In fish:
 function wt --description "Pick a worktree and cd into it"
     set -l target (wrk wt --print-path $argv)
     or return $status
+    test -n "$target"; or return 1
     cd -- $target
 end
 ```
@@ -122,15 +125,19 @@ In bash or zsh:
 wt() {
   local target
   target=$(wrk wt --print-path "$@") || return $?
+  [ -n "$target" ] || return 1
   cd -- "$target"
 }
 ```
 
-Both forward the status rather than swallowing it, which is what makes a cancelled pick
-distinguishable at the call site — fish propagates a command substitution's status through
-`set`, so `or return $status` really does carry `130` out. A guard on emptiness
-(`test -n "$target"`) would also avoid the bad `cd`, but it reports every outcome as the
-same nonzero and throws that distinction away.
+Both guards earn their line. **Forwarding the status** is what keeps a cancelled pick
+distinguishable at the call site: fish propagates a command substitution's status through
+`set`, so `or return $status` really does carry the `130` out, and bash's declaration is
+split from its assignment on purpose, because `local target=$(…)` reports `local`'s own
+status — always `0` — and would silently discard the very distinction this protocol exists
+to draw. **Checking for emptiness** then catches the one case a status cannot: a run that
+exited `0` having printed nothing. Without it fish expands `cd -- $target` to a bare `cd`
+and sends you to your home directory.
 
 `wrk wt` and `wrk pr` themselves arrive in
 [EXC-1016](https://linear.app/macintacos/issue/EXC-1016) and

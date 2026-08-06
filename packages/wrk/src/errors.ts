@@ -1,8 +1,7 @@
 /**
  * The thrown values `wrk`'s exit rules are expressed over.
  *
- * Two of the three are failures. {@link Cancelled} is not, and travels this way for the reason
- * its own doc gives rather than because dismissing a picker went wrong.
+ * Two of the three are failures; {@link Cancelled} is not — see its own doc.
  *
  * They live in a module of their own because **every layer of the package throws one and
  * nothing here needs anything back.** This module imports nothing — not `node:process`, not a
@@ -34,10 +33,15 @@ export class Refusal extends Error {}
  * The user dismissed an interactive component without choosing, so there is no path to print.
  *
  * Not a failure — a picker that was cancelled did exactly what it was asked to. The only reason
- * it travels as a thrown value is that throwing **unwinds**: a command returning a sentinel
- * could still reach `emitLine` further down its own action, and the whole of what the cd
- * protocol promises is that a cancelled run leaves stdout empty. Control flow enforces that;
- * a returned `null` would only ask for it.
+ * it travels as a thrown value is that throwing **unwinds**: a command holding a sentinel could
+ * still reach `emitLine` further down its own action, and the whole of what the cd protocol
+ * promises is that a cancelled run leaves stdout empty. Control flow enforces that; a `null`
+ * the action is trusted to check would only ask for it.
+ *
+ * The throw therefore happens in the **command**, not in the picker. `@macintacos/wrk-picker`
+ * cannot import this — the dependency runs `wrk` → `picker` — so a dismissal crosses the
+ * package boundary as a value, and the action that received it converts it here, before it has
+ * written anything.
  *
  * `reportFailure` maps it to **130** — `128 + SIGINT` — the shell's own convention for "the user
  * aborted" and what `fzf` exits with on `ESC`, so a keybinding already written against `fzf`

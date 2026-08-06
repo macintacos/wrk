@@ -21,10 +21,9 @@
  *
  * There is one answer that is deliberately **not** JSON, and it is routed through here
  * rather than written behind this module's back: {@link emitLine}, the shape the editor's
- * `WorktreeCreate` hook and the pickers' `--print-path` both consume. Its consumer is not a
- * parser but a `cd`, so the envelope would be the wrong answer rather than a more rigorous
- * one. A command uses one or the other and never both — see {@link emitLine} for why that is
- * a rule rather than a style.
+ * `WorktreeCreate` hook consumes. Its consumer is not a parser but a `cd`, so the envelope
+ * would be the wrong answer rather than a more rigorous one. A command uses one or the other
+ * and never both — see {@link emitLine} for why that is a rule rather than a style.
  *
  * **The envelope never omits a key**, and its keys keep a fixed order. An absent value is
  * `null`, never a missing key, so a caller reads any documented field unconditionally
@@ -54,9 +53,9 @@
  * `proc.ts` gives for its own choice: the published artifact targets Node, so a Bun-only
  * API here would have to be unpicked at build time.
  *
- * **The types the rules are written over live in [`./errors`](./errors), which is
- * this module's only import.** An exit rule needs a type to be expressed over, but a layer
- * that merely *throws* one needs nothing from this module — so the plumbing depends on the
+ * **The types the rules are written over live in [`./errors`](./errors), which is this
+ * module's only import.** An exit rule needs a type to be expressed over, but a layer that
+ * merely *throws* one needs nothing from this module — so the plumbing depends on the
  * dependency-free vocabulary rather than on the streams. That leaves every arrow in the
  * package running away from presentation, and this module's own single import pointing at a
  * file that imports nothing at all.
@@ -138,11 +137,11 @@ export function emit(payload: object): void {
  * nothing else — no braces, no quotes, no key. Handing it the envelope would not be a
  * stricter answer, it would be a directory that cannot be entered.
  *
- * The pickers' `--print-path` is the other, and it wants the same line for the same reason:
- * a Node process cannot move its parent shell, so the path goes to stdout and a shell
- * function does the `cd`. That caller adds a second obligation this function cannot carry on
- * its own — a run that produced no choice must leave stdout **empty** — which is why
- * cancelling throws {@link Cancelled} rather than reaching here with a sentinel.
+ * The pickers' `--print-path`, arriving with `wrk wt` and `wrk pr`, will be the second, and
+ * wants the same line for the same reason: a Node process cannot move its parent shell, so
+ * the path goes to stdout and a shell function does the `cd`. That caller adds an obligation
+ * this function cannot carry on its own — a run that produced no choice must leave stdout
+ * **empty** — which is why cancelling throws {@link Cancelled} rather than reaching here.
  *
  * **A command uses this or {@link emit}, never both.** Both write to the one stdout, so a
  * run that called each would emit a document with a stray line glued to it — unparseable to
@@ -201,9 +200,6 @@ export function debug(message: string): void {
  * runtime prints its stack and exits `1` on its own. Mapping an unexpected error to a tidy
  * one-line message would hide the one thing that makes a bug diagnosable.
  *
- * A {@link Cancelled} is the one arrival that writes nothing, so on that path the function's
- * name is a slight misnomer: it reports no failure, it only answers the status.
- *
  * The caller assigns the result to `process.exitCode` rather than passing it to
  * `process.exit`, for the flushing reason this module's header gives.
  *
@@ -221,9 +217,7 @@ export function debug(message: string): void {
  * ```
  */
 export function reportFailure(error: unknown): number {
-  // First, and silent, because it is the one arrival here that is not a failure — see
-  // {@link Cancelled}. Nothing is written, so neither channel can carry a path the shell
-  // function would then try to enter.
+  // Silent: neither channel may carry a path the shell function would then try to enter.
   if (error instanceof Cancelled) return 130;
 
   if (error instanceof Refusal) {

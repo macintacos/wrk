@@ -172,8 +172,7 @@ describe("reportFailure", () => {
       "process.exitCode = output.reportFailure(new errors.Cancelled());",
     );
 
-    // 128 + SIGINT, the shell's own convention and fzf's, so a keybinding written against
-    // fzf tells "the user pressed escape" from "wrk broke" without being re-taught.
+    // 130 = 128 + SIGINT; see `Cancelled` for why that number.
     expect(result.code).toBe(130);
     // stdout empty is the half the cd protocol rests on — a cancelled run that printed
     // anything would be a directory the shell function then tries to enter.
