@@ -64,6 +64,16 @@ const ERASE_NOISE = new RegExp(`${ESC}\\[\\d*[KG]`, "g");
 /** The tail of an erase preamble, after which the frame's own text begins. */
 const ERASE_PREAMBLE_END = `${ESC}[G`;
 
+/**
+ * Cursor-home, the tail of Ink's *fullscreen* preamble.
+ *
+ * The counterpart to {@link ERASE_PREAMBLE_END} on the other branch of
+ * `shouldClearTerminalForFrame`: erase-screen, erase-scrollback, then home. A capture that
+ * contains one of these has a frame beginning after it, and the run that produces one is a
+ * viewport shrink — see the resize cases in [`../picker.test.ts`](../picker.test.ts).
+ */
+const HOME = `${ESC}[H`;
+
 /** One cursor-up step: `ESC [ n A`, where an omitted `n` means one row. */
 const CURSOR_UP = new RegExp(`${ESC}\\[(\\d*)A`, "g");
 
@@ -105,6 +115,58 @@ const BASE_ENV: Record<string, string | undefined> = {
   TERM: "xterm-256color",
 };
 
+/**
+ * The bytes a terminal sends for the keys a picker binds.
+ *
+ * Written as what the *terminal* transmits, not as what the application receives: an arrow
+ * key is three bytes on the wire and a `key.upArrow` only on the far side of Ink's parser.
+ * A test that drives a picker is on the wire side.
+ */
+export const KEY = {
+  up: `${ESC}[A`,
+  down: `${ESC}[B`,
+  /** Carriage return, which is what Enter sends in raw mode — not a newline. */
+  enter: "\r",
+  escape: ESC,
+  /**
+   * `DEL`, which is what terminals send for Backspace; `\b` is what almost nothing sends.
+   *
+   * Built from its code point rather than written as an escape in a literal, so the byte is
+   * named here the way {@link ESC} is named above rather than sitting in the source
+   * invisibly.
+   */
+  backspace: String.fromCodePoint(0x7f),
+} as const;
+
+/** The live terminal a {@link PtyOptions.drive} callback is handed. */
+export interface PtySession {
+  /** Sends bytes to the process as if typed. */
+  write(data: string): void;
+  /** Changes the viewport, which is a `SIGWINCH` to the process. */
+  resize(cols: number, rows: number): void;
+  /** Everything received so far. */
+  capture(): string;
+  /**
+   * Waits until the capture satisfies `condition`.
+   *
+   * The alternative is sleeping a guessed interval before every keystroke, which is how a
+   * suite becomes flaky on a loaded machine. Waiting on what the frame actually says is
+   * both faster and deterministic.
+   *
+   * The predicate form is the load-bearing one, because a capture is **cumulative**:
+   * {@link waitFor}'s substring can only wait for text that has never appeared, so waiting
+   * on a redraw that shows rows already seen — a narrowed filter, a shrunk window — needs a
+   * question about the *last frame*, which `frameLines` answers and a substring cannot.
+   *
+   * @throws If `condition` has not held within `timeoutMs` (3 s by default, deliberately
+   *   under `bun test`'s own 5 s so the timeout that fires is the one that says what it was
+   *   waiting for).
+   */
+  waitUntil(condition: (capture: string) => boolean, timeoutMs?: number): Promise<void>;
+  /** {@link waitUntil} for the common case: waiting on text that has not appeared before. */
+  waitFor(needle: string, timeoutMs?: number): Promise<void>;
+}
+
 /** Options for {@link runInPty}. */
 export interface PtyOptions {
   /** Viewport height. */
@@ -113,6 +175,14 @@ export interface PtyOptions {
   cols?: number;
   /** Variables layered over {@link BASE_ENV}, which has already shed the ambient ones. */
   env?: Record<string, string>;
+  /**
+   * Drives the session while the process runs — types keys, resizes the window.
+   *
+   * Without this a capture can only show a program's opening frame, which for an
+   * interactive component is the one frame that proves the least. Omit it for a probe that
+   * runs to completion on its own.
+   */
+  drive?: (session: PtySession) => Promise<void>;
 }
 
 /** What a probe run leaves behind. */
@@ -131,11 +201,13 @@ export interface PtyRun {
  * separate options would be more machinery for the same result.
  *
  * @param script - Shell source, run through `bash -c`.
- * @param options - Viewport size and environment; see {@link PtyOptions}.
+ * @param options - Viewport size, environment, and an optional driver; see
+ *   {@link PtyOptions}.
  * @returns The capture and the exit status.
  */
 export async function runInPty(script: string, options: PtyOptions): Promise<PtyRun> {
   const chunks: Uint8Array[] = [];
+  const capture = () => Buffer.concat(chunks.map(Buffer.from)).toString();
 
   const proc = Bun.spawn(["bash", "-c", script], {
     env: { ...BASE_ENV, ...options.env },
@@ -148,10 +220,35 @@ export async function runInPty(script: string, options: PtyOptions): Promise<Pty
     },
   });
 
-  const exitCode = await proc.exited;
-  proc.terminal?.close();
+  const terminal = proc.terminal;
+  if (options.drive) {
+    // Loudly, rather than silently skipping the driver: a scenario that meant to type keys
+    // and instead captured an untouched opening frame would still produce assertions, and
+    // they would be about the wrong thing.
+    if (!terminal) throw new Error("the spawned process has no terminal to drive");
 
-  return { capture: Buffer.concat(chunks.map(Buffer.from)).toString(), exitCode };
+    const waitUntil = async (condition: (text: string) => boolean, timeoutMs = 3000) => {
+      const deadline = Date.now() + timeoutMs;
+      while (!condition(capture())) {
+        if (Date.now() > deadline)
+          throw new Error(`timed out; last frame: ${frameLines(capture())}`);
+        await Bun.sleep(10);
+      }
+    };
+
+    await options.drive({
+      write: (data) => terminal.write(data),
+      resize: (cols, rows) => terminal.resize(cols, rows),
+      capture,
+      waitUntil,
+      waitFor: (needle, timeoutMs) => waitUntil((text) => text.includes(needle), timeoutMs),
+    });
+  }
+
+  const exitCode = await proc.exited;
+  terminal?.close();
+
+  return { capture: capture(), exitCode };
 }
 
 /**
@@ -208,13 +305,6 @@ export function hasColour(capture: string): boolean {
 /**
  * The height, in rows, of the **last** frame the capture contains.
  *
- * Finding where the last frame starts is the whole of this function. The cursor is hidden
- * exactly once, at first paint, so slicing from it keeps every frame ever drawn and counts
- * their sum. Each redraw instead opens with an erase preamble that ends in the column-move
- * `ESC [ G`, so the text after the *last* of those is the final frame and nothing before
- * it — and on a single-frame run, where no redraw ever happened, the hide is the later of
- * the two markers and wins.
- *
  * Blank rows are not counted: a frame is measured by its non-empty lines, so a component
  * that deliberately renders a spacer row reads one short here. No probe scenario has one,
  * and a caller that grows one should count differently rather than work around this.
@@ -223,14 +313,53 @@ export function hasColour(capture: string): boolean {
  * @returns The number of non-empty lines in the last frame.
  */
 export function frameHeight(capture: string): number {
-  const start = Math.max(
+  return frameLines(capture).length;
+}
+
+/**
+ * Where the **last** frame in a capture begins.
+ *
+ * Finding this is the whole of {@link frameLines}. The cursor is hidden exactly once, at
+ * first paint, so slicing from it keeps every frame ever drawn. Each redraw instead opens
+ * with a preamble whose tail is either {@link ERASE_PREAMBLE_END} or {@link HOME}, one per
+ * branch of Ink's inline/fullscreen decision, so the text after the *last* of the three
+ * markers is the final frame and nothing before it — and on a single-frame run, where no
+ * redraw ever happened, the hide is the latest of them and wins.
+ */
+function lastFrameStart(capture: string): number {
+  return Math.max(
     capture.lastIndexOf(ERASE_PREAMBLE_END) + ERASE_PREAMBLE_END.length,
+    capture.lastIndexOf(HOME) + HOME.length,
     capture.lastIndexOf(HIDE_CURSOR) + HIDE_CURSOR.length,
   );
+}
 
+/**
+ * The non-empty lines of the **last** frame, as plain text.
+ *
+ * What a reader would have seen, in order — which is what an assertion about *ordering*
+ * needs and what a substring search over the whole capture cannot give, since every earlier
+ * frame is still in the capture too.
+ *
+ * @param capture - A pty capture from {@link runInPty}.
+ * @returns One entry per rendered line, escape sequences stripped.
+ */
+export function frameLines(capture: string): string[] {
   return capture
-    .slice(start)
+    .slice(lastFrameStart(capture))
     .replace(ANY_ESCAPE, "")
     .split(/\r?\n/)
-    .filter((line) => line.trim() !== "").length;
+    .filter((line) => line.trim() !== "");
+}
+
+/**
+ * The **last** frame with its escape sequences intact.
+ *
+ * The companion to {@link frameLines}, for the one question that is about the codes rather
+ * than the text: whether a highlight was actually emitted, and where.
+ *
+ * @param capture - A pty capture from {@link runInPty}.
+ */
+export function lastFrame(capture: string): string {
+  return capture.slice(lastFrameStart(capture));
 }
