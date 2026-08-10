@@ -126,5 +126,5 @@ large to represent exactly; in JSON, anything that is not an object at the root.
 ## Going further
 
 [doc/ADVANCED.md](doc/ADVANCED.md) carries the rest: the git version floor in detail, the
-repository's own dev workflow, the output contract callers parse and its exit rules, and
-each `agent` command in full.
+repository's own dev workflow, the output contract callers parse and its exit rules, the
+`cd` protocol a picker moves your shell with, and each `agent` command in full.

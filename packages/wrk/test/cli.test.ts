@@ -118,6 +118,17 @@ describe("main", () => {
     expect(result.stdout).toBe("");
   });
 
+  test("turns a cancelled pick into 130, with both channels silent", async () => {
+    // The `reportFailure` case in output.test.ts pins the mapping; this pins the claim
+    // `Cancelled`'s own doc rests on — that throwing from inside an action unwinds through
+    // `parseAsync` into `main`, so nothing further down that action can still reach stdout.
+    const result = await inChild("throw new errors.Cancelled();");
+
+    expect(result.code).toBe(130);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toBe("");
+  });
+
   test("leaves a run that emitted a verdict at 0", async () => {
     // The case every caller actually hits. A `main` that set a nonzero status
     // unconditionally would still pass both cases above.
