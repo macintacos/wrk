@@ -39,7 +39,7 @@ const REFRESHED: PickerRow<string>[] = [
 const payloadsOf = (rows: readonly PickerRow<string>[]): string[] => rows.map((row) => row.payload);
 
 /** A picker that has just opened on {@link PLAIN}. */
-const opened = () => ({ query: "", selected: undefined, top: 0, rows: PLAIN });
+const opened = () => ({ query: "", selected: undefined, top: 0, previewTop: 0, rows: PLAIN });
 
 /** The list rows a `move` is budgeted, large enough that `top` never moves in these cases. */
 const LIST_ROWS = 10;

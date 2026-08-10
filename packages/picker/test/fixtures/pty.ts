@@ -136,6 +136,9 @@ export const KEY = {
    * invisibly.
    */
   backspace: String.fromCodePoint(0x7f),
+  /** The tilde-terminated forms, which is how a terminal sends the two page keys. */
+  pageUp: `${ESC}[5~`,
+  pageDown: `${ESC}[6~`,
 } as const;
 
 /** The live terminal a {@link PtyOptions.drive} callback is handed. */
