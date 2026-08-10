@@ -122,6 +122,11 @@ others alone. A leading `~` in a root is expanded; a root that is still relative
 afterwards is dropped, because it would otherwise be scanned from wherever you happened to
 be standing.
 
+`search.depth` is exact rather than a maximum, so a container one level shallower than it
+says is not found. The scan also skips dot-directories on its way down — that is what
+keeps it out of `.bare` and `.git`, and it means a container living under a hidden
+directory (`~/GitLocal/.work/project`) is unreachable however the depth is set.
+
 **Nothing reports a bad config.** A file that is missing, unreadable, unparseable, or
 carries none of these keys leaves the layer below it standing, and a single malformed
 value falls through on its own while its well-formed neighbours still apply. So a typo
