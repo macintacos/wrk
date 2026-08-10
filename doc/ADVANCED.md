@@ -266,6 +266,47 @@ repository is the exception: with nothing stored there is nothing to draw, so it
 `--print-path` selects the bare-path stdout shape the `cd` protocol above consumes.
 Without it the answer is the usual envelope, `{worktree_path, number}`.
 
+## Picker latency
+
+**Both pickers are interactive within two seconds of process start, on a warm cache,
+however slow `gh` is.** That is the budget, and
+[`packages/wrk/test/latency.test.ts`](../packages/wrk/test/latency.test.ts) enforces it:
+each command is driven in a real terminal against a `gh` stubbed to take four seconds, and
+the clock starts before the shell does — so the runtime's own cold start, the module
+graph, `git`, the configuration read and the cache read are all inside the number, not
+excluded from it.
+
+Two seconds is the ceiling the suite fails at, not the cost. Measured on Apple silicon,
+medians of five runs:
+
+| | idle | under eight spinning CPU burners |
+| --- | --- | --- |
+| `wrk wt` | 256 ms | 312 ms |
+| `wrk pr` | 279 ms | 322 ms |
+
+No single loaded run exceeded 384 ms.
+
+The gap between the two is deliberate. A budget pinned just above the observed figure
+fails on a loaded machine for a reason that is not a regression, and a suite that fails
+for no reason teaches everyone to re-run it. Half the stub's delay is the honest ceiling:
+no machine is slow enough to cross it, and no implementation that waited for `gh` is fast
+enough to stay under it.
+
+**Two things sit outside the budget, both by construction.**
+
+The **first run in a repository** has nothing cached, and for `wrk pr` the pull requests
+*are* the rows — so it waits for `gh` once, measured at 4426 ms against the four-second
+stub. `wrk wt` does not: its rows come from git, so a cold cache costs it nothing at the
+draw (293 ms) and only delays the annotation.
+
+**Dismissing does not stop an in-flight `gh`.** Nothing kills the fetch, so a run that is
+still waiting on one stays alive until it answers — measured at the full four seconds
+against the stub, versus 90 ms when there is nothing outstanding. It reaches `wrk wt` only
+on a cold cache, and `wrk pr` on the first view of any pull request at a given pane width,
+because the preview pane fetches on the first frame. The wait moved from in front of the
+draw to after the choice; the total is the same, and it is the trade both pickers are
+built on.
+
 ## Agent commands
 
 `wrk agent repo-setup` is what runs when the repository is not on disk at all. It clones

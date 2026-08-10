@@ -292,8 +292,8 @@ particular query earns, the pane's 40% share — is implementation, and may move
 ## Known ceilings
 
 - **The filter is O(rows) per keystroke.** `fuzzyMatch` runs once per row per keystroke
-  and the query is not pre-compiled: roughly 4–6 ms per keystroke at 5,000 rows, and
-  imperceptible at the hundreds these pickers actually list. If you feed it thousands,
+  and the query is not pre-compiled: 6–9 ms per keystroke at 5,000 rows, against 0.05–0.7
+  ms across the dozens to hundreds these pickers actually list. If you feed it thousands,
   that is the number to measure against.
 - **The preview is not debounced.** One call per row the cursor passes through, and one
   per column count a resize drag passes through. Cache on `(payload, width)` — which you

@@ -319,13 +319,35 @@ export async function runInPty(script: string, options: PtyOptions): Promise<Pty
       }
     };
 
-    await options.drive({
-      write: (data) => terminal.write(data),
-      resize: (cols, rows) => terminal.resize(cols, rows),
-      capture,
-      waitUntil,
-      waitFor: (needle, timeoutMs) => waitUntil((text) => text.includes(needle), timeoutMs),
-    });
+    try {
+      await options.drive({
+        write: (data) => terminal.write(data),
+        resize: (cols, rows) => terminal.resize(cols, rows),
+        capture,
+        waitUntil,
+        waitFor: (needle, timeoutMs) => waitUntil((text) => text.includes(needle), timeoutMs),
+      });
+    } catch (error) {
+      // A driver that throws abandons the scenario mid-run, and nothing else will ever end this
+      // child: the keystroke that would have dismissed the picker is the one that did not
+      // happen. Without this the whole `bash → wrk → gh` tree outlives the failure and keeps
+      // running for the test process's lifetime — so one failing case slows every case after
+      // it, which is how a single failure becomes a suite that looks flaky.
+      //
+      // The signal goes to `bash`, and the rest of the tree dies because `bash` is the pty's
+      // session leader and its children are the foreground group — not because anything here
+      // walks the tree. A **detached** descendant is outside that group and survives, which is
+      // why a fixture whose `gh` polls still needs a bound of its own.
+      //
+      // Awaited, and the terminal closed, because the success path below does both: a kill
+      // that has not landed by the time the next case starts is the same leak one step later,
+      // and the pty's own file descriptor leaks on every failure otherwise.
+      proc.kill();
+      await proc.exited;
+      terminal.close();
+
+      throw error;
+    }
   }
 
   const exitCode = await proc.exited;

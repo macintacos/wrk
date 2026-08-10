@@ -116,12 +116,18 @@
  * of a rendered document. That module states why the two filters exist and why the widening
  * is the pane's alone.
  *
- * ## What is not here
+ * ## What the latency budget settled
  *
- * The latency budget (EXC-1020) belongs to its own issue. The filter loop calls
- * {@link fuzzyMatch} once per row per keystroke and does not pre-compile the query; see the
- * `ponytail:` note on {@link useMatches} for when that stops being the right call, and the
- * one on {@link usePreview} for the redraw the pane does not debounce.
+ * The budget is stated and enforced in `packages/wrk` — `doc/ADVANCED.md` for the promise,
+ * `test/latency.test.ts` for the proof — because it is a claim about a whole invocation and
+ * this package is only part of one. What it settled *here* is that neither of this
+ * component's two known ceilings is worth spending code on yet, and both `ponytail:` notes now
+ * carry the measurement that says so rather than the deferral that used to.
+ *
+ * The filter loop still calls {@link fuzzyMatch} once per row per keystroke without
+ * pre-compiling the query — see {@link useMatches} for the row count at which that stops being
+ * the right call — and {@link usePreview} still debounces nothing, because the pane is off the
+ * budget by construction: a list is interactive whether or not the pane beside it has landed.
  *
  * @packageDocumentation
  */
@@ -394,12 +400,16 @@ function prepare<T>(rows: readonly PickerRow<T>[]): Prepared<T>[] {
  * user was reaching for.
  */
 // ponytail: one `fuzzyMatch` call per row per keystroke, which re-decodes the query each
-// time — roughly 4–6 ms per keystroke at 5,000 rows, two orders of magnitude above what
-// this component's callers list. The fix, when EXC-1020's budget says it is needed, is
-// `compileQuery(query) -> (textCodePoints) => match` with each row's code points cached.
-// A replacement is the second trigger, and the more expensive one: it re-runs `prepare`
-// over every cell as well as this pass. It is also far rarer — one or two per run against
-// dozens of keystrokes — so EXC-1020 should measure the keystroke first.
+// time. EXC-1020 measured it rather than guessing, and the answer is that it does not
+// matter at the sizes this component is used at: 0.05–0.17 ms per keystroke at 12–50 rows
+// and 0.2–0.7 ms at 200, against 6–9 ms at 5,000. `compileQuery(query) -> (textCodePoints)
+// => match`, with each row's code points cached, is still the fix. Extrapolating those
+// figures, a keystroke reaches a whole 60 Hz frame somewhere past 10,000 rows, so that is
+// the order of magnitude at which building it starts to buy something.
+// A replacement is the second trigger and the more expensive one, since it re-runs `prepare`
+// over every cell as well as this pass: 0.2 ms at 12 rows, 0.8 ms at 50, 58 ms at 5,000, of
+// which `prepare` is four fifths. It is also far rarer, one or two per run against dozens of
+// keystrokes, so the keystroke is the number to watch first either way.
 function useMatches<T>(rows: readonly Prepared<T>[], query: string): Match<T>[] {
   return useMemo(() => {
     if (query === "") return rows.map((row) => ({ row, positions: [] }));
@@ -450,9 +460,14 @@ const NO_LINES: readonly PreviewLine[] = [];
  */
 // ponytail: one call per row the cursor passes through and one per column count a drag
 // passes through, neither debounced. `preview.ts` records the same ceiling from its end and
-// says the fix belongs to the caller, which is this — a timer here would collapse both. Left
-// out until EXC-1020's latency budget says what the interval should be, since a guessed one
-// is a delay a user feels for no measured reason.
+// says the fix belongs to the caller, which is this — a timer here would collapse both.
+// EXC-1020 measured a sweep down an eight-row list at seven `gh pr view` spawns, one per row
+// the cursor landed on, and left the debounce out: none of it is in front of a frame, `wrk pr`
+// being interactive in ~280 ms while its first preview `gh` still has four seconds to run. It
+// is not free, though — a caller that does not `unref` its fetch pays for the last of those
+// spawns on the way *out*, which `preview.ts`'s marker and `doc/ADVANCED.md` both record. The
+// interval stays unchosen because a guessed one is a delay felt for no measured cause; what
+// would settle it is a measurement of the exit, not of the sweep.
 function usePreview<T>(
   preview: ((payload: T, width: number) => string | Promise<string>) | undefined,
   row: Prepared<T> | undefined,
