@@ -18,7 +18,7 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import { renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 
 import {
@@ -95,6 +95,30 @@ function scenario(env = "", options: { stdout?: string; pipedStdin?: boolean } =
     `printf '%s \\n' '${PROMPT}'`,
     `${env} ${probe} > "${options.stdout ?? "/dev/null"}" ${stdin}`,
   ].join("\n");
+}
+
+/**
+ * Reserves the path a probe waits on for its replacement rows, and makes sure it is absent.
+ *
+ * The probe treats the file's *existence* as the cue, so a leftover from an earlier run
+ * would fire the replacement before the test typed anything.
+ */
+function replacePath(purpose: string): string {
+  const path = `${tmpdir()}/EXC-1013-${purpose}-replace-${process.pid}.json`;
+  rmSync(path, { force: true });
+  written.push(path);
+  return path;
+}
+
+/**
+ * Drops the replacement rows where the probe is waiting, atomically.
+ *
+ * Written beside the target and renamed onto it, because a plain write is visible to the
+ * probe's `existsSync` the instant it is created and would be read back half-formed.
+ */
+function landRows(path: string, rows: Row[]): void {
+  writeFileSync(`${path}.part`, JSON.stringify(rows));
+  renameSync(`${path}.part`, path);
 }
 
 /** Where a scenario's stdout is sent when the test wants to read the chosen payload. */
@@ -498,6 +522,152 @@ describe("rows carry columns and an identity of their own", () => {
     expect(exitCode).toBe(0);
     expect(capture).toContain("feature/thing-0");
     expect(await Bun.file(stdout).text()).toBe("null");
+  });
+});
+
+describe("the row set can be replaced while the picker is open", () => {
+  /** Three worktrees as `wrk wt` first draws them, straight from a stale cache. */
+  const PLAIN: Row[] = [
+    { payload: "/wt/alpha", columns: [{ text: "wt-alpha" }] },
+    { payload: "/wt/beta", columns: [{ text: "wt-beta" }] },
+    { payload: "/wt/gamma", columns: [{ text: "wt-gamma" }] },
+  ];
+
+  /**
+   * The same three annotated from the stack graph, plus a fourth the refresh discovered.
+   *
+   * Every way a replacement can move a row is in here at once, because each one on its own
+   * would let an index-restoring picker keep passing: a new row above shifts the indices, a
+   * longer name in column one widens it so the annotations sit further right, and a second
+   * column appears where there was none. This is the shape EXC-1017 will actually deliver.
+   */
+  const ANNOTATED: Row[] = [
+    { payload: "/wt/delta", columns: [{ text: "wt-delta-refreshed" }, { text: "#7 bottom" }] },
+    { payload: "/wt/alpha", columns: [{ text: "wt-alpha" }, { text: "#41" }] },
+    { payload: "/wt/beta", columns: [{ text: "wt-beta" }, { text: "#42" }] },
+    { payload: "/wt/gamma", columns: [{ text: "wt-gamma" }, { text: "#43 top" }] },
+  ];
+
+  /** {@link ANNOTATED} minus the worktree that was removed while the picker was up. */
+  const WITHOUT_GAMMA: Row[] = ANNOTATED.filter((row) => row.payload !== "/wt/gamma");
+
+  /** A scenario wired for both files, since every case here needs the pair. */
+  function replaceable(purpose: string, rows: Row[], stdout?: string): [string, string] {
+    const replace = replacePath(purpose);
+    const env = `PROBE_ROWS_FILE="${rowsFile(purpose, rows)}" PROBE_REPLACE_FILE="${replace}"`;
+
+    return [scenario(env, { stdout }), replace];
+  }
+
+  /**
+   * Waits until the replacement is fully drawn: `count` lines tall, and carrying `text`.
+   *
+   * Both halves are load-bearing. Height alone cannot see a replacement that keeps the row
+   * count, and text alone is satisfied by the first line of a frame still being written —
+   * which is a capture read one line short, several assertions later.
+   *
+   * Over `frameLines` for the same reason {@link selects} is: a query highlights the
+   * characters it matched, so an annotation the query runs through is a dozen SGR sequences
+   * on the wire and only reads as its own text once they are stripped.
+   */
+  function replaced(count: number, text: string): (capture: string) => boolean {
+    return (capture) => {
+      const lines = frameLines(capture);
+      return lines.length === count && lines.some((line) => line.includes(text));
+    };
+  }
+
+  test("the whole row set can be swapped from outside the render loop", async () => {
+    const [script, replace] = replaceable("swap", PLAIN);
+
+    const { frame } = await driven(script, {
+      act: async (pty) => {
+        await opened(pty, "wt-gamma");
+        landRows(replace, ANNOTATED);
+        await pty.waitUntil(replaced(5, "wt-delta-refreshed"));
+      },
+    });
+
+    const lines = frameLines(frame);
+
+    expect(lines).toHaveLength(5);
+    expect(lines[1]).toContain("wt-delta-refreshed");
+    expect(lines.join("\n")).toContain("#43 top");
+  });
+
+  test("the cursor rides the payload it was on, not the index", async () => {
+    const stdout = payloadPath("cursor");
+    const [script, replace] = replaceable("cursor", PLAIN, stdout);
+
+    const { frame } = await driven(script, {
+      quit: KEY.enter,
+      act: async (pty) => {
+        await opened(pty, "wt-gamma");
+        pty.write(KEY.down);
+        await pty.waitUntil(selects("wt-beta"));
+        landRows(replace, ANNOTATED);
+        await pty.waitUntil(replaced(5, "wt-delta-refreshed"));
+      },
+    });
+
+    // `wt-beta` was the second row and is now the third. A picker that restored the index
+    // would leave the gutter one line higher, on `wt-alpha` — which is the row the user
+    // would then choose without ever having moved onto it.
+    expect(frameLines(frame)[3]).toMatch(/^▌ wt-beta/);
+    expect(await Bun.file(stdout).text()).toBe(`"/wt/beta"`);
+  });
+
+  test("a replacement that drops the selected row sends the cursor to the top", async () => {
+    const stdout = payloadPath("dropped");
+    const [script, replace] = replaceable("dropped", PLAIN, stdout);
+
+    const { frame } = await driven(script, {
+      quit: KEY.enter,
+      act: async (pty) => {
+        await opened(pty, "wt-gamma");
+        pty.write(KEY.down.repeat(2));
+        await pty.waitUntil(selects("wt-gamma"));
+        landRows(replace, WITHOUT_GAMMA);
+        await pty.waitUntil(replaced(4, "wt-delta-refreshed"));
+      },
+    });
+
+    expect(frameLines(frame)[1]).toMatch(/^▌ wt-delta-refreshed/);
+    expect(await Bun.file(stdout).text()).toBe(`"/wt/delta"`);
+  });
+
+  test("a standing query survives the replacement and filters what arrived", async () => {
+    // Deliberately sequential — the keystroke's frame has settled before the rows land, and
+    // the claim is that the replacement leaves the query standing and re-runs it over what
+    // arrived. `beta-stack` is an annotation that makes a row the query had already rejected
+    // start matching it, so a query that was merely *kept* would not be enough.
+    //
+    // Two writers in one React batch is the other half of this, and no driven terminal can
+    // schedule that on purpose; [`./reducer.test.ts`](./reducer.test.ts) applies the actions
+    // directly for it.
+    const stacked: Row[] = [
+      { payload: "/wt/alpha", columns: [{ text: "wt-alpha" }, { text: "beta-stack" }] },
+      { payload: "/wt/beta", columns: [{ text: "wt-beta" }, { text: "solo" }] },
+      { payload: "/wt/gamma", columns: [{ text: "wt-gamma" }, { text: "none" }] },
+    ];
+
+    const [script, replace] = replaceable("query", PLAIN);
+
+    const { frame } = await driven(script, {
+      act: async (pty) => {
+        await opened(pty, "wt-gamma");
+        pty.write("beta");
+        await pty.waitUntil((capture) => frameLines(capture)[0] === "❯ beta");
+        landRows(replace, stacked);
+        await pty.waitUntil(replaced(3, "beta-stack"));
+      },
+    });
+
+    const lines = frameLines(frame);
+
+    expect(lines[0]).toBe("❯ beta");
+    expect(lines).toHaveLength(3);
+    expect(lines[1]).toContain("beta-stack");
   });
 });
 
