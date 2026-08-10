@@ -53,7 +53,7 @@ describe("workspace layout", () => {
 });
 
 describe("typescript configuration", () => {
-  test("the effective compiler options are strict", () => {
+  test("the effective compiler options are strict, and compile JSX", () => {
     // tsconfig.json carries comments, which `Bun.file().json()` rejects outright.
     // `tsc --showConfig` is the parser that already understands the format, and it
     // resolves any `extends` chain a later build config introduces.
@@ -70,11 +70,18 @@ describe("typescript configuration", () => {
         strict?: boolean;
         noUncheckedIndexedAccess?: boolean;
         verbatimModuleSyntax?: boolean;
+        jsx?: string;
       };
     };
 
     expect(compilerOptions.strict).toBe(true);
     expect(compilerOptions.noUncheckedIndexedAccess).toBe(true);
     expect(compilerOptions.verbatimModuleSyntax).toBe(true);
+
+    // The `.tsx` files in `packages/picker` are Ink components carrying no
+    // `import React` line. Drop this option and every one of them fails to
+    // compile — which is easy to do while editing the compiler options for an
+    // unrelated reason, since no `.ts` file in the workspace notices.
+    expect(compilerOptions.jsx).toBe("react-jsx");
   });
 });

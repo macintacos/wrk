@@ -1,0 +1,184 @@
+/**
+ * The Ink program EXC-1009's evidence is gathered from — one file, switched by environment.
+ *
+ * Every question the spike asks is about how Ink behaves in a terminal, so the subject has
+ * to be a real child process attached to a pty rather than a component rendered in-process:
+ * raw mode, colour detection and the fullscreen threshold are all decided from `isTTY` and
+ * the window size of the stream Ink renders to. `test/fixtures/pty.ts` supplies the
+ * terminal; this file supplies the thing running inside it.
+ *
+ * Environment rather than argv, and one file rather than four, because a probe is a
+ * fixture: the scenarios differ by a single prop or a single hook call, and four
+ * near-identical files would hide that. `PROBE_MODE` selects the scenario; the rest are
+ * knobs on it.
+ *
+ * | Variable | Default | What it does |
+ * | --- | --- | --- |
+ * | `PROBE_MODE` | `list` | `list`, `input-unguarded`, `input-guard-uncoerced`, `input-guarded`, or `fixed-width`. |
+ * | `PROBE_ROWS` | `19` | Rows the frame occupies — ~80% of a 24-row viewport. |
+ * | `PROBE_ITEMS` | `200` | List length, deliberately far longer than the window. |
+ * | `PROBE_FRAMES` | `4` | Timer ticks before unmounting. The last one exits rather than advancing, and Ink's 30 fps throttle can coalesce adjacent advances into one write — so this is an upper bound on redraws, not a count of them. |
+ * | `PROBE_SHRINK` | unset | In `fixed-width` mode, set `flexShrink={0}` on the column. |
+ * | `PROBE_TRUNCATE` | unset | In `fixed-width` mode, set `wrap="truncate"` on the text. |
+ *
+ * **Rendering goes to stderr in every mode.** `packages/wrk/src/output.ts` promises stdout
+ * is one JSON document per run, so an interactive component that takes Ink's default
+ * stream puts escape sequences in the machine channel. Passing `stdout: process.stderr` is
+ * the mechanism that file names, and the probe exercises it as its only rendering path
+ * rather than as one case among several.
+ *
+ * @packageDocumentation
+ */
+
+import { Box, render, Text, useApp, useInput, useStdin } from "ink";
+import type { ReactElement } from "react";
+import { useCallback, useEffect, useState } from "react";
+
+const MODE = process.env.PROBE_MODE ?? "list";
+const ROWS = Number(process.env.PROBE_ROWS ?? 19);
+const ITEMS = Number(process.env.PROBE_ITEMS ?? 200);
+const FRAMES = Number(process.env.PROBE_FRAMES ?? 4);
+const SHRINK = process.env.PROBE_SHRINK !== undefined;
+const TRUNCATE = process.env.PROBE_TRUNCATE !== undefined;
+
+/** Every item the list could show, of which only {@link ROWS} ever fit. */
+const items = Array.from({ length: ITEMS }, (_index, i) => `item ${i}`);
+
+/**
+ * Ticks {@link FRAMES} times, calling `onTick` for all but the last, then unmounts.
+ *
+ * Split from {@link useScroll} so the scenario that wants only the unmount — `fixed-width`,
+ * which has nothing to scroll — can say so, instead of calling a hook named for scrolling
+ * and discarding what it returns.
+ *
+ * @param onTick - Run on every tick but the final one, which exits instead.
+ */
+function useAutoExit(onTick: () => void): void {
+  const { exit } = useApp();
+
+  useEffect(() => {
+    let tick = 0;
+    const timer = setInterval(() => {
+      tick += 1;
+      if (tick >= FRAMES) {
+        clearInterval(timer);
+        exit();
+        return;
+      }
+      onTick();
+    }, 30);
+
+    return () => clearInterval(timer);
+  }, [exit, onTick]);
+}
+
+/**
+ * Advances a cursor over the list until {@link useAutoExit} unmounts.
+ *
+ * The redraws are the point. A first paint proves nothing about relative addressing — it
+ * is the second and every later frame, each erasing the last one by walking the cursor
+ * back up, that either stays inside the frame or eats the terminal above it.
+ *
+ * @returns The index of the highlighted row.
+ */
+function useScroll(): number {
+  const [selected, setSelected] = useState(0);
+
+  useAutoExit(useCallback(() => setSelected((previous) => previous + 1), []));
+
+  return selected;
+}
+
+/** The window of the list that fits, drawn one row per line. */
+function List() {
+  const selected = useScroll();
+  // A window that would start past the end of the list is a mis-set knob, not a scenario:
+  // `slice` would answer a short frame and every height assertion would quietly measure it.
+  const start = Math.max(0, Math.min(selected, items.length - ROWS));
+
+  return (
+    <Box flexDirection="column">
+      {items.slice(start, start + ROWS).map((item, index) => (
+        <Text key={item} inverse={index === selected - start} color="green">
+          {item}
+        </Text>
+      ))}
+    </Box>
+  );
+}
+
+/**
+ * The same window, with `useInput` called unconditionally.
+ *
+ * Ink's `useInput` puts stdin into raw mode, and raw mode is a TTY capability — so this is
+ * the shape that throws the moment the picker is run with its stdin piped.
+ */
+function UnguardedInput() {
+  useInput(() => {});
+  return <List />;
+}
+
+/**
+ * The same window, with the guard Ink's own error message points at — **coerced**.
+ *
+ * `isRawModeSupported` is declared `boolean` but is really `stdin.isTTY`, which Node
+ * leaves `undefined` rather than `false` on a pipe. Ink's own early return is
+ * `options.isActive === false`, a strict comparison, so handing the raw value straight to
+ * `isActive` type-checks, reads as a guard, and guards nothing. `Boolean` is the whole
+ * difference between this component and the one above.
+ */
+function GuardedInput() {
+  const { isRawModeSupported } = useStdin();
+  useInput(() => {}, { isActive: Boolean(isRawModeSupported) });
+  return <List />;
+}
+
+/**
+ * The guard as anyone would first write it, and as the type signature invites.
+ *
+ * Kept as its own scenario because it is the trap rather than a typo: it compiles, it
+ * reads correctly, and it crashes exactly where the unguarded version does.
+ */
+function UncoercedGuardInput() {
+  const { isRawModeSupported } = useStdin();
+  useInput(() => {}, { isActive: isRawModeSupported });
+  return <List />;
+}
+
+/**
+ * A fixed-width column holding an over-long label.
+ *
+ * The height of the frame is the assertion: a label that wraps costs a row the height
+ * budget did not allow for, and a picker whose rows silently grow is a picker that crosses
+ * the fullscreen threshold on someone else's terminal.
+ *
+ * The two settings are separate knobs rather than one, because which of them does the work
+ * is exactly the question — see the third group of
+ * [`../ink-gotchas.test.ts`](../ink-gotchas.test.ts).
+ */
+function FixedWidth() {
+  useAutoExit(useCallback(() => {}, []));
+  const label = "a label far wider than the column it was given to live in";
+
+  return (
+    <Box flexDirection="column">
+      <Box width={20} flexShrink={SHRINK ? 0 : undefined}>
+        <Text wrap={TRUNCATE ? "truncate" : undefined}>{label}</Text>
+      </Box>
+    </Box>
+  );
+}
+
+const scenarios: Record<string, () => ReactElement> = {
+  list: List,
+  "input-unguarded": UnguardedInput,
+  "input-guard-uncoerced": UncoercedGuardInput,
+  "input-guarded": GuardedInput,
+  "fixed-width": FixedWidth,
+};
+
+const Scenario = scenarios[MODE];
+if (!Scenario) throw new Error(`unknown PROBE_MODE: ${MODE}`);
+
+const instance = render(<Scenario />, { stdout: process.stderr });
+await instance.waitUntilExit();
