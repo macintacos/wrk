@@ -475,6 +475,19 @@ describe("addWorktree", () => {
     );
   });
 
+  test("detaches rather than letting git's DWIM mint a branch from the directory name", async () => {
+    // What `wrk pr` needs: the worktree exists first and `gh pr checkout` decides its branch a
+    // moment later, so a DWIM'd `stage` branch here would be minted only to be abandoned.
+    const own = makeContainer();
+    const added = join(own, "stage");
+
+    await addWorktree(added, own, { detach: true });
+
+    const entry = (await listWorktrees(own)).find((wt) => wt.path === added);
+    expect(entry).toBeDefined();
+    expect(entry?.branch).toBeNull();
+  });
+
   test("rejects with git's own message when git refuses", async () => {
     const own = makeContainer();
 

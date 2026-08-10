@@ -25,7 +25,7 @@
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import {
@@ -34,7 +34,6 @@ import {
   KEY,
   maxCursorRise,
   type PtySession,
-  runInPty,
   SHOW_CURSOR,
   typeUntil,
 } from "../../picker/test/fixtures/pty";
@@ -45,10 +44,16 @@ import type { Worktree } from "../src/git";
 import { candidates, worktreeRows } from "../src/wt";
 import {
   addRunWorktree,
+  childEnv,
   cleanupFixtures,
+  driveCli,
+  ENDED,
   fixtureGit,
   makeContainer,
+  quit,
   runCli,
+  shedGh,
+  status,
   tempDir,
 } from "./fixtures/repo";
 
@@ -246,65 +251,6 @@ function repoWith(count: number): { container: string; checkout: string; worktre
 }
 
 /**
- * A directory holding `git` and nothing else, to be used as a child's whole `PATH`.
- *
- * `gh.ts` makes the spawn itself the presence gate, so an unreachable `gh` is answered
- * instantly and locally — where leaving the real `gh` reachable puts an authenticating,
- * possibly networked binary on the critical path of every one of these cases, with latency
- * nothing here can bound. It is also the more faithful fixture: "absent" is one of the four
- * conditions the un-annotated acceptance criterion names, and it is the only one of the four
- * that can be produced without a network.
- *
- * Binaries are symlinked into a fresh directory rather than the directory being prepended to
- * the real `PATH`, because prepending would leave `gh` findable further along it.
- *
- * @param also - Further binaries to make reachable, by the name they are spelled on `PATH`.
- *   {@link gatedGh} needs the two its script runs, since the script's own `PATH` is this
- *   directory.
- * @returns The directory.
- */
-function shedGh(...also: string[]): string {
-  const dir = tempDir();
-  for (const name of ["git", ...also]) {
-    const binary = Bun.which(name);
-    if (binary === null) throw new Error(`${name} is not on PATH, so no fixture can shed gh`);
-    symlinkSync(binary, join(dir, name));
-  }
-
-  return dir;
-}
-
-/** The `PATH` every case runs with unless it says otherwise: `git`, and no `gh` at all. */
-const GHLESS: string = shedGh();
-
-/**
- * Environment for one `wrk wt` child: a cache of its own, no config at all, and no `gh` unless
- * `path` says otherwise.
- *
- * Neither redirection is tidiness. Without `XDG_CACHE_HOME` these runs read and write the
- * developer's real `~/.cache/wrk`, so a case would depend on what a previous *real* `wrk wt`
- * had left there — and would leave entries of its own behind. Without `XDG_CONFIG_HOME` they
- * read the developer's real `~/.config/wrk/config.toml`, and the annotated case asserts
- * against `DEFAULTS.glyphs`, so anyone who has ever set `[glyphs]` would fail this suite for a
- * reason that has nothing to do with the code. `config.test.ts` shields the same variable for
- * the same reason.
- *
- * `WRK_DEBUG` is shed for that same reason and is the sharpest of the three, because it is the
- * variable a developer working on *this* feature exports: `debug()` writes its lines to stderr,
- * which is the channel the picker draws on, and two cases below assert that nothing prefixed
- * `wrk: ` reaches the terminal. Empty rather than absent, since `debug()` tests the value for
- * truthiness and a `Record<string, string>` has no way to spell "unset".
- *
- * @param cacheHome - `XDG_CACHE_HOME` for the child. A private empty directory by default,
- *   which is the cold-cache case; pass one that has been seeded to get a warm one.
- * @param path - `PATH` for the child, {@link GHLESS} by default. {@link gatedGh} answers the
- *   one the annotation-timing cases pass instead.
- */
-function childEnv(cacheHome: string = tempDir(), path: string = GHLESS): Record<string, string> {
-  return { PATH: path, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: tempDir(), WRK_DEBUG: "" };
-}
-
-/**
  * A `PATH` whose `gh` answers `rows` — but not until the returned `open` is called.
  *
  * The cases below are about *ordering*: a frame on screen while `gh` has not answered is the
@@ -362,52 +308,14 @@ function gatedGh(rows: readonly PullRequest[]): { path: string; open: () => void
 /** Height of the pty every driven case runs in, matching `picker.test.ts`'s. */
 const ROWS = 24;
 
-/** The CLI entry point, as `fixtures/repo.ts` resolves it. */
-const CLI = join(import.meta.dir, "../src/cli.ts");
-
-/** What the driving script echoes once the CLI has exited, whatever its status. */
-const ENDED = "EXIT:";
-
-/**
- * Runs `wrk wt` inside a pty, from `cwd`, with stdout captured to a file.
- *
- * Stdout is redirected away from the terminal for the reason `picker.test.ts` gives: the
- * capture would otherwise hold the answer as well as the frames, and `frameLines` would count
- * it as a rendered row. It is also the shape the command actually ships in.
- *
- * The restricted `PATH` is applied inside the script rather than through `runInPty`'s `env`,
- * so it reaches the CLI child without also deciding where `bash` itself is found.
- *
- * @param options - {@link childEnv}'s two, as an object rather than trailing positionals —
- *   `RunOptions`, `PullRequestOptions`, `PtyOptions`, `PickOptions` and `CacheKey` all take
- *   this shape, and a caller wanting only the second would otherwise pass `undefined` first.
- */
-async function driveWt(
+/** `driveCli`, with `wt` already in the argv and this suite's viewport. */
+function driveWt(
   cwd: string,
   args: string[],
   drive: (session: PtySession) => Promise<void>,
   options: { cacheHome?: string; path?: string } = {},
-): Promise<{ capture: string; exitCode: number; stdout: string }> {
-  const out = join(tempDir(), "stdout");
-  const argv = args.map((argument) => `"${argument}"`).join(" ");
-  const env = childEnv(options.cacheHome, options.path);
-  const exports = Object.entries(env)
-    .map(([name, value]) => `${name}="${value}"`)
-    .join(" ");
-  const script = `cd "${cwd}" && ${exports} "${process.execPath}" "${CLI}" wt ${argv} >"${out}"; echo "EXIT:$?"`;
-  const run = await runInPty(script, { rows: ROWS, drive });
-
-  return { ...run, stdout: await Bun.file(out).text() };
-}
-
-/**
- * {@link typeUntil} for a key that ends the run, which the driving script says out loud.
- *
- * An extra keystroke landing after the run has already ended is harmless: it reaches `bash`,
- * which is running a `-c` script and never reads its stdin.
- */
-function quit(session: PtySession, key: string): Promise<void> {
-  return typeUntil(session, key, (text) => text.includes(ENDED), "ended");
+): ReturnType<typeof driveCli> {
+  return driveCli(cwd, ["wt", ...args], drive, { ...options, rows: ROWS });
 }
 
 /**
@@ -462,11 +370,6 @@ async function frameWhileOpen(
 /** `runCli`, with the same gh-less, private-cache environment the driven cases use. */
 function wtCli(args: string[], cwd: string): ReturnType<typeof runCli> {
   return runCli(args, cwd, childEnv());
-}
-
-/** The exit status the driving script echoes, since the shell's own status is bash's. */
-function status(capture: string): number {
-  return Number(/EXIT:(\d+)/.exec(capture)?.[1] ?? Number.NaN);
 }
 
 describe("wrk wt — the cd protocol", () => {

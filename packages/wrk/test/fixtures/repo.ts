@@ -12,15 +12,22 @@
  * which the default-branch sync runs in full), and a way to add commits to the seed. Any retrofit
  * adds those first.
  *
+ * **It also holds the harness for running the real CLI against them** — {@link runCli} for the
+ * cases a pipe can answer, {@link driveCli} for the ones only a terminal can, and the
+ * {@link childEnv} that shields both from the developer's own cache, configuration and `gh`.
+ * Those belong beside the repositories rather than in one suite, because every command that
+ * takes a cwd needs both halves and the second suite to want them would otherwise copy them.
+ *
  * Everything here builds *real* repositories with the real `git`. Nothing is stubbed: a
  * conformance suite that asserted against a mocked git would certify the mock.
  */
 
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
+import { type PtySession, runInPty, typeUntil } from "../../../picker/test/fixtures/pty";
 import { worktreeDirName } from "../../src/naming";
 import { type RunResult, run } from "../../src/proc";
 
@@ -217,4 +224,139 @@ export function runCli(
   env: Record<string, string | undefined> = {},
 ): Promise<RunResult> {
   return run(process.execPath, [CLI, ...args], { cwd, env: { ...FIXTURE_ENV, ...env } });
+}
+
+/**
+ * A directory holding `git` and nothing else, to be used as a child's whole `PATH`.
+ *
+ * `gh.ts` makes the spawn itself the presence gate, so an unreachable `gh` is answered
+ * instantly and locally — where leaving the real `gh` reachable puts an authenticating,
+ * possibly networked binary on the critical path of every case that uses this, with latency
+ * nothing here can bound. It is also the more faithful fixture: "absent" is one of the four
+ * conditions `gh.ts` folds into "could not answer", and the only one producible without a
+ * network.
+ *
+ * Binaries are symlinked into a fresh directory rather than the directory being prepended to
+ * the real `PATH`, because prepending would leave `gh` findable further along it.
+ *
+ * **A fresh directory per call, never one memoised at module scope.** This module is imported
+ * once per *process* while {@link cleanupFixtures} is called by each test file, so a directory
+ * built at import is removed by whichever suite finishes first and every later suite runs with
+ * a `PATH` naming a directory that is gone. The symptom is `Executable not found in $PATH:
+ * "git"` from a suite that never mentions `PATH`, in the full run only.
+ *
+ * A suite wanting a `gh` that *answers* writes its own script in here afterwards — see
+ * `wt.test.ts`'s gated one and `prpick.test.ts`'s logging one. Both are `gh`-shaped fixtures
+ * over this one directory rather than a second way of building it.
+ *
+ * @param also - Further binaries to make reachable, by the name they are spelled on `PATH`. A
+ *   fixture `gh` script runs with this directory as its own whole `PATH`, so anything it
+ *   shells out to has to be named here.
+ * @returns The directory.
+ */
+export function shedGh(...also: string[]): string {
+  const dir = tempDir();
+  for (const name of ["git", ...also]) {
+    const binary = Bun.which(name);
+    if (binary === null) throw new Error(`${name} is not on PATH, so no fixture can shed gh`);
+    symlinkSync(binary, join(dir, name));
+  }
+
+  return dir;
+}
+
+/**
+ * Environment for one CLI child: a cache of its own, no config at all, and no `gh` unless
+ * `path` says otherwise.
+ *
+ * None of the redirections is tidiness. Without `XDG_CACHE_HOME` these runs read and write the
+ * developer's real `~/.cache/wrk`, so a case would depend on what a previous *real* `wrk` had
+ * left there — and would leave entries of its own behind. Without `XDG_CONFIG_HOME` they read
+ * the developer's real `~/.config/wrk/config.toml`, so anyone who has ever set `[glyphs]` would
+ * fail a suite asserting against `DEFAULTS` for a reason that has nothing to do with the code.
+ * `config.test.ts` shields the same variable for the same reason.
+ *
+ * `WRK_DEBUG` is shed for that same reason and is the sharpest of the three, because it is the
+ * variable a developer working on these features exports: `debug()` writes to stderr, which is
+ * the channel the pickers draw on, and cases in both suites assert that nothing prefixed
+ * `wrk: ` reaches the terminal. Empty rather than absent, since `debug()` tests the value for
+ * truthiness and a `Record<string, string>` has no way to spell "unset".
+ *
+ * @param cacheHome - `XDG_CACHE_HOME` for the child. A private empty directory by default,
+ *   which is the cold-cache case; pass one that has been seeded to get a warm one.
+ * @param path - `PATH` for the child. A `gh`-less one by default; pass {@link shedGh}'s answer
+ *   with a script written into it for a `gh` that answers.
+ */
+export function childEnv(
+  cacheHome: string = tempDir(),
+  path: string = shedGh(),
+): Record<string, string> {
+  return { PATH: path, XDG_CACHE_HOME: cacheHome, XDG_CONFIG_HOME: tempDir(), WRK_DEBUG: "" };
+}
+
+/** What a {@link driveCli} script echoes once the CLI has exited, whatever its status. */
+export const ENDED = "EXIT:";
+
+/**
+ * The exit status {@link driveCli}'s script echoed, since the shell's own status is bash's.
+ *
+ * The pattern is built from {@link ENDED} rather than written out, so the marker has one
+ * definition. Spelled literally, changing it would leave every driven case reading `NaN` — a
+ * failure that names neither the marker nor this function.
+ */
+export function status(capture: string): number {
+  return Number(new RegExp(`${ENDED}(\\d+)`).exec(capture)?.[1] ?? Number.NaN);
+}
+
+/**
+ * {@link typeUntil} for a key that ends the run, which {@link driveCli}'s script says out loud.
+ *
+ * The condition every driven CLI case shares, and one `typeUntil`'s repetition precondition is
+ * satisfied by: an extra keystroke landing after the run has already ended reaches `bash`,
+ * which is running a `-c` script and never reads its stdin.
+ */
+export function quit(session: PtySession, key: string): Promise<void> {
+  return typeUntil(session, key, (text) => text.includes(ENDED), "ended");
+}
+
+/**
+ * Runs the real `wrk` CLI inside a pty, from `cwd`, with stdout captured to a file.
+ *
+ * The counterpart to {@link runCli} for everything only true of a terminal: the pickers read
+ * `isTTY` off stdin and stderr, and the `cd` protocol is a claim about stdout and an exit
+ * status at once.
+ *
+ * **Stdout is redirected away from the terminal**, for the reason `picker.test.ts` gives: the
+ * capture would otherwise hold the answer as well as the frames, and `frameLines` would count
+ * it as one more rendered row. It is also the shape these commands actually ship in, both the
+ * `cd` shim and every agent-facing caller having captured it.
+ *
+ * The environment is exported inside the script rather than passed through `runInPty`, so a
+ * restricted `PATH` reaches the CLI child without also deciding where `bash` itself is found.
+ *
+ * @param cwd - Where to run the CLI from, which is the whole input for most of these cases.
+ * @param argv - Arguments after `wrk`.
+ * @param drive - Types keys and reads frames while the run is live.
+ * @param options - {@link childEnv}'s two, as an object rather than trailing positionals —
+ *   `RunOptions`, `PullRequestOptions`, `PtyOptions`, `PickOptions` and `CacheKey` all take
+ *   this shape, and a caller wanting only the second would otherwise pass `undefined` first.
+ * @returns The capture, bash's exit status, and what the CLI wrote to stdout. Read the CLI's
+ *   own status with {@link status} rather than off `exitCode`, which is the shell's.
+ */
+export async function driveCli(
+  cwd: string,
+  argv: string[],
+  drive: (session: PtySession) => Promise<void>,
+  options: { cacheHome?: string; path?: string; rows?: number } = {},
+): Promise<{ capture: string; exitCode: number; stdout: string }> {
+  const out = join(tempDir(), "stdout");
+  const quoted = argv.map((argument) => `"${argument}"`).join(" ");
+  const exports = Object.entries(childEnv(options.cacheHome, options.path))
+    .map(([name, value]) => `${name}="${value}"`)
+    .join(" ");
+
+  const script = `cd "${cwd}" && ${exports} "${process.execPath}" "${CLI}" ${quoted} >"${out}"; echo "${ENDED}$?"`;
+  const run = await runInPty(script, { rows: options.rows ?? 24, drive });
+
+  return { ...run, stdout: await Bun.file(out).text() };
 }
