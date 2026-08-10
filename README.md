@@ -11,6 +11,10 @@ The repository is a [Bun](https://bun.sh) workspace holding two packages:
 | `@macintacos/wrk-picker` | `packages/picker` | The reusable inline terminal picker. |
 
 The bare npm name `wrk` is taken, so both packages publish under the `@macintacos` scope.
+The picker is published on its own —
+[packages/picker/README.md](packages/picker/README.md) carries its API, the
+payload-identity contract every caller has to honour, and the semver policy that governs
+changing either.
 
 ## Requirements
 

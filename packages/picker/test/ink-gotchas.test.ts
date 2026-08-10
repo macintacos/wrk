@@ -52,9 +52,12 @@
  * `import.meta.resolve` probe in a try/catch, so at runtime the branch is simply not taken.
  * A bundler follows the dynamic import statically anyway and dies on `devtools.js`'s
  * `react-devtools-core` import. `--external react-devtools-core` clears it without adding a
- * React devtools package to a CLI's dependency tree — for EXC-986 and EXC-1014, which are
- * the issues that will actually ship a bundle. Only that one module needs excluding: `ws`,
- * the other import in `devtools.js`, is a real dependency of Ink and resolves.
+ * React devtools package to a CLI's dependency tree — for EXC-986, which is the issue that
+ * will actually ship a bundle. The picker's own tarball is unaffected, since it publishes
+ * TypeScript source and nothing bundles it on the way out, but a *consumer* bundling the
+ * picker into their CLI inherits this exactly; `packages/picker/README.md` says so under
+ * Requirements. Only that one module needs excluding: `ws`, the other import in
+ * `devtools.js`, is a real dependency of Ink and resolves.
  *
  * @packageDocumentation
  */
@@ -190,7 +193,7 @@ describe("bundling Ink pulls in a devtools dependency nobody installed", () => {
   });
 
   test("marking it external is enough — the dependency need not be installed", async () => {
-    // The remedy for EXC-986 and EXC-1014, and the cheaper of the two the issue named: the
+    // The remedy for EXC-986, and the cheaper of the two the issue named: the
     // alternative is adding a React devtools package to a CLI's dependency tree to satisfy
     // a code path it will never run.
     const { exitCode } = await build("react-devtools-core");
