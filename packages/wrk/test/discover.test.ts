@@ -17,7 +17,7 @@ import { symlinkSync } from "node:fs";
 import { mkdir, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-import { frameLines, KEY, runInPty } from "../../picker/test/fixtures/pty";
+import { frameLines, KEY, runInPty, SHOW_CURSOR, typeUntil } from "../../picker/test/fixtures/pty";
 import { findContainers, resolveRepo } from "../src/discover";
 import { Refusal } from "../src/errors";
 import {
@@ -218,6 +218,16 @@ describe("resolveRepo in a terminal", () => {
   /** The picker's selected-row gutter, as `packages/picker/src/picker.tsx` draws it. */
   const CURSOR = "▌ ";
 
+  /**
+   * Whether the gutter marks the row for `name`.
+   *
+   * Over `frameLines` rather than the raw capture, because the gutter and the row it marks are
+   * separated by the escape sequences that colour them.
+   */
+  function onRow(name: string): (capture: string) => boolean {
+    return (capture) => frameLines(capture).some((line) => line.startsWith(`${CURSOR}${name}`));
+  }
+
   /** Where the probe's stdout is sent, so the pty capture holds only what was drawn. */
   function stdoutPath(purpose: string): string {
     return join(tempDir(), `EXC-1019-${purpose}-stdout.txt`);
@@ -257,19 +267,19 @@ describe("resolveRepo in a terminal", () => {
       cols: WIDE,
       drive: async (pty) => {
         await pty.waitFor("alpha");
-        // The keystroke handler attaches in an effect that runs around the first commit, so a
-        // key sent the instant the frame appears can land in the gap and be dropped.
-        await Bun.sleep(150);
+        // `beta` is chosen by moving rather than by typing, since a fuzzy query would also
+        // match the temp path every row shares. Reached from the bottom rather than by one
+        // arrow from the top: the first key of a session can be swallowed by the effect that
+        // enables raw mode, and `typeUntil` re-types until one lands — which is only safe at
+        // the end of a list, where the reducer clamps a repeat into a no-op instead of carrying
+        // the cursor past the row being waited for. Stepping back up is then a single key on a
+        // terminal already known to be raw.
+        await typeUntil(pty, KEY.down, onRow("gamma"), "reached the last row");
+        // Snapshotted here rather than at the first row's appearance: the cursor having reached
+        // the last row is proof the whole list is drawn, where a fixed settle is a guess.
         frame = frameLines(pty.capture());
-        // Sorted, so the second row is `beta` — chosen by moving rather than by typing, since
-        // a fuzzy query would also match the temp path every row shares. The move is waited on
-        // rather than slept through: a guessed interval is how this suite would go flaky on a
-        // loaded machine, and a cursor that had not moved yet would choose `alpha` and fail as
-        // if the picker were broken.
-        pty.write(KEY.down);
-        await pty.waitUntil((capture) =>
-          frameLines(capture).some((line) => line.startsWith(`${CURSOR}beta`)),
-        );
+        pty.write(KEY.up);
+        await pty.waitUntil(onRow("beta"));
         pty.write(KEY.enter);
       },
     });
@@ -291,8 +301,9 @@ describe("resolveRepo in a terminal", () => {
       cols: WIDE,
       drive: async (pty) => {
         await pty.waitFor("alpha");
-        await Bun.sleep(150);
-        pty.write(KEY.escape);
+        // The condition is Ink letting the cursor back, which is the dismissal itself — the
+        // probe's own exit is redirected away and says nothing on this terminal.
+        await typeUntil(pty, KEY.escape, (capture) => capture.includes(SHOW_CURSOR), "closed");
       },
     });
 

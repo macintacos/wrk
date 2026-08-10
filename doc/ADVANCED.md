@@ -189,11 +189,15 @@ list of one. With none it refuses: exit `1`, nothing on stdout.
 
 **With `gh` absent, logged out, offline or rate-limited, rows render un-annotated** — the
 branch name alone, exactly as if there were no pull requests to look for — and nothing is
-said about it on stderr. The annotation is read through the shared `pr-graph` cache, and
-once that cache has been filled the refresh runs behind the draw rather than in front of
-it, so a stale graph is what you see rather than a picker waiting on the network. The very
-first run in a repository is the exception: with nothing stored there is nothing to draw,
-so it waits for `gh` once.
+said about it on stderr.
+
+**The picker never waits on `gh`.** Your worktrees are something git already knows, so the
+list is drawn from them alone and the annotation arrives underneath it: the marker,
+`#number`, the position and the title appear in place, and the cursor stays on the row you
+were reading. Once the shared `pr-graph` cache has been filled that is a frame later, and
+the refresh that keeps it current runs in the background for the next invocation. The
+first run in a repository is a `gh` round trip later instead — the list is on screen for
+all of it, and a row chosen before that round trip finishes waits for it on the way out.
 
 `--print-path` selects the bare-path stdout shape the `cd` protocol above consumes.
 Without it the answer is the usual envelope, `{worktree_path, branch}`, with `branch` null

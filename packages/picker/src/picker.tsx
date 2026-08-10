@@ -238,8 +238,8 @@ export interface PickOptions<T> {
   /**
    * Called once, when the picker opens, with a function that replaces the whole row set.
    *
-   * The channel for rows that are not ready when the picker has to be — `wrk wt` draws
-   * worktrees from a stale cache immediately and annotates them from the stack graph a
+   * The channel for rows that are not ready when the picker has to be — `wrk wt` draws its
+   * worktrees the moment `git` has them and annotates them from the pull-request graph a
    * moment later. `replace` may be called any number of times, from anywhere, and takes
    * effect on the next frame; the user's query, and the row their cursor is on, both
    * survive it. See {@link PickerRow.payload} for what "the row they are on" is matched by.

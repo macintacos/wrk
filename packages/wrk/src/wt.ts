@@ -23,6 +23,30 @@
  * which {@link annotations} catches and reports through {@link debug}: a picker that cannot
  * find a pull request still has worktrees to show, and stderr belongs to the frame.
  *
+ * **Annotation is also always behind the draw.** The list is what the user asked for and `git`
+ * already has it, so the rows go up from the worktrees alone and the pull requests arrive
+ * afterwards, through the picker's `onOpen` — never in front of the first frame. A warm cache
+ * makes that a frame apart and a cold one makes it a `gh` round trip apart, and the difference
+ * between the two is now how long the annotation takes to show up rather than how long the
+ * terminal stays blank. The cursor rides across the replacement because the payload is a path;
+ * {@link worktreeRows} states that obligation from the row's end.
+ *
+ * What that costs, on a cold cache only: the `gh` round trip is in flight while the user is
+ * choosing, and choosing does not stop it. `cli.ts` sets `process.exitCode` rather than calling
+ * `process.exit` — `output.ts` says why — and `proc.ts`'s `run` does not `unref` its child, so
+ * a pick made before `gh` answers keeps the process alive until it does. The wait moved from in
+ * front of the draw to after the choice; the total is the same.
+ *
+ * **The picker's README documents an `AbortController` for exactly this, and it is deliberately
+ * not used here.** Aborting would reach only the cold-cache case — a warm one answers from disk
+ * and refreshes in a detached process this one is not waiting on — and that is the single case
+ * where abandoning the fetch costs something real. `cached` writes the entry only once `refresh`
+ * resolves, and rethrows rather than falling back when there is no previous entry, so an
+ * aborted first run leaves the cache as cold as it found it. Every subsequent run would pay the
+ * same round trip and abandon it again, and the rows would stay bare until some other consumer
+ * warmed the entry. Waiting out a fetch that is about to fill the cache is the cheaper of the
+ * two, and it is bounded: it happens once per repository.
+ *
  * **An un-annotated row carries one column, not five empty ones.** The picker sizes each
  * column across the whole row set and tolerates rows holding fewer of them, so a branch with
  * no pull request emits `[branch]` and renders identically to a picker that never looked —
@@ -207,9 +231,10 @@ export function candidates(worktrees: readonly Worktree[], here: string | null):
  * row carrying it unreachable — and git guarantees that by never listing two worktrees at one
  * path, where a `{ worktree_path, branch }` object would rely on nobody rebuilding it. That
  * second half is not idle: the same contract requires a payload to still compare `===` after a
- * row-set replacement, which is how EXC-1017 will push annotations in behind the draw. A
- * string satisfies it today and will still satisfy it then. {@link chooseWorktree} maps the
- * path back to the answer it emits.
+ * row-set replacement, and {@link chooseWorktree} replaces the whole set the moment the
+ * annotation arrives. A path comes back equal from a fresh `git worktree list`, so the cursor
+ * stays on the worktree the user was reading while every row grows four columns underneath it.
+ * {@link chooseWorktree} maps the path back to the answer it emits.
  *
  * @param offered - The worktrees to draw, as {@link candidates} answered.
  * @param prs - Pull requests by head ref, as `pullRequests` returns them. An empty map is the
@@ -236,8 +261,16 @@ export function worktreeRows(
 /**
  * The repository's pull requests, or an empty map if they could not be read at all.
  *
- * `background` because this draws on a keystroke: a stale graph now beats a fresh one in three
- * seconds, and `pr.ts` names a picker as the caller that option exists for.
+ * `background` still, now that {@link chooseWorktree} calls this from behind the draw rather
+ * than in front of it: nothing is waiting on the answer, so the detached refresh costs this run
+ * nothing and leaves the entry warm for the next one. `pr.ts` names a picker as the caller that
+ * option exists for.
+ *
+ * ponytail: under `WRK_DEBUG` this path's own diagnostics — `pr.ts`'s foreground-refresh and
+ * spawn lines, and the `catch` below — reach stderr while the picker owns it, and Ink sizes its
+ * erase to its own render, so the frame drifts a row per line. Harmless with the flag unset,
+ * which is every real run. Gate `debug` on whether a picker is mounted, or route it through the
+ * picker, if the diagnostics ever need to be readable at the same time as the frame.
  *
  * The `catch` covers the one failure `pullRequests` documents as its own — an unreadable cache
  * directory — and deliberately not `gh` being unable to answer, which never reaches here.
@@ -320,7 +353,30 @@ export async function chooseWorktree(cwd: string): Promise<Chosen | null> {
 
   try {
     const path = await pick({
-      rows: worktreeRows(offered, await annotations(container, config), config),
+      // The empty map is the point: these rows are the un-annotated ones, and the pull requests
+      // arrive through `onOpen` below. See this module's header for why nothing about them may
+      // stand in front of the first frame.
+      rows: worktreeRows(offered, new Map(), config),
+      onOpen: (replace) => {
+        // Not awaited, deliberately: this callback fires from the picker's first effect, and
+        // awaiting it here is the very wait being removed.
+        //
+        // Nothing in the chain is expected to reject. `annotations` absorbs its own failures,
+        // and `replace` is the picker's own dispatch — a throw out of it would be a bug in the
+        // picker, which is why it is left to surface rather than caught. That is the opposite
+        // call from `PickOptions.preview`, and for the opposite reason: that callback is a
+        // caller's own function reaching for `gh`, so a rejection there is ordinary.
+        //
+        // A refresh that outlives the pick dispatches into an unmounted component, which React
+        // makes a no-op — `pick` promises that, and it is the only stopping cue it offers.
+        //
+        // The `if` skips a replacement that would say nothing — an absent, logged-out, offline
+        // or rate-limited `gh` — which would still cost a re-measure of every column and a
+        // redraw.
+        void annotations(container, config).then((prs) => {
+          if (prs.size > 0) replace(worktreeRows(offered, prs, config));
+        });
+      },
     });
 
     // The `??` is unreachable — every payload came out of a row built from `offered` on the
