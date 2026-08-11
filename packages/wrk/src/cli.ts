@@ -25,10 +25,13 @@
  * @packageDocumentation
  */
 
+import { readFileSync } from "node:fs";
+
 import { Command } from "@commander-js/extra-typings";
 
 import { renderConversion, resolveConversion } from "./convert";
 import { resolveRepo } from "./discover";
+import { doctor, renderDoctor } from "./doctor";
 import { Cancelled, Refusal } from "./errors";
 import { emit, emitLine, note, PREFIX, reportFailure } from "./output";
 import { preflight } from "./preflight";
@@ -37,6 +40,27 @@ import { repoSetup } from "./setup";
 import { teardown } from "./teardown";
 import { createWorktree } from "./worktree";
 import { chooseWorktree } from "./wt";
+
+/**
+ * What `--version` reports: the `version` field of this package's own manifest.
+ *
+ * Read at runtime rather than imported, and the path holds in both places this file lives:
+ * `package.json` sits one directory above `src/` in the repository and in the published
+ * tarball alike. A JSON import would need `resolveJsonModule` turned on across the workspace
+ * to say the same thing, and `readFileSync` with a `URL` reads identically under Node and Bun
+ * — which is `proc.ts`'s reason for `node:child_process`, applied here.
+ *
+ * The cast is deliberate rather than a schema: this is the package describing itself, not input
+ * from outside it. It is also not a failure anything could be done about at runtime — commander's
+ * `version(str)` is a *getter* when `str` is `undefined`, so a manifest with no `version` makes
+ * `.version(VERSION)` answer `undefined` and the `.option()` chained onto it throw at import,
+ * taking every command with it. That is the correct outcome for a package whose own manifest is
+ * malformed, and it is loud. `test/cli.test.ts` reads the same field independently and compares,
+ * so the value cannot drift from the manifest either.
+ */
+const { version: VERSION } = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as { version: string };
 
 /**
  * The output configuration a picker command is registered with, and no other command is.
@@ -49,6 +73,22 @@ import { chooseWorktree } from "./wt";
  * **Applying it stays one command wide.** `configureOutput` spreads its argument into a *new*
  * object owned by the command it was called on, so this literal is read and never written, two
  * commands can share it, and `wrk --help` and every `agent` command keep stdout.
+ *
+ * **It reaches `--help` and cannot reach `--version`**, which is a property of how commander
+ * registers each rather than a choice made here. The help option is created lazily, so `-h`
+ * after a picker's name is unknown to the root, falls through to the picker, and is answered
+ * through *its* output configuration — this one, or {@link HUMAN_HELP} where `wt rm` has taken
+ * it back. {@link VERSION}'s option is registered eagerly on the root, and its listener writes
+ * through the **root's** configuration whichever subcommand was named, so no configuration
+ * below the root can route it and `wrk wt --print-path --version` really does put `0.0.0` on
+ * stdout for the shim to `cd` into. The alternatives are worse than the hazard: intercepting
+ * argv before `parseAsync` means re-deciding which command was named outside commander, and
+ * `enablePositionalOptions` — the setting that would confine the flag to the root — is the one
+ * this module's header declines by name, and would unclaim `--json` after a subcommand. So it
+ * is documented rather than closed: the failing invocation is a picker asked for the tool's
+ * version, and what it costs is a loud `cd` error rather than a wrong directory. It stops at
+ * the two commands whose stdout is a destination — `wt rm` inherits the same root-answered
+ * flag and is unharmed by it, its stdout being a report rather than a path.
  *
  * The width has to move with the text: commander reads it from `process.stdout` by default,
  * which under the shim is a pipe, so help would wrap at 80 columns on a terminal twice that
@@ -148,6 +188,7 @@ export function buildProgram(): Command {
   const program = new Command()
     .name("wrk")
     .description("Worktree, PR-stack and agent-workflow tooling.")
+    .version(VERSION)
     .option("--json", "Emit machine-readable JSON on stdout instead of human output");
 
   program
@@ -168,6 +209,21 @@ export function buildProgram(): Command {
       // own insertion order, and `Conversion` is built as one literal, so this preserves it.
       if (wantsJson(command)) emit({ ...conversion, recipe });
       else note(recipe);
+    });
+
+  program
+    .command("doctor")
+    .description("Report whether the tools wrk shells out to are present and new enough")
+    .action(async (_options, command) => {
+      const report = await doctor();
+      if (wantsJson(command)) emit(report);
+      else note(renderDoctor(report));
+
+      // The one command whose exit status is a finding rather than a failure to give an
+      // answer — see [`./doctor`](./doctor)'s header for why that is a fifth exit rule, and why
+      // it leaves "a run that fails writes nothing to stdout" intact. Assigned rather than
+      // exited, per [`./output`](./output)'s flushing rule.
+      if (!report.ok) process.exitCode = 1;
     });
 
   // Bound rather than chained, for the reason `agent` below is: `.command()` answers the

@@ -4,7 +4,8 @@
  * `wrk` is read by machines before it is read by people: ten-plus skill files across two
  * agent trees pipe its stdout through `jq` and branch on the fields they find. This module
  * is the whole of what those callers are promised — two channels, one envelope, four exit
- * rules — and it is deliberately the only place any of them is decided.
+ * rules and the one exception to them — and it is deliberately the only place any of them is
+ * decided.
  *
  * **stdout is the machine channel; stderr is the human one.** Every *answer* a command
  * produces goes through {@link emit}, so a run's stdout is one JSON document, and every
@@ -14,11 +15,14 @@
  * the runs slow enough to have printed progress.
  *
  * Two things on stdout are **not** answers and are not this module's to route. Commander
- * renders `--help` there itself, which is correct — a caller asking for help is a human. Two
- * commands take that back: `wrk wt` and `wrk pr` each have a *path* on stdout, so both
- * route their own help to stderr rather than hand a shell function a usage block to `cd` into. And an interactive component
- * must be constructed against stderr (Ink's `render` takes a `stdout` option) rather than
- * allowed its default, or its escape sequences land in the machine channel.
+ * renders `--help` and `--version` there itself, which is correct — a caller asking for either
+ * is a human. Two commands take the first of those back: `wrk wt` and `wrk pr` each have a
+ * *path* on stdout, so both route their own help to stderr rather than hand a shell function a
+ * usage block to `cd` into. `--version` they cannot take back — it is answered by the root
+ * whichever subcommand was named, and `cli.ts`'s `PICKER_HELP` records why that is commander's
+ * to decide rather than theirs. And an interactive component must be constructed against
+ * stderr (Ink's `render` takes a `stdout` option) rather than allowed its default, or its
+ * escape sequences land in the machine channel.
  *
  * There is one answer that is deliberately **not** JSON, and it is routed through here
  * rather than written behind this module's back: {@link emitLine}, the shape the editor's
@@ -42,6 +46,16 @@
  * {@link reportFailure} is where those rules live, and anything it does not recognise is
  * rethrown rather than mapped: an unexpected error is a bug in `wrk`, and its stack is the
  * only useful thing about it.
+ *
+ * **A fifth rule belongs to one command and is not reached through here.** `wrk doctor`
+ * exits `1` when a tool it checked is missing or too old, because its caller is a shell
+ * running `wrk doctor || …` that parses nothing, so the status is the only channel the
+ * finding can travel on. That is a *finding*, not a failure, and the distinction is what keeps
+ * it compatible with the promise every consumer of this contract actually rests on — **a run
+ * that fails writes nothing to stdout**, which is what makes a `jq -er` pipeline safe. This
+ * one writes its complete envelope there and differs only in the status beside it, so no
+ * caller ever reads a partial document. It is set by assignment in the command rather than
+ * raised, so nothing here maps it — see [`./doctor`](./doctor)'s header.
  *
  * **Callers set `process.exitCode`; they do not call `process.exit`.** Writing to stdout
  * is asynchronous whenever stdout is a pipe — which is every agent-facing invocation —

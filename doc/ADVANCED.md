@@ -21,6 +21,24 @@ relative path, and the repository resolves to a container named `--path-format=a
 That answer is silent, stable, and wrong. Check `git --version` before reaching for a
 debugger.
 
+`wrk doctor` is that check, mechanised. It reports both tools `wrk` shells out to and the
+versions they answer with, holds `git` to the floor above, and **exits `1`** when either
+is missing or too old — so `wrk doctor || …` is enough to gate a script on it.
+
+```console
+$ wrk doctor
+git  2.51.0
+gh   missing
+$ echo $?
+1
+```
+
+A `git` that is present but below the floor is reported as present and not ok
+(`2.30.0 (needs 2.36 or newer)`), never as missing: they are different problems with
+different fixes. `gh` is held to no floor. Both tools are required — `git` outright, `gh`
+by `wrk pr` and by the stack annotations `wrk wt` draws — so either one missing fails the
+check. `--json` puts the same answer on the envelope, as `{ok, tools[]}`.
+
 ## Tasks
 
 Tool versions are pinned by [mise](https://mise.jdx.dev) and checksum-locked in
@@ -56,10 +74,11 @@ owns TOML.
 `wrk` is read by machines before it is read by people, so its two streams have separate
 jobs. **stdout is the machine channel**: every answer a command produces goes there, as
 one JSON object per run. **stderr is the human channel**: progress, warnings and failure
-messages, whatever the run's outcome. `--help` is the exception that proves it — a caller
-asking for help is a human, so it renders on stdout and no envelope is involved. The two
-commands that take that back are `wrk wt` and `wrk pr`, whose stdout is a path being fed
-to `cd`; see [The cd protocol](#the-cd-protocol).
+messages, whatever the run's outcome. `--help` and `--version` are the exceptions that
+prove it — a caller asking for either is a human, so both render on stdout and no envelope
+is involved. `wrk wt` and `wrk pr` take the first of those back, their stdout being a path
+fed to `cd`; `--version` they cannot take back, because the root answers it whichever
+subcommand was named. See [The cd protocol](#the-cd-protocol) for both.
 
 A global `--json` flag puts a command that would otherwise print for a human onto the same
 envelope. The agent-facing commands are JSON either way, because their callers parse them
@@ -69,7 +88,7 @@ The envelope **never omits a key**. A value the run did not reach is `null`, not
 key, so `.reason` can be read unconditionally rather than guarded. Keys come out in the
 order the result type declares them, so two runs of the same command diff cleanly.
 
-Four exit rules, and the first is the one to know:
+Four exit rules and one exception, and the first is the one to know:
 
 | Outcome                                   | Exit        | Shape                                      |
 | ----------------------------------------- | ----------- | ------------------------------------------ |
@@ -77,10 +96,17 @@ Four exit rules, and the first is the one to know:
 | A refusal                                 | `1`         | One `wrk: …` line on stderr. Nothing else. |
 | A command `wrk` ran failed                | the child's | Its argv, status and stderr, on stderr.    |
 | A picker the user dismissed               | `130`       | Nothing on stdout, and no `wrk: …` line.   |
+| A `wrk doctor` finding                    | `1`         | The whole envelope, on stdout.             |
 
 A well-formed "blocked" answer is a **successful run**: callers branch on the payload's
 verdict field, never on the exit status. An exit status that is not `0` means `wrk` has no
 answer to give, not that the answer was no.
+
+One command takes the other side of that on purpose. `wrk doctor` exits `1` when a tool it
+checked is missing or too old, because the caller it exists for is a shell running
+`wrk doctor || …` that parses nothing. That is a **finding**, not a failure, and it stays
+compatible with the rule below: the envelope on stdout is complete either way, and only
+the status beside it differs. No other command has a second meaning for its exit status.
 
 One command has a second machine shape. `wrk agent create --hook` prints the worktree path
 alone, because the editor's `WorktreeCreate` hook enters whatever directory the
@@ -143,6 +169,16 @@ line `wt rm <worktree>` becomes `wrk wt --print-path rm <worktree>`: the teardow
 completion, prints nothing on stdout, and the emptiness guard below then reports the
 successful destructive run as a failure. Forwarding `rm` untouched is the whole fix, and
 it costs the picker nothing — `rm` is not a worktree anyone can `cd` to.
+
+**`--version` is the same shape and is not guarded**, deliberately. The root answers it
+whichever subcommand was named — that is commander, not a choice `wrk` makes — so
+`wt --version` reaches the function, misses the `rm` arm, and becomes
+`wrk wt --print-path --version`, which prints the version where the shim expects a path
+and leaves you at `cd -- 0.0.0`. Unlike the `rm` case nothing destructive has run and the
+error is immediate and loud, so the arm it would take is not worth the line;
+`wt rm --version` is forwarded and simply prints the version. `PICKER_HELP` in
+[packages/wrk/src/cli.ts](../packages/wrk/src/cli.ts) records why closing this properly
+costs more than it saves.
 
 Both of the remaining guards earn their line. **Forwarding the status** is what keeps a
 cancelled pick distinguishable at the call site: fish propagates a command substitution's

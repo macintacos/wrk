@@ -22,6 +22,18 @@ const CLI_MODULE = join(import.meta.dir, "../src/cli");
 const ERRORS_MODULE = join(import.meta.dir, "../src/errors");
 const OUTPUT_MODULE = join(import.meta.dir, "../src/output");
 
+/** The module as an executable rather than as an import, for the cases that drive the CLI. */
+const CLI_ENTRY = `${CLI_MODULE}.ts`;
+
+/** What `packages/wrk/package.json` declares, read independently of the program. */
+async function manifestVersion(): Promise<string> {
+  const manifest = (await Bun.file(join(import.meta.dir, "../package.json")).json()) as {
+    version: string;
+  };
+
+  return manifest.version;
+}
+
 /**
  * Runs the real program in a child, with one probe command whose action is `body`.
  *
@@ -65,6 +77,26 @@ describe("buildProgram", () => {
       .filter((long) => long === "--json");
 
     expect(flags).toEqual(["--json"]);
+  });
+
+  test("carries the version its own package manifest declares", async () => {
+    // Read back out of the manifest rather than compared against a literal: the whole
+    // requirement is that the two cannot drift, and a literal here would be a third place
+    // the version is written down.
+    expect(buildProgram().version()).toBe(await manifestVersion());
+  });
+});
+
+describe("--version", () => {
+  test("prints the manifest's version on stdout and exits 0", async () => {
+    // Driven rather than read off the tree, because commander decides the stream and the
+    // status itself: `buildProgram().version()` above would still pass if the flag printed
+    // to stderr or exited nonzero.
+    const result = await run(process.execPath, [CLI_ENTRY, "--version"]);
+
+    expect(result.code).toBe(0);
+    expect(result.stdout.trim()).toBe(await manifestVersion());
+    expect(result.stderr).toBe("");
   });
 });
 
