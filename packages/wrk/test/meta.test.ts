@@ -232,9 +232,12 @@ describe("writeKey", () => {
 
       expect(await writeKey(container, "linear", "milestone", "v1")).toBe(true);
 
-      expect(JSON.parse(await readMeta(container))).toEqual({
-        linear: { projectName: "wrk", milestone: "v1" },
-      });
+      // Literal bytes here as well as on the create path: updating an existing file is
+      // where the indentation criterion is actually load-bearing, since that is the file
+      // another tool already hand-edited.
+      expect(await readMeta(container)).toBe(
+        '{\n  "linear": {\n    "projectName": "wrk",\n    "milestone": "v1"\n  }\n}\n',
+      );
     });
   });
 
@@ -309,6 +312,24 @@ describe("writeKey", () => {
       await writeKey(container, "git", FLAG, true);
 
       expect(await entries(container)).toEqual([PROJECT_META]);
+    });
+  });
+
+  test("two overlapping writes both settle, and publish a whole document", async () => {
+    await withContainer(async (container) => {
+      // A staging name shared between overlapping writes is the failure this pins: the
+      // first rename takes the file, the second rejects `ENOENT` — and the caller of the
+      // first has already been told `true` for bytes that are no longer on disk. Which
+      // update survives is *not* asserted: one is lost by the read-modify-write, which is
+      // the ceiling the `ponytail:` comment in `meta.ts` names.
+      const settled = await Promise.all([
+        writeKey(container, "git", FLAG, true),
+        writeKey(container, "linear", "projectName", "wrk"),
+      ]);
+
+      expect(settled).toEqual([true, true]);
+      expect(await entries(container)).toEqual([PROJECT_META]);
+      expect(JSON.parse(await readMeta(container))).toBeObject();
     });
   });
 });
