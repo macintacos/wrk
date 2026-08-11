@@ -58,6 +58,12 @@
  * which leaves the crossing available and everything else still blocked. A guard does not block
  * harder because it knows less about itself.
  *
+ * One deliberate tightening over the Python guard follows from reading that asymmetry
+ * consistently. It names the *session's* branch with a plain `--abbrev-ref`, so a run worktree
+ * stopped mid-rebase stops looking like one to itself and may write outside its own checkout;
+ * here both branches come from {@link headBranch}, so it still knows what it is and stays
+ * blocked. Same rule, applied to both ends rather than one.
+ *
  * ## What is deliberately not blocked
  *
  * A path outside the container, which is what permits the exec plan store at
@@ -69,7 +75,7 @@
  * @packageDocumentation
  */
 
-import { realpath } from "node:fs/promises";
+import { readlink, realpath } from "node:fs/promises";
 import { basename, isAbsolute, join, relative, resolve, sep } from "node:path";
 
 import { headBranch } from "./git";
@@ -124,6 +130,10 @@ function isUnder(path: string, root: string): boolean {
  * this half of the decision — and because that is what lets {@link guardEdit} ask this question
  * *before* paying for a branch lookup it usually turns out not to need.
  *
+ * Exported rather than kept private because it is the question a harness's wiring wants on its
+ * own: "would a verdict here even involve me?" is answerable with no git at all, and the Python
+ * guard this consolidates exports its `target_checkout` for the same reason.
+ *
  * @param filePath - The path the edit or write is aimed at.
  * @param container - The repository container.
  * @param checkout - Root of the checkout the session is working in.
@@ -177,35 +187,51 @@ export function verdict(filePath: string, session: Session, targetBranch: string
     allowed: false,
     reason:
       `Blocked: this session is working in ${checkout}, but ${filePath} is elsewhere in the ` +
-      "repository container. Use a path relative to that checkout, or absolute under its root.",
+      "repository container. Use a path relative to the working directory, or absolute under " +
+      `${checkout}.`,
   };
 }
 
 /**
- * `filePath` as a path comparable with git's own answers: absolute, and through any symlink.
+ * `filePath` as a path comparable with git's own answers: absolute, and through every symlink on
+ * the way to it as well as one standing at it.
  *
- * The resolution is what stops macOS's `/tmp` → `/private/tmp` from defeating a match, since
- * git emits realpath-resolved paths and a target spelled the other way would land outside every
- * container and be allowed. Only the *parent* is resolved, because the target itself routinely
- * does not exist yet — a `Write` creating a file is the ordinary case — and a `realpath` on a
- * missing path rejects rather than answering as far as it can.
+ * The resolution is what stops macOS's `/tmp` → `/private/tmp` from defeating a match, since git
+ * emits realpath-resolved paths and a target spelled the other way would land outside every
+ * container and be allowed. Python's `Path.resolve()` — which the guard being consolidated uses —
+ * resolves as far as it can and stops; `realpath(3)` has no such mode and rejects outright on
+ * anything missing, so the three shapes the guard actually sees are taken in turn:
  *
- * A parent that does not exist either falls back to plain normalization. That is the honest
- * boundary of this pass: a write several directories deep into a tree that is not there yet is
- * compared unresolved, which can only ever *allow* an edit the resolved form would have caught.
+ * 1. **The target exists.** `realpath` answers for it, including when it *is* a symlink into
+ *    another checkout — the write follows that, so the guard must too.
+ * 2. **The target does not exist but its parent does** — an ordinary `Write` creating a file.
+ *    The parent resolves and the name is joined back on. If the name is a *dangling* symlink,
+ *    `realpath` rejected in step 1 but the write would still land wherever it points, so the link
+ *    is read and followed explicitly.
+ * 3. **Neither exists.** Plain normalization.
+ *
+ * Two boundaries remain, and both fail *open* — they can only allow an edit the fully resolved
+ * form would have caught, never block one it would have permitted. A chain of dangling symlinks
+ * is followed one hop rather than to its end, and a write several directories deep into a tree
+ * that is not there yet is compared unresolved.
  */
 async function resolveTarget(filePath: string, cwd: string): Promise<string> {
   const absolute = resolve(cwd, filePath);
-  const parent = resolve(absolute, "..");
 
-  return realpath(parent).then(
-    (real) => join(real, basename(absolute)),
-    () => absolute,
-  );
+  const existing = await realpath(absolute).catch(() => null);
+  if (existing !== null) return existing;
+
+  const parent = await realpath(resolve(absolute, "..")).catch(() => null);
+  if (parent === null) return absolute;
+
+  const named = join(parent, basename(absolute));
+  const dangling = await readlink(named).catch(() => null);
+
+  return dangling === null ? named : resolve(parent, dangling);
 }
 
 /**
- * {@link verdict}, with the facts resolved from disk.
+ * The decision itself, free to throw and free to hang — {@link guardEdit} owns both answers.
  *
  * Locates the session with {@link locate}, names both branches with {@link headBranch} — which
  * sees through a rebase in progress, so a worktree stopped on a conflict is still recognised as
@@ -216,43 +242,66 @@ async function resolveTarget(filePath: string, cwd: string): Promise<string> {
  * an edit inside the session's own checkout — is settled by two concurrent `rev-parse` probes and
  * string comparison, with no branch lookup at all; only a path that actually crosses pays for the
  * two, and it pays for them concurrently.
+ */
+async function decide(filePath: string, cwd: string): Promise<Verdict> {
+  const where = await locate(cwd);
+  if (where.kind !== "checkout") return ALLOWED;
+
+  const target = await resolveTarget(filePath, cwd);
+  const sibling = targetCheckout(target, where.container, where.root);
+  if (sibling === null) return ALLOWED;
+
+  // Caught here, not by the outer handler: that one allows, which is right for the session's own
+  // lookup but not for the target's, whose failure must keep the block. A target that is not a
+  // directory makes git fail to start, which is the ordinary way that arrives.
+  const [branch, targetBranch] = await Promise.all([
+    headBranch(where.root).catch(() => null),
+    headBranch(sibling).catch(() => null),
+  ]);
+  const session: Session = {
+    container: where.container,
+    checkout: where.root,
+    branch: branch ?? "",
+  };
+
+  return verdict(target, session, targetBranch ?? "");
+}
+
+/**
+ * Ceiling on one decision, after which the edit is allowed unread.
  *
- * **Every failure here answers allowed**, including one this module did not anticipate: it is
- * called before every file write, and blocking on its own bug would wedge a session with no way
- * out. Only a decision reached in full can block.
+ * The failure this closes is not an exception but a *wait*: a contended `index.lock`, a stalled
+ * network filesystem, a git that never returns. Nothing above would throw, so the fail-open
+ * handler never fires — the promise simply does not settle, the harness's hook never answers, and
+ * the session is wedged with no way out. That is the same outcome blocking on a bug would have,
+ * reached along the one axis a `try`/`catch` cannot see, so it gets the same answer.
  *
- * @param filePath - The path the edit or write is aimed at. Relative paths are resolved against
- *   `cwd`, which is what a harness that never relocates its session hands over.
- * @param cwd - Where the session is working. Defaults to this process's cwd.
+ * Five seconds because that is what `guard_worktree_edits.py` caps each of its git calls at, for
+ * this reason in those words. It is a ceiling on the whole decision rather than per call, which is
+ * the stricter reading and bounds anything a later change adds inside it.
+ */
+const DEADLINE_MS = 5000;
+
+/**
+ * {@link verdict}, with the facts resolved from disk.
+ *
+ * **Every failure answers allowed**, including one this module did not anticipate and including a
+ * decision that simply takes too long ({@link DEADLINE_MS}): it is called before every file write,
+ * and blocking on its own bug would wedge a session with no way out. Only a decision reached in
+ * full can block.
+ *
+ * @param filePath - The path the edit or write is aimed at. A relative one is resolved against
+ *   `cwd`, exactly as the harness's own tool would resolve it.
+ * @param cwd - The session's working directory — not its checkout root, which {@link locate}
+ *   derives from it. Defaults to this process's cwd.
  * @returns Allowed, or blocked with the message the wiring should surface. Never throws.
  */
 export async function guardEdit(filePath: string, cwd?: string): Promise<Verdict> {
   if (filePath === "") return ALLOWED;
 
-  try {
-    const where = await locate(cwd);
-    if (where.kind !== "checkout") return ALLOWED;
+  const stalled = new Promise<Verdict>((settle) => {
+    setTimeout(() => settle(ALLOWED), DEADLINE_MS).unref();
+  });
 
-    const target = await resolveTarget(filePath, where.root);
-    const sibling = targetCheckout(target, where.container, where.root);
-    if (sibling === null) return ALLOWED;
-
-    // Both caught here rather than by the outer handler, which answers allowed — and only the
-    // first of them should. The target's is the lookup whose failure must *keep* the block, and
-    // a target that is not a directory at all makes git fail to start, which is the ordinary way
-    // that arrives.
-    const [branch, targetBranch] = await Promise.all([
-      headBranch(where.root).catch(() => null),
-      headBranch(sibling).catch(() => null),
-    ]);
-    const session: Session = {
-      container: where.container,
-      checkout: where.root,
-      branch: branch ?? "",
-    };
-
-    return verdict(target, session, targetBranch ?? "");
-  } catch {
-    return ALLOWED;
-  }
+  return Promise.race([decide(filePath, cwd ?? process.cwd()).catch(() => ALLOWED), stalled]);
 }

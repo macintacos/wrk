@@ -15,10 +15,11 @@
 
 import { afterAll, describe, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 
+import { currentBranch } from "../src/git";
 import type { Session, Verdict } from "../src/guard";
 import { guardEdit, targetCheckout, verdict } from "../src/guard";
 import {
@@ -26,6 +27,7 @@ import {
   cleanupFixtures,
   FIXTURE_ENV,
   fixtureGit,
+  IDENTITY,
   makeContainer,
   tempDir,
 } from "./fixtures/repo";
@@ -192,10 +194,13 @@ describe("the import closure", () => {
    * Every module `entry` reaches through relative imports, and every bare specifier among them.
    *
    * A regex over the source rather than a parse: these files are written by this project and
-   * every import in them is a static top-level `from "…"`, so the shapes a parser would buy —
-   * a dynamic import, a `require`, a specifier built by concatenation — do not occur. One that
-   * appears later fails this case loudly rather than silently, since an unfollowed import is a
-   * file whose own imports go unchecked.
+   * every import in them is a static top-level `from "…"`, so the shapes a parser would buy — a
+   * dynamic import, a `require`, a specifier built by concatenation — do not occur.
+   *
+   * That premise is **asserted rather than assumed**, because it is exactly the assumption whose
+   * quiet failure would turn this whole case green while the picker sat on the hot path: a regex
+   * that cannot match `await import("…")` does not see the specifier, so the closure stays small
+   * and the set below still equals `["zod"]`. A file that grows one throws here instead.
    */
   function closure(entry: string): { files: string[]; bare: Set<string> } {
     const files: string[] = [];
@@ -207,9 +212,12 @@ describe("the import closure", () => {
       if (files.includes(file)) continue;
       files.push(file);
 
-      for (const [, specifier] of readFileSync(file, "utf8").matchAll(
-        /^import[^"']*["']([^"']+)["'];?$/gm,
-      )) {
+      const source = readFileSync(file, "utf8");
+      if (/\b(?:import|require)\s*\(/.test(source)) {
+        throw new Error(`${file}: dynamic import or require — this walk cannot follow it`);
+      }
+
+      for (const [, specifier] of source.matchAll(/^import[^"']*["']([^"']+)["'];?$/gm)) {
         if (specifier === undefined) continue;
         if (specifier.startsWith(".")) queue.push(`${join(dirname(file), specifier)}.ts`);
         else bare.add(specifier);
@@ -258,24 +266,31 @@ const BUDGET_MS = 1000;
 const RUNS = 5;
 
 describe(`the latency budget — a verdict within ${BUDGET_MS} ms of process start`, () => {
-  test("costs about what starting the runtime costs, on the path that does the most work", async () => {
-    // The sanctioned crossing specifically: it is the only shape that pays for both branch
-    // lookups, so a budget met here is met by every other shape by construction.
+  test("costs about what starting the runtime costs, on a path that does the most work", async () => {
+    // Measured on a *blocked* crossing, which pays for both branch lookups exactly as the
+    // sanctioned one does — and answers the one word no shortcut can produce. `allowed` is what
+    // every fail-open path prints too: a probe that crashed, a container fixture that failed to
+    // build, a cwd that turned out not to be a repository. Asserting on it would let this case
+    // sleep through the regression it exists to catch, since all three are also very fast.
     const { container, checkout } = makeContainer();
     const worktree = addRunWorktree(container, "EXC-1/feature");
     addRunWorktree(container, "EXC-2/other");
+    // The runtime already running this suite, for `runCli`'s reason in `fixtures/repo.ts`: no
+    // toolchain lookup, and the child is the same binary being measured.
     const probe = join(import.meta.dir, "fixtures", "guard-probe.ts");
-    const target = join(worktree, "src/app.ts");
+    const target = join(checkout, "src/app.ts");
 
     const samples: number[] = [];
     for (let run = 0; run < RUNS; run++) {
       const started = performance.now();
-      const child = Bun.spawn(["bun", probe, target, checkout], { stdout: "pipe", stderr: "pipe" });
+      const child = Bun.spawn([process.execPath, probe, target, worktree], {
+        stdout: "pipe",
+        stderr: "pipe",
+      });
       await child.exited;
       samples.push(performance.now() - started);
 
-      // A crashed probe exits in a few milliseconds, which would read as a very fast guard.
-      expect(await new Response(child.stdout).text()).toBe("allowed\n");
+      expect(await new Response(child.stdout).text()).toBe("blocked\n");
     }
     const median = samples.sort((a, b) => a - b)[Math.floor(RUNS / 2)] as number;
 
@@ -306,7 +321,48 @@ describe("guardEdit", () => {
     const worktree = addRunWorktree(container, "EXC-1/feature");
     conflictedRebase(checkout, worktree);
 
+    // Without this the case passes on a rebase that finished or never started, leaving HEAD
+    // attached — in which case `currentBranch` answers and the recovery under test never runs.
+    expect(await currentBranch(worktree)).toBeNull();
     expect(reason(await guardEdit(join(worktree, "file.txt"), checkout))).toBeNull();
+  });
+
+  test("resolves a relative path against the working directory, not the checkout root", async () => {
+    // A session `cd`-ed into a subdirectory is the ordinary case, and every `..` in a relative
+    // path resolves one level too high if the checkout root is used as the anchor: an edit into
+    // the session's own tree gets blocked, and one aimed at the default-branch checkout gets
+    // through. Both directions are pinned, because the anchor being wrong breaks them together.
+    const { container, checkout } = makeContainer();
+    const worktree = addRunWorktree(container, "EXC-1/feature");
+    const inside = join(worktree, "src");
+    mkdirSync(inside, { recursive: true });
+
+    expect(reason(await guardEdit("../src/app.ts", inside))).toBeNull();
+    expect(reason(await guardEdit(`../../${basename(checkout)}/app.ts`, inside))).not.toBeNull();
+  });
+
+  test("follows a symlink standing at the target, not only ones on the way to it", async () => {
+    // The write follows it, so the guard has to. A symlink inside the worktree pointing at the
+    // default-branch checkout is the shape that would otherwise launder the accident straight
+    // through the rule.
+    const { container, checkout } = makeContainer();
+    const worktree = addRunWorktree(container, "EXC-1/feature");
+    const aliased = join(worktree, "aliased.txt");
+    symlinkSync(join(checkout, "README"), aliased);
+
+    expect(reason(await guardEdit(aliased, worktree))).not.toBeNull();
+  });
+
+  test("follows a symlink standing at the target even when it dangles", async () => {
+    // `realpath` rejects on a link whose target does not exist, so this is a distinct code path
+    // from the case above rather than a restatement of it — and it is the one a `Write` takes,
+    // since writing through a dangling link is what creates the file it points at.
+    const { container, checkout } = makeContainer();
+    const worktree = addRunWorktree(container, "EXC-1/feature");
+    const aliased = join(worktree, "dangling.txt");
+    symlinkSync(join(checkout, "not-there-yet.txt"), aliased);
+
+    expect(reason(await guardEdit(aliased, worktree))).not.toBeNull();
   });
 
   test("keeps the block when the target is not a checkout at all", async () => {
@@ -341,18 +397,15 @@ describe("guardEdit", () => {
  * deliberate one should not read as a broken suite.
  */
 function conflictedRebase(checkout: string, worktree: string): void {
-  // Spelled out rather than left to the machine's git config, which a fixture must not depend on.
-  const identity = ["-c", "user.email=t@example.com", "-c", "user.name=T"];
-
   writeFileSync(join(checkout, "file.txt"), "checkout\n");
   fixtureGit(["add", "file.txt"], checkout);
-  fixtureGit([...identity, "commit", "-q", "-m", "checkout side"], checkout);
+  fixtureGit([...IDENTITY, "commit", "-q", "-m", "checkout side"], checkout);
   writeFileSync(join(worktree, "file.txt"), "worktree\n");
   fixtureGit(["add", "file.txt"], worktree);
-  fixtureGit([...identity, "commit", "-q", "-m", "worktree side"], worktree);
+  fixtureGit([...IDENTITY, "commit", "-q", "-m", "worktree side"], worktree);
 
   try {
-    execFileSync("git", ["rebase", "--no-update-refs", "main"], {
+    execFileSync("git", [...IDENTITY, "rebase", "--no-update-refs", "main"], {
       cwd: worktree,
       env: FIXTURE_ENV,
       stdio: "pipe",

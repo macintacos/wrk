@@ -305,6 +305,9 @@ describe("headBranch", () => {
     // directory — the reason the lookup asks git for both paths rather than one.
     const stopped = makeConflictedRebase("--apply");
 
+    // As above: a rebase that finished or never started leaves HEAD attached, and the case
+    // would then pass on `currentBranch`'s answer without the fallback running at all.
+    expect(await currentBranch(stopped)).toBeNull();
     expect(await headBranch(stopped)).toBe("EXC-9/topic");
   });
 

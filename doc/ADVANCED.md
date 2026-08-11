@@ -430,14 +430,29 @@ worktrees:
 
 No single loaded run exceeded 402 ms. "At load average 18" is three other full test suites
 sharing the machine rather than the pickers' spinning burners, because that is what was
-running; it is the harsher number of the two.
+running; it is the harsher number of the two. Only the idle column ranks the shapes
+against each other — under that much contention the spread within one shape is wider than
+the difference between two, so the loaded column bounds the cost rather than ordering it.
 
-**The cost is `git`, not the module.** A process that imports `guard.ts` and does nothing
-measures the same 7 ms as one that imports nothing at all, so the whole figure is the two
+**Most of the cost is `git`, but the module graph is not free.** Medians of twenty against
+a process that imports nothing, on one machine at one moment — read the deltas, not the
+absolutes:
+
+| probe | median | over baseline |
+| --- | --- | --- |
+| imports nothing | 15.9 ms | — |
+| `./naming` | 16.9 ms | +1.0 ms |
+| `zod` | 24.4 ms | +8.5 ms |
+| `./repo` | 26.3 ms | +10.4 ms |
+| `./guard` | 27.3 ms | +11.4 ms |
+
+Roughly a quarter of the idle figure is loading the module, and
+**`zod` is three quarters of that** — reached through `./repo` → `./git`, where it parses
+the `worktree list --porcelain` records that this path never asks for. The rest is the two
 `rev-parse` probes that locate the session plus, only when a path actually crosses, the
-two branch lookups. All four run concurrently in pairs, and the two branch lookups are not
+two branch lookups. All four run concurrently in pairs, and the branch lookups are not
 paid at all unless the path crosses — which is why the ordinary edit, inside the session's
-own checkout, is the cheapest shape in the table.
+own checkout, is the cheapest shape idle.
 
 **The budget does not enforce "does not load the picker"; the import-closure case does.**
 That case walks `guard.ts`'s transitive imports and asserts the set of non-`node:`
