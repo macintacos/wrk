@@ -76,8 +76,9 @@ jobs. **stdout is the machine channel**: every answer a command produces goes th
 one JSON object per run. **stderr is the human channel**: progress, warnings and failure
 messages, whatever the run's outcome. `--help` and `--version` are the exceptions that
 prove it — a caller asking for either is a human, so both render on stdout and no envelope
-is involved. The two commands that take that back are `wrk wt` and `wrk pr`, whose stdout
-is a path being fed to `cd`; see [The cd protocol](#the-cd-protocol).
+is involved. `wrk wt` and `wrk pr` take the first of those back, their stdout being a path
+fed to `cd`; `--version` they cannot take back, because the root answers it whichever
+subcommand was named. See [The cd protocol](#the-cd-protocol) for both.
 
 A global `--json` flag puts a command that would otherwise print for a human onto the same
 envelope. The agent-facing commands are JSON either way, because their callers parse them
@@ -168,6 +169,16 @@ line `wt rm <worktree>` becomes `wrk wt --print-path rm <worktree>`: the teardow
 completion, prints nothing on stdout, and the emptiness guard below then reports the
 successful destructive run as a failure. Forwarding `rm` untouched is the whole fix, and
 it costs the picker nothing — `rm` is not a worktree anyone can `cd` to.
+
+**`--version` is the same shape and is not guarded**, deliberately. The root answers it
+whichever subcommand was named — that is commander, not a choice `wrk` makes — so
+`wt --version` reaches the function, misses the `rm` arm, and becomes
+`wrk wt --print-path --version`, which prints the version where the shim expects a path
+and leaves you at `cd -- 0.0.0`. Unlike the `rm` case nothing destructive has run and the
+error is immediate and loud, so the arm it would take is not worth the line;
+`wt rm --version` is forwarded and simply prints the version. `PICKER_HELP` in
+[packages/wrk/src/cli.ts](../packages/wrk/src/cli.ts) records why closing this properly
+costs more than it saves.
 
 Both of the remaining guards earn their line. **Forwarding the status** is what keeps a
 cancelled pick distinguishable at the call site: fish propagates a command substitution's

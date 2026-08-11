@@ -77,15 +77,18 @@ const { version: VERSION } = JSON.parse(
  * **It reaches `--help` and cannot reach `--version`**, which is a property of how commander
  * registers each rather than a choice made here. The help option is created lazily, so `-h`
  * after a picker's name is unknown to the root, falls through to the picker, and is answered
- * through *its* output configuration — this one. {@link VERSION}'s option is registered eagerly
- * on the root, and its listener writes through the **root's** configuration whichever
- * subcommand was named, so `wrk wt --print-path --version` really does put `0.0.0` on stdout
- * for the shim to `cd` into. The alternatives are worse than the hazard: intercepting argv
- * before `parseAsync` means re-deciding which command was named outside commander, and
+ * through *its* output configuration — this one, or {@link HUMAN_HELP} where `wt rm` has taken
+ * it back. {@link VERSION}'s option is registered eagerly on the root, and its listener writes
+ * through the **root's** configuration whichever subcommand was named, so no configuration
+ * below the root can route it and `wrk wt --print-path --version` really does put `0.0.0` on
+ * stdout for the shim to `cd` into. The alternatives are worse than the hazard: intercepting
+ * argv before `parseAsync` means re-deciding which command was named outside commander, and
  * `enablePositionalOptions` — the setting that would confine the flag to the root — is the one
  * this module's header declines by name, and would unclaim `--json` after a subcommand. So it
  * is documented rather than closed: the failing invocation is a picker asked for the tool's
- * version, and what it costs is a loud `cd` error rather than a wrong directory.
+ * version, and what it costs is a loud `cd` error rather than a wrong directory. It stops at
+ * the two commands whose stdout is a destination — `wt rm` inherits the same root-answered
+ * flag and is unharmed by it, its stdout being a report rather than a path.
  *
  * The width has to move with the text: commander reads it from `process.stdout` by default,
  * which under the shim is a pipe, so help would wrap at 80 columns on a terminal twice that
