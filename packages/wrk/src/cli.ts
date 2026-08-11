@@ -30,10 +30,11 @@ import { Command } from "@commander-js/extra-typings";
 import { renderConversion, resolveConversion } from "./convert";
 import { resolveRepo } from "./discover";
 import { Cancelled, Refusal } from "./errors";
-import { emit, emitLine, note, reportFailure } from "./output";
+import { emit, emitLine, note, PREFIX, reportFailure } from "./output";
 import { preflight } from "./preflight";
 import { choosePullRequest } from "./prpick";
 import { repoSetup } from "./setup";
+import { teardown } from "./teardown";
 import { createWorktree } from "./worktree";
 import { chooseWorktree } from "./wt";
 
@@ -59,6 +60,25 @@ import { chooseWorktree } from "./wt";
 const PICKER_HELP = {
   writeOut: (text: string) => process.stderr.write(text),
   getOutHelpWidth: () => process.stderr.columns ?? 80,
+};
+
+/**
+ * Commander's own help configuration, spelled out so a subcommand can take it back.
+ *
+ * {@link PICKER_HELP} is inherited by anything registered under a picker — commander copies the
+ * output configuration into each subcommand as it is created — and `wt rm` is the one command
+ * that is under a picker without being one. Restating the defaults is the whole mechanism:
+ * there is no "inherit nothing" to ask for.
+ *
+ * **That inheritance is by reference, and this is only safe because `configureOutput` rebinds
+ * rather than mutates.** `copyInheritedSettings` assigns the parent's configuration object
+ * itself, so applying this one in place would flip `wt` and `pr` to stdout as a side effect;
+ * commander spreads into a fresh object instead, which keeps the write local to the command it
+ * was called on. Worth re-checking if the commander major ever moves.
+ */
+const HUMAN_HELP = {
+  writeOut: (text: string) => process.stdout.write(text),
+  getOutHelpWidth: () => process.stdout.columns ?? 80,
 };
 
 /**
@@ -101,6 +121,22 @@ const PICKER_HELP = {
  * path to print. That is [`./prpick`](./prpick)'s to own; what this tree sees is the same
  * `Chosen | null` either way.
  *
+ * `wt rm` hangs off `wt` and takes the *opposite* side of every one of those decisions, which
+ * is why it reads nothing like its parent. Its stdout is not a destination, so it consults
+ * {@link wantsJson} like `repo convert` — the human line on stderr, the envelope only when
+ * asked — and it hands its help back to stdout, undoing the {@link PICKER_HELP} that reaches
+ * it through commander's `copyInheritedSettings`. That is not tidiness: `output.ts`'s contract
+ * is that `--help` belongs on stdout with `wt` and `pr` the two named exceptions, and a third
+ * exception inherited by accident is the shape that makes a written contract stop being true.
+ * Commander runs a parent's action when no subcommand matches, so bare `wrk wt` is still the
+ * picker.
+ *
+ * It is also the one command here that does **not** go through `resolveRepo`. Orphan recovery
+ * answers with *some* container when the cwd is in none, and a destructive command must act on
+ * the repository the caller is standing in or on none at all — while the case that recovery
+ * exists for, a cwd whose directory is gone, is one this command refuses to create and one no
+ * runtime can start in anyway.
+ *
  * `--branch` is a `requiredOption` rather than validated in the action, which puts its
  * absence on the route this module's own `main` documents as already correct: commander
  * writes its message to stderr and exits `1` itself, before the action runs and therefore
@@ -134,7 +170,9 @@ export function buildProgram(): Command {
       else note(recipe);
     });
 
-  program
+  // Bound rather than chained, for the reason `agent` below is: `.command()` answers the
+  // command it just made, so `rm` would have no handle to hang off otherwise.
+  const wt = program
     .command("wt")
     .description("Pick one of this repository's worktrees and say where to go")
     .option("--print-path", "Print the chosen path alone, for the cd shim")
@@ -153,6 +191,22 @@ export function buildProgram(): Command {
 
       if (printPath === true) emitLine(chosen.worktree_path);
       else emit(chosen);
+    });
+
+  wt.command("rm")
+    .description("Remove a worktree, resync the default-branch checkout, and delete its branch")
+    .argument("<worktree>", "The worktree to retire: a path, or the branch it holds")
+    .option("--force", "Remove it even with uncommitted changes in it")
+    .configureOutput(HUMAN_HELP)
+    .action(async (worktree: string, { force }, command) => {
+      const torn = await teardown(process.cwd(), worktree, { force });
+      if (wantsJson(command)) {
+        emit(torn);
+        return;
+      }
+
+      const deleted = torn.branch === null ? "" : ` and deleted ${torn.branch}`;
+      note(`${PREFIX}removed ${torn.worktree_path}${deleted}; ${torn.checkout} is synced`);
     });
 
   program

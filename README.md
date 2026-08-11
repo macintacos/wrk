@@ -57,6 +57,7 @@ flags.
 | Command                      | What it does                                                   |
 | ---------------------------- | -------------------------------------------------------------- |
 | `wrk wt`                     | Picks one of this repository's worktrees and says where to go.  |
+| `wrk wt rm <worktree>`       | Retires a worktree: removes it, resyncs, deletes its branch.    |
 | `wrk pr`                     | Picks an open pull request and says where to go, checking it out. |
 | `wrk repo convert`           | Prints, and never runs, the bare-repo conversion recipe.        |
 | `wrk agent repo-setup <url>` | Clones a repository into the bare-repo layout, in the cwd.      |
@@ -75,6 +76,15 @@ worktree for whichever you choose — creating it and checking the pull request 
 is not one already. Both filter as you type. No child process can move the shell that
 launched it, so they print where to go and a small shell function does the `cd` —
 [doc/ADVANCED.md](doc/ADVANCED.md#the-cd-protocol) has both shims and the rest of it.
+
+`wrk wt rm` is the other end of a worktree's life, and the one command here that deletes
+things. It takes the four steps a merged branch's cleanup has always been — leave the
+worktree, remove it, bring the default-branch checkout up to date, delete the branch — and
+runs them in that order, because a branch still checked out somewhere cannot be deleted.
+It **will not** remove the worktree you are standing in, and it deletes exactly the one
+branch that worktree held, never the rest of the issue's family. See
+[doc/ADVANCED.md](doc/ADVANCED.md#retiring-a-worktree) for what it refuses and what it
+discards.
 
 ## Configuration
 
