@@ -69,6 +69,12 @@ const PICKER_HELP = {
  * output configuration into each subcommand as it is created — and `wt rm` is the one command
  * that is under a picker without being one. Restating the defaults is the whole mechanism:
  * there is no "inherit nothing" to ask for.
+ *
+ * **That inheritance is by reference, and this is only safe because `configureOutput` rebinds
+ * rather than mutates.** `copyInheritedSettings` assigns the parent's configuration object
+ * itself, so applying this one in place would flip `wt` and `pr` to stdout as a side effect;
+ * commander spreads into a fresh object instead, which keeps the write local to the command it
+ * was called on. Worth re-checking if the commander major ever moves.
  */
 const HUMAN_HELP = {
   writeOut: (text: string) => process.stdout.write(text),
