@@ -124,8 +124,11 @@ const CONVERSION_REFERENCE = "repo-setup";
  * this is not git's lock. The container is safe to write into precisely because it is not a
  * work tree — {@link isBareLayout} has already answered `true` before the sync is reached —
  * so the directory can never surface as an untracked file in some checkout's `git status`.
+ *
+ * Exported for [`./teardown`](./teardown), the sync's second caller: two callers naming
+ * different locks would serialise nothing.
  */
-const SYNC_LOCK = ".wrk-sync.lock";
+export const SYNC_LOCK = ".wrk-sync.lock";
 
 /**
  * One preflight run's answer, rendered as the single JSON object on stdout.
@@ -235,6 +238,11 @@ function report(
  * The three mutations go through {@link gitOk} rather than gaining wrappers of their own, per
  * `git.ts`'s rule that one caller does not earn a wrapper.
  *
+ * Exported for [`./teardown`](./teardown), whose third step is this one — the resync a
+ * worktree's removal leaves owing. It stays here rather than moving somewhere neutral because
+ * this module's header is where the sync's collisions and its lock are argued; a caller takes
+ * {@link SYNC_LOCK} with it, since the sync is only serialised if every caller holds it.
+ *
  * @param cwd - The checkout to sync.
  * @param defaultBranch - The branch to end up on, already resolved.
  * @param from - The branch currently checked out, so the switch can be skipped when it is
@@ -242,7 +250,7 @@ function report(
  * @throws If a configured remote cannot be reached, the switch fails, or the pull is not a
  *   fast-forward.
  */
-async function syncDefaultBranch(
+export async function syncDefaultBranch(
   cwd: string,
   defaultBranch: string,
   from: string | null,
