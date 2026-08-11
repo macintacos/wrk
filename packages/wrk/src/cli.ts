@@ -25,6 +25,8 @@
  * @packageDocumentation
  */
 
+import { readFileSync } from "node:fs";
+
 import { Command } from "@commander-js/extra-typings";
 
 import { renderConversion, resolveConversion } from "./convert";
@@ -37,6 +39,24 @@ import { repoSetup } from "./setup";
 import { teardown } from "./teardown";
 import { createWorktree } from "./worktree";
 import { chooseWorktree } from "./wt";
+
+/**
+ * What `--version` reports: the `version` field of this package's own manifest.
+ *
+ * Read at runtime rather than imported, and the path holds in both places this file lives:
+ * `package.json` sits one directory above `src/` in the repository and in the published
+ * tarball alike. A JSON import would need `resolveJsonModule` turned on across the workspace
+ * to say the same thing, and `readFileSync` with a `URL` reads identically under Node and Bun
+ * — which is `proc.ts`'s reason for `node:child_process`, applied here.
+ *
+ * The cast is deliberate rather than a schema: this is the package describing itself, not
+ * input from outside it, and a manifest with no `version` is a broken build that nothing
+ * `wrk` could do about at runtime. `test/cli.test.ts` reads the same field independently and
+ * compares, so the two cannot drift.
+ */
+const { version: VERSION } = JSON.parse(
+  readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+) as { version: string };
 
 /**
  * The output configuration a picker command is registered with, and no other command is.
@@ -148,6 +168,7 @@ export function buildProgram(): Command {
   const program = new Command()
     .name("wrk")
     .description("Worktree, PR-stack and agent-workflow tooling.")
+    .version(VERSION)
     .option("--json", "Emit machine-readable JSON on stdout instead of human output");
 
   program
