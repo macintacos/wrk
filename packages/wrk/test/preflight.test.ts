@@ -82,10 +82,31 @@ function tempDir(): string {
   return dir;
 }
 
+/**
+ * Turns off git's automatic maintenance in a fixture repository.
+ *
+ * `git maintenance run --auto` fires behind ordinary commands and holds
+ * `.git/objects/maintenance.lock` for as long as it runs — which {@link manifest} lists on
+ * its way past and then `lstat`s once it has gone, failing a byte-identical case with
+ * `ENOENT` over a mutation preflight never made. Whether it fires at all depends on the
+ * machine's own git config and on how much loose work the fixture happens to have, so the
+ * cases below are otherwise red on some machines and green on others.
+ *
+ * It goes in the repository's **own config** rather than in {@link FIXTURE_ENV}, because
+ * the git processes racing the walk are the ones `preflight` spawns — those inherit this
+ * process's environment, not the fixtures'. Both keys, because `gc.auto` governs the older
+ * path and `maintenance.auto` the one that names the lock.
+ */
+function quiesce(gitDir: string): void {
+  fixtureGit(["config", "maintenance.auto", "false"], gitDir);
+  fixtureGit(["config", "gc.auto", "0"], gitDir);
+}
+
 /** A plain, non-bare repository on `branch`, carrying one committed file. */
 function makeRepo(branch = "main"): string {
   const dir = tempDir();
   fixtureGit(["init", "-q", "-b", branch, dir]);
+  quiesce(dir);
   writeFileSync(join(dir, "tracked.txt"), "before\n");
   fixtureGit(["add", "tracked.txt"], dir);
   fixtureGit([...AUTHOR, "commit", "-q", "-m", "init"], dir);
@@ -96,6 +117,7 @@ function makeRepo(branch = "main"): string {
 function makeContainer(seed: string): string {
   const dir = tempDir();
   fixtureGit(["clone", "-q", "--bare", seed, join(dir, ".bare")]);
+  quiesce(join(dir, ".bare"));
   writeFileSync(join(dir, ".git"), "gitdir: ./.bare\n");
   return dir;
 }

@@ -2,8 +2,9 @@
  * Where `wrk` reads its own settings.
  *
  * Three layers, lowest first: {@link DEFAULTS}, then a machine-wide file at
- * `$XDG_CONFIG_HOME/wrk/config.toml`, then a `wrk` namespace inside the repository
- * container's `.project-meta.json`. {@link loadConfig} folds them into one
+ * `$XDG_CONFIG_HOME/wrk/config.toml`, then the `wrk` namespace inside the repository
+ * container's `.project-meta.json` — read through [`./meta`](./meta), which owns that file
+ * for every namespace in it rather than only this one. {@link loadConfig} folds them into one
  * {@link WrkConfig} and never reports a problem with any of them — a config that is
  * absent, unreadable, unparseable, or simply carries none of the keys leaves the layers
  * below it standing.
@@ -70,6 +71,8 @@ import { isAbsolute, join } from "node:path";
 import { parse as parseToml } from "smol-toml";
 import { z } from "zod";
 
+import { readNamespace } from "./meta";
+
 /**
  * Directory under the XDG config root, and the key the per-repo settings hang off.
  *
@@ -80,9 +83,6 @@ const NAMESPACE = "wrk";
 
 /** The machine-wide config file's name within its namespaced directory. */
 const GLOBAL_FILENAME = "config.toml";
-
-/** The container-level file the per-repo layer is read from. Shared with other tools. */
-const PROJECT_META = ".project-meta.json";
 
 /**
  * Expands a leading `~`, and only a leading `~`.
@@ -286,15 +286,6 @@ function take<S extends z.ZodType>(schema: S, value: unknown): z.infer<S> | null
 }
 
 /**
- * The `wrk` namespace of a `.project-meta.json`, and nothing else in the document.
- *
- * `z.object` strips every key it is not told about, so the neighbouring tool's top-level
- * `search` is discarded by the parse itself — it is not merely stepped around, it never
- * reaches the fold. That is the whole guarantee this layer owes a file `wrk` is a guest in.
- */
-const PROJECT_NAMESPACE = z.object({ [NAMESPACE]: LAYER }).transform((meta) => meta[NAMESPACE]);
-
-/**
  * Resolves the machine-wide config file's path.
  *
  * The two rejections mirror `cache.ts`'s `defaultRoot`, for the same two reasons. An
@@ -319,36 +310,25 @@ export function globalConfigPath(): string {
 }
 
 /**
- * Reads one document through `parse`, answering `null` for every way that can fail.
+ * Reads the machine-wide TOML document, answering `null` for every way that can fail.
  *
  * Missing, unreadable, a directory, or rejected by the parser all collapse to the same
  * answer, because the caller does the same thing with each: fall through to the layer
  * below. Distinguishing them would only be useful for a diagnostic this module is
- * specified not to emit. Whether what came back is usable is the caller's schema's
- * question, not this function's — `null` fails every one of them anyway.
+ * specified not to emit.
  *
- * `parse` is a parameter because the two layers are in two formats and everything else
- * about reading them is identical.
+ * The per-repo layer's equivalent is {@link readNamespace}, which owes the same
+ * degradation to a file in a different format — see [`./meta`](./meta).
  */
-async function readDocument(path: string, parse: (text: string) => unknown): Promise<unknown> {
+async function readGlobalLayer(path: string): Promise<Layer | null> {
   const text = await readFile(path, "utf8").catch(() => null);
   if (text === null) return null;
 
   try {
-    return parse(text);
+    return take(LAYER, parseToml(text));
   } catch {
     return null;
   }
-}
-
-/** Reads the machine-wide TOML document. */
-async function readGlobalLayer(path: string): Promise<Layer | null> {
-  return take(LAYER, await readDocument(path, parseToml));
-}
-
-/** Reads the `wrk` namespace out of a container's `.project-meta.json`. */
-async function readProjectLayer(container: string): Promise<Layer | null> {
-  return take(PROJECT_NAMESPACE, await readDocument(join(container, PROJECT_META), JSON.parse));
 }
 
 /** One named section of a layer, or `null` when it is absent or is not a table. */
@@ -415,7 +395,7 @@ export async function loadConfig(sources: ConfigSources = {}): Promise<WrkConfig
 
   const [globalLayer, projectLayer] = await Promise.all([
     readGlobalLayer(globalPath),
-    container ? readProjectLayer(container) : null,
+    container ? readNamespace(container, NAMESPACE) : null,
   ]);
 
   // Every fold below applies the layers in this order, so a later one wins. A third layer
