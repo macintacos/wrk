@@ -203,6 +203,51 @@ all of it, and a row chosen before that round trip finishes waits for it on the 
 Without it the answer is the usual envelope, `{worktree_path, branch}`, with `branch` null
 on a detached HEAD.
 
+### Retiring a worktree
+
+`wrk wt rm` is the counterpart to `wrk agent create`: it takes a worktree back out again,
+and takes its branch with it.
+
+```bash
+wrk wt rm <worktree> [--force] [--json]
+```
+
+`<worktree>` is either a path — absolute, or relative to where you are — or the branch the
+worktree holds, which is what `wrk wt` shows as a row's identity and so the form you are
+most likely to have in mind.
+
+**Four steps, in an order that is the whole point.** Leave the worktree, remove it, resync
+the default-branch checkout, delete the branch. The resync sits third rather than last
+because a branch that is still checked out somewhere cannot be deleted; it is also what
+stops the next run branching from a stale base, since a merged pull request's commits are
+not in that checkout until it pulls.
+
+**"Leave the worktree" is about your shell, not about `wrk`.** No child process can move
+the shell that launched it, so the command cannot take you out of a directory it is about
+to delete — it refuses instead, and names the checkout to `cd` to. Standing anywhere else
+in the repository is fine, including in another worktree.
+
+Two other refusals, each exiting `1` with a `wrk:` line and an untouched repository: the
+default-branch checkout is not something this removes, and a `<worktree>` matching neither
+a path nor a branch is not guessed at.
+
+**The branch delete is the only one, and it is a `-D`.** Removing a worktree never removes
+the branch that was checked out in it, so without this step the branch would outlive it
+for good; and exactly that branch goes, never the rest of an `EXC-123/*` family, whose
+worktrees may still be live. Force-delete rather than `-d` because the state this command
+exists for is a merged pull request, whose local tip is routinely unreachable from the
+default branch after a squash or rebase merge — which `-d` would refuse.
+**Commits that exist only on that branch are gone with it.** A detached worktree held no
+branch, so nothing is deleted for one.
+
+`--force` governs the *removal* alone and never the branch. Without it a worktree holding
+uncommitted changes stops the run, git's own complaint and all, so you can look at the
+diff before deciding; with it, that work is discarded.
+
+The answer is a `wrk:` line on stderr. `--json` puts it on stdout as
+`{worktree_path, branch, checkout}` instead — what was removed, what was deleted, and
+where to go now — with `branch` null for a detached worktree.
+
 ## The pull-request picker
 
 `wrk pr` lists the repository's open pull requests and answers where to go for the one you

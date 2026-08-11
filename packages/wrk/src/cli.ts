@@ -30,10 +30,11 @@ import { Command } from "@commander-js/extra-typings";
 import { renderConversion, resolveConversion } from "./convert";
 import { resolveRepo } from "./discover";
 import { Cancelled, Refusal } from "./errors";
-import { emit, emitLine, note, reportFailure } from "./output";
+import { emit, emitLine, note, PREFIX, reportFailure } from "./output";
 import { preflight } from "./preflight";
 import { choosePullRequest } from "./prpick";
 import { repoSetup } from "./setup";
+import { teardown } from "./teardown";
 import { createWorktree } from "./worktree";
 import { chooseWorktree } from "./wt";
 
@@ -101,6 +102,14 @@ const PICKER_HELP = {
  * path to print. That is [`./prpick`](./prpick)'s to own; what this tree sees is the same
  * `Chosen | null` either way.
  *
+ * `wt rm` hangs off `wt` and takes the *opposite* side of every one of those decisions, which
+ * is why it reads nothing like its parent. It is the one command in the group whose stdout is
+ * not a destination, so it consults {@link wantsJson} like `repo convert` — the human line on
+ * stderr, the envelope only when asked. Commander runs a parent's action when no subcommand
+ * matches, so bare `wrk wt` is still the picker. One inheritance is worth knowing rather than
+ * overriding: {@link PICKER_HELP} reaches here through `copyInheritedSettings`, so
+ * `wrk wt rm --help` renders on stderr with the rest of the group.
+ *
  * `--branch` is a `requiredOption` rather than validated in the action, which puts its
  * absence on the route this module's own `main` documents as already correct: commander
  * writes its message to stderr and exits `1` itself, before the action runs and therefore
@@ -134,7 +143,9 @@ export function buildProgram(): Command {
       else note(recipe);
     });
 
-  program
+  // Bound rather than chained, for the reason `agent` below is: `.command()` answers the
+  // command it just made, so `rm` would have no handle to hang off otherwise.
+  const wt = program
     .command("wt")
     .description("Pick one of this repository's worktrees and say where to go")
     .option("--print-path", "Print the chosen path alone, for the cd shim")
@@ -153,6 +164,21 @@ export function buildProgram(): Command {
 
       if (printPath === true) emitLine(chosen.worktree_path);
       else emit(chosen);
+    });
+
+  wt.command("rm")
+    .description("Remove a worktree, resync the default-branch checkout, and delete its branch")
+    .argument("<worktree>", "The worktree to retire: a path, or the branch it holds")
+    .option("--force", "Remove it even with uncommitted changes in it")
+    .action(async (worktree: string, { force }, command) => {
+      const torn = await teardown(process.cwd(), worktree, { force });
+      if (wantsJson(command)) emit(torn);
+      else
+        note(
+          `${PREFIX}removed ${torn.worktree_path}` +
+            `${torn.branch === null ? "" : ` and deleted ${torn.branch}`}; ` +
+            `${torn.checkout} is synced`,
+        );
     });
 
   program

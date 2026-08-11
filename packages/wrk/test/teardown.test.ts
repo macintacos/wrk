@@ -22,7 +22,15 @@ import { join } from "node:path";
 
 import { CommandFailed, Refusal } from "../src/errors";
 import { teardown } from "../src/teardown";
-import { addRunWorktree, cleanupFixtures, dirty, fixtureGit, makeContainer } from "./fixtures/repo";
+import {
+  addRunWorktree,
+  childEnv,
+  cleanupFixtures,
+  dirty,
+  fixtureGit,
+  makeContainer,
+  runCli,
+} from "./fixtures/repo";
 
 afterAll(cleanupFixtures);
 
@@ -179,5 +187,60 @@ describe("teardown", () => {
     expect(torn.branch).toBeNull();
     expect(existsSync(detached)).toBe(false);
     expect(branches(checkout)).toEqual(["main"]);
+  });
+});
+
+describe("wrk wt rm", () => {
+  test("puts the envelope on stdout under --json, and nothing else there", async () => {
+    const { container, checkout } = makeContainer();
+    const worktree = addRunWorktree(container, "EXC-1/add-thing");
+
+    const result = await runCli(["wt", "rm", "EXC-1/add-thing", "--json"], checkout, childEnv());
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      worktree_path: worktree,
+      branch: "EXC-1/add-thing",
+      checkout,
+    });
+  });
+
+  test("says what it did on stderr, leaving stdout empty, without --json", async () => {
+    const { container, checkout } = makeContainer();
+    const worktree = addRunWorktree(container, "EXC-1/add-thing");
+
+    const result = await runCli(["wt", "rm", "EXC-1/add-thing"], checkout, childEnv());
+
+    expect(result.code).toBe(0);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain(`wrk: removed ${worktree}`);
+    expect(result.stderr).toContain("deleted EXC-1/add-thing");
+  });
+
+  test("exits 1 on a refusal, with nothing on stdout", async () => {
+    const { container } = makeContainer();
+    const worktree = addRunWorktree(container, "EXC-1/add-thing");
+
+    const result = await runCli(["wt", "rm", "EXC-1/add-thing"], worktree, childEnv());
+
+    expect(result.code).toBe(1);
+    expect(result.stdout).toBe("");
+    expect(result.stderr).toContain("wrk: cannot remove");
+    expect(existsSync(worktree)).toBe(true);
+  });
+
+  test("leaves `wrk wt` itself still answering with a worktree", async () => {
+    // The subcommand must not swallow the group's own action: `wt` with nothing after it is
+    // still the picker, which with a single candidate answers without drawing anything.
+    const { container, checkout } = makeContainer();
+    const worktree = addRunWorktree(container, "EXC-1/add-thing");
+
+    const result = await runCli(["wt"], checkout, childEnv());
+
+    expect(result.code).toBe(0);
+    expect(JSON.parse(result.stdout)).toEqual({
+      worktree_path: worktree,
+      branch: "EXC-1/add-thing",
+    });
   });
 });
