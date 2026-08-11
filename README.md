@@ -47,10 +47,10 @@ repository root:
 bun packages/wrk/src/cli.ts --help
 ```
 
-That prints the usage block: the global `--json` flag, the `wt` and `pr` pickers, and the
-two command groups, `repo` and `agent`. `--help` works at every level, so
-`bun packages/wrk/src/cli.ts agent create --help` is the quickest way to see one command's
-flags.
+That prints the usage block: the global `--json` flag, the `wt` and `pr` pickers,
+`doctor`, and the two command groups, `repo` and `agent`. `--help` works at every level,
+so `bun packages/wrk/src/cli.ts agent create --help` is the quickest way to see one
+command's flags.
 
 ## The commands
 
@@ -59,6 +59,8 @@ flags.
 | `wrk wt`                     | Picks one of this repository's worktrees and says where to go.  |
 | `wrk wt rm <worktree>`       | Retires a worktree: removes it, resyncs, deletes its branch.    |
 | `wrk pr`                     | Picks an open pull request and says where to go, checking it out. |
+| `wrk doctor`                 | Checks that `git` and `gh` are installed and new enough.        |
+| `wrk --version`              | Prints the version, as the package manifest declares it.        |
 | `wrk repo convert`           | Prints, and never runs, the bare-repo conversion recipe.        |
 | `wrk agent repo-setup <url>` | Clones a repository into the bare-repo layout, in the cwd.      |
 | `wrk agent preflight`        | Says whether an agent may cut a worktree here, and why not.     |
