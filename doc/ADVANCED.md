@@ -407,6 +407,60 @@ because the preview pane fetches on the first frame. The wait moved from in fron
 draw to after the choice; the total is the same, and it is the trade both pickers are
 built on.
 
+## Edit-guard latency
+
+The cross-checkout edit decision
+([`packages/wrk/src/guard.ts`](../packages/wrk/src/guard.ts)) is built to be called from a
+guard that fires on **every** file edit and write, so its budget is a different kind of
+claim from the pickers': **one verdict within a second of process start**, enforced by
+[`packages/wrk/test/guard.test.ts`](../packages/wrk/test/guard.test.ts). The clock starts
+before `bun` does, so the runtime's cold start, the module graph and every `git` call are
+inside the number.
+
+A second is the ceiling the suite fails at, not the cost. Measured on Apple silicon,
+medians of five runs, on a container holding a default-branch checkout and two run
+worktrees:
+
+| | idle | at load average 18 |
+| --- | --- | --- |
+| sanctioned crossing | 39 ms | 272 ms |
+| inside the session's own checkout | 34 ms | 214 ms |
+| blocked crossing | 41 ms | 47 ms |
+| outside the container | 35 ms | 34 ms |
+
+No single loaded run exceeded 402 ms. "At load average 18" is three other full test suites
+sharing the machine rather than the pickers' spinning burners, because that is what was
+running; it is the harsher number of the two. Only the idle column ranks the shapes
+against each other — under that much contention the spread within one shape is wider than
+the difference between two, so the loaded column bounds the cost rather than ordering it.
+
+**Most of the cost is `git`, but the module graph is not free.** Medians of twenty against
+a process that imports nothing, on one machine at one moment — read the deltas, not the
+absolutes:
+
+| probe | median | over baseline |
+| --- | --- | --- |
+| imports nothing | 15.9 ms | — |
+| `./naming` | 16.9 ms | +1.0 ms |
+| `zod` | 24.4 ms | +8.5 ms |
+| `./repo` | 26.3 ms | +10.4 ms |
+| `./guard` | 27.3 ms | +11.4 ms |
+
+Roughly a quarter of the idle figure is loading the module, and
+**`zod` is three quarters of that** — reached through `./repo` → `./git`, where it parses
+the `worktree list --porcelain` records that this path never asks for. The rest is the two
+`rev-parse` probes that locate the session plus, only when a path actually crosses, the
+two branch lookups. All four run concurrently in pairs, and the branch lookups are not
+paid at all unless the path crosses — which is why the ordinary edit, inside the session's
+own checkout, is the cheapest shape idle.
+
+**The budget does not enforce "does not load the picker"; the import-closure case does.**
+That case walks `guard.ts`'s transitive imports and asserts the set of non-`node:`
+specifiers is exactly `zod`, which arrives through `./repo` → `./git`. It fails in under
+two milliseconds and cannot be blurred by machine load, which a timing case can: a probe
+importing the picker still medianed 506 ms under the load above, comfortably inside a
+one-second budget. The two cases split the criterion because one of them is exact.
+
 ## Agent commands
 
 `wrk agent repo-setup` is what runs when the repository is not on disk at all. It clones

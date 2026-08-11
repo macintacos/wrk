@@ -36,6 +36,8 @@
  * @packageDocumentation
  */
 
+import { readFile } from "node:fs/promises";
+
 import { z } from "zod";
 
 import { CommandFailed } from "./errors";
@@ -207,6 +209,50 @@ export async function currentBranch(cwd?: string): Promise<string | null> {
   const ref = await symbolicRef("HEAD", cwd);
   if (ref === null || !ref.startsWith(BRANCH_PREFIX)) return null;
   return ref.slice(BRANCH_PREFIX.length);
+}
+
+/**
+ * The files git records the rebasing branch in, one per backend.
+ *
+ * Both are asked for, because which one exists is a property of how the rebase was started:
+ * `rebase-merge/` is the merge and interactive backends, `rebase-apply/` the apply backend
+ * (`git rebase --apply`, and `git am`). Neither is read directly — they are resolved through
+ * `--git-path` so a linked worktree's *own* git directory answers, rather than the shared one
+ * every checkout in the container has in common.
+ */
+const REBASE_HEAD_NAMES = ["rebase-merge/head-name", "rebase-apply/head-name"] as const;
+
+/**
+ * The branch checked out in `cwd`, seeing through a rebase in progress.
+ *
+ * {@link currentBranch}'s answer whenever there is one, and otherwise the branch a stopped
+ * rebase is rebasing. `git rebase` detaches HEAD for its duration, so a worktree stopped on a
+ * conflict stops naming its branch precisely when it has to be edited by hand to resolve that
+ * conflict — and anything keyed off the branch, an edit guard above all, stops recognising it.
+ * Cherry-pick, revert and merge leave HEAD attached and never reach the fallback.
+ *
+ * `null` still means what it means on {@link currentBranch}: a detached HEAD that is not
+ * mid-rebase, or no repository. A rebase started *from* a detached HEAD records the literal
+ * `detached HEAD` rather than a ref, which is not a branch name and answers `null` too.
+ *
+ * @param cwd - Directory to inspect. Defaults to this process's cwd.
+ */
+export async function headBranch(cwd?: string): Promise<string | null> {
+  const attached = await currentBranch(cwd);
+  if (attached !== null) return attached;
+
+  const paths = await revParse(
+    ["--path-format=absolute", ...REBASE_HEAD_NAMES.flatMap((name) => ["--git-path", name])],
+    cwd,
+  );
+  // Read together rather than in turn: at most one exists, so trying them in order would
+  // serialise a miss in front of the hit for no gain.
+  const contents = await Promise.all(
+    lines(paths ?? "").map((path) => readFile(path, "utf8").catch(() => null)),
+  );
+  const ref = contents.find((text) => text !== null)?.trim();
+
+  return ref?.startsWith(BRANCH_PREFIX) === true ? ref.slice(BRANCH_PREFIX.length) : null;
 }
 
 /**

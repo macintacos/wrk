@@ -24,6 +24,7 @@ import {
   git,
   gitCommonDir,
   gitOk,
+  headBranch,
   isInsideWorkTree,
   listWorktrees,
   parseWorktree,
@@ -242,6 +243,83 @@ describe("currentBranch", () => {
 
   test("returns null outside a repository", async () => {
     expect(await currentBranch(notARepo)).toBeNull();
+  });
+});
+
+/**
+ * A worktree of `repo` stopped mid-rebase on a conflict, on branch `EXC-9/topic`.
+ *
+ * The conflict is the point: a rebase that applies cleanly finishes and re-attaches HEAD,
+ * leaving nothing for {@link headBranch} to recover. Both commits touch the same line of the
+ * same file from a shared parent, which is the smallest thing git refuses to merge.
+ *
+ * @param backend - `--merge` writes `rebase-merge/head-name`, `--apply` writes
+ *   `rebase-apply/head-name`. Both are real paths in git and both are read back.
+ * @returns The worktree's root, with the rebase still in progress.
+ */
+function makeConflictedRebase(backend: "--merge" | "--apply"): string {
+  const base = makeRepo();
+  writeFileSync(join(base, "file.txt"), "base\n");
+  fixtureGit(["add", "file.txt"], base);
+  fixtureGit([...IDENTITY, "commit", "-q", "-m", "base"], base);
+
+  const topic = join(tempDir(), "topic");
+  fixtureGit(["worktree", "add", "-q", "-b", "EXC-9/topic", topic, "HEAD"], base);
+  writeFileSync(join(base, "file.txt"), "main\n");
+  fixtureGit([...IDENTITY, "commit", "-q", "-am", "main side"], base);
+  writeFileSync(join(topic, "file.txt"), "topic\n");
+  fixtureGit([...IDENTITY, "commit", "-q", "-am", "topic side"], topic);
+
+  // Exits nonzero on the conflict, which is the state being built rather than a failure, and
+  // says so at length on stderr — piped so a deliberate conflict does not read as a broken
+  // suite. `--no-update-refs` because the apply backend refuses outright when the setting is
+  // on, and a refused rebase leaves HEAD attached, which would pass this case vacuously.
+  try {
+    execFileSync("git", [...IDENTITY, "rebase", "--no-update-refs", backend, "main"], {
+      cwd: topic,
+      env: FIXTURE_ENV,
+      stdio: "pipe",
+    });
+  } catch {
+    /* expected: the rebase stops on the conflict */
+  }
+  return topic;
+}
+
+describe("headBranch", () => {
+  test("returns the checked-out branch when HEAD is attached", async () => {
+    expect(await headBranch(repo)).toBe("main");
+  });
+
+  test("recovers the branch being rebased under the merge backend", async () => {
+    // `git rebase` detaches HEAD for its duration, so `currentBranch` stops naming the
+    // branch exactly when the model has to edit the worktree to resolve the conflict.
+    const stopped = makeConflictedRebase("--merge");
+
+    expect(await currentBranch(stopped)).toBeNull();
+    expect(await headBranch(stopped)).toBe("EXC-9/topic");
+  });
+
+  test("recovers the branch being rebased under the apply backend", async () => {
+    // The other of git's two rebase backends, which records the same fact under a different
+    // directory — the reason the lookup asks git for both paths rather than one.
+    const stopped = makeConflictedRebase("--apply");
+
+    // As above: a rebase that finished or never started leaves HEAD attached, and the case
+    // would then pass on `currentBranch`'s answer without the fallback running at all.
+    expect(await currentBranch(stopped)).toBeNull();
+    expect(await headBranch(stopped)).toBe("EXC-9/topic");
+  });
+
+  test("returns null on a detached HEAD that is not mid-rebase", async () => {
+    const detached = join(tempDir(), "head-detached");
+    fixtureGit(["worktree", "add", "-q", "--detach", detached], repo);
+
+    expect(await headBranch(detached)).toBeNull();
+  });
+
+  test("returns null outside a repository", async () => {
+    expect(await headBranch(notARepo)).toBeNull();
   });
 });
 

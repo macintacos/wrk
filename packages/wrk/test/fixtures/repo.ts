@@ -56,7 +56,7 @@ export const FIXTURE_ENV: Record<string, string | undefined> = {
 };
 
 /** A committer identity that does not depend on the runner's git config. */
-const IDENTITY = ["-c", "user.email=t@example.com", "-c", "user.name=T"];
+export const IDENTITY = ["-c", "user.email=t@example.com", "-c", "user.name=T"];
 
 /** The tracked file every fixture repository carries, so {@link dirty} has something to modify. */
 const TRACKED_FILE = "README";
