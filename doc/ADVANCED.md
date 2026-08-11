@@ -407,6 +407,45 @@ because the preview pane fetches on the first frame. The wait moved from in fron
 draw to after the choice; the total is the same, and it is the trade both pickers are
 built on.
 
+## Edit-guard latency
+
+The cross-checkout edit decision
+([`packages/wrk/src/guard.ts`](../packages/wrk/src/guard.ts)) is built to be called from a
+guard that fires on **every** file edit and write, so its budget is a different kind of
+claim from the pickers': **one verdict within a second of process start**, enforced by
+[`packages/wrk/test/guard.test.ts`](../packages/wrk/test/guard.test.ts). The clock starts
+before `bun` does, so the runtime's cold start, the module graph and every `git` call are
+inside the number.
+
+A second is the ceiling the suite fails at, not the cost. Measured on Apple silicon,
+medians of five runs, on a container holding a default-branch checkout and two run
+worktrees:
+
+| | idle | at load average 18 |
+| --- | --- | --- |
+| sanctioned crossing | 39 ms | 272 ms |
+| inside the session's own checkout | 34 ms | 214 ms |
+| blocked crossing | 41 ms | 47 ms |
+| outside the container | 35 ms | 34 ms |
+
+No single loaded run exceeded 402 ms. "At load average 18" is three other full test suites
+sharing the machine rather than the pickers' spinning burners, because that is what was
+running; it is the harsher number of the two.
+
+**The cost is `git`, not the module.** A process that imports `guard.ts` and does nothing
+measures the same 7 ms as one that imports nothing at all, so the whole figure is the two
+`rev-parse` probes that locate the session plus, only when a path actually crosses, the
+two branch lookups. All four run concurrently in pairs, and the two branch lookups are not
+paid at all unless the path crosses — which is why the ordinary edit, inside the session's
+own checkout, is the cheapest shape in the table.
+
+**The budget does not enforce "does not load the picker"; the import-closure case does.**
+That case walks `guard.ts`'s transitive imports and asserts the set of non-`node:`
+specifiers is exactly `zod`, which arrives through `./repo` → `./git`. It fails in under
+two milliseconds and cannot be blurred by machine load, which a timing case can: a probe
+importing the picker still medianed 506 ms under the load above, comfortably inside a
+one-second budget. The two cases split the criterion because one of them is exact.
+
 ## Agent commands
 
 `wrk agent repo-setup` is what runs when the repository is not on disk at all. It clones

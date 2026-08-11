@@ -177,13 +177,13 @@ describe("verdict — the inversion it dissolves", () => {
 
 describe("targetCheckout", () => {
   test("names the container-level directory a crossing path lands in", () => {
-    expect(targetCheckout(`${SIBLING}/deep/nested/app.ts`, fromWorktree)).toBe(SIBLING);
+    expect(targetCheckout(`${SIBLING}/deep/nested/app.ts`, CONTAINER, WORKTREE)).toBe(SIBLING);
   });
 
   test("is null for the three shapes that settle without one", () => {
-    expect(targetCheckout("src/app.ts", fromWorktree)).toBeNull();
-    expect(targetCheckout(`${WORKTREE}/src/app.ts`, fromWorktree)).toBeNull();
-    expect(targetCheckout("/tmp/scratch.md", fromWorktree)).toBeNull();
+    expect(targetCheckout("src/app.ts", CONTAINER, WORKTREE)).toBeNull();
+    expect(targetCheckout(`${WORKTREE}/src/app.ts`, CONTAINER, WORKTREE)).toBeNull();
+    expect(targetCheckout("/tmp/scratch.md", CONTAINER, WORKTREE)).toBeNull();
   });
 });
 
@@ -233,6 +233,53 @@ describe("the import closure", () => {
 
     expect([...bare].filter((specifier) => !specifier.startsWith("node:")).sort()).toEqual(["zod"]);
     expect(files.length).toBeGreaterThan(1);
+  });
+});
+
+/**
+ * What one decision must cost, from process start. **The enforced budget.**
+ *
+ * A regression guard rather than a benchmark, on the construction `latency.test.ts` sets out for
+ * the picker's: the number is placed where no machine can cross it and no regression that matters
+ * can stay under it, not just above the observed cost. Idle, every path shape here measures 34–42
+ * ms; at load average 18, with three other full test suites sharing the machine, the median rose
+ * to 272 ms and the worst single run to 402 ms. A thousand is ~25× the first and ~2.5× the
+ * second.
+ *
+ * What that catches is the class of regression that *waits* — a lock, a network call, a storm of
+ * serialised subprocesses — which is the only class that matters for something firing before
+ * every file write. What it deliberately does not catch is the picker, because a timing case
+ * cannot: under the same load, a probe importing the picker still medianed 506 ms. The import
+ * closure above is that half of the criterion, and it is exact rather than statistical.
+ */
+const BUDGET_MS = 1000;
+
+/** Runs per measurement. Odd, so the median is a sample rather than a mean of two. */
+const RUNS = 5;
+
+describe(`the latency budget — a verdict within ${BUDGET_MS} ms of process start`, () => {
+  test("costs about what starting the runtime costs, on the path that does the most work", async () => {
+    // The sanctioned crossing specifically: it is the only shape that pays for both branch
+    // lookups, so a budget met here is met by every other shape by construction.
+    const { container, checkout } = makeContainer();
+    const worktree = addRunWorktree(container, "EXC-1/feature");
+    addRunWorktree(container, "EXC-2/other");
+    const probe = join(import.meta.dir, "fixtures", "guard-probe.ts");
+    const target = join(worktree, "src/app.ts");
+
+    const samples: number[] = [];
+    for (let run = 0; run < RUNS; run++) {
+      const started = performance.now();
+      const child = Bun.spawn(["bun", probe, target, checkout], { stdout: "pipe", stderr: "pipe" });
+      await child.exited;
+      samples.push(performance.now() - started);
+
+      // A crashed probe exits in a few milliseconds, which would read as a very fast guard.
+      expect(await new Response(child.stdout).text()).toBe("allowed\n");
+    }
+    const median = samples.sort((a, b) => a - b)[Math.floor(RUNS / 2)] as number;
+
+    expect(median).toBeLessThan(BUDGET_MS);
   });
 });
 

@@ -120,24 +120,33 @@ function isUnder(path: string, root: string): boolean {
  * Paths are normalized (`.`, `..`, duplicate separators) but **not** resolved through symlinks,
  * which is what keeps this pure; {@link guardEdit} does that pass before calling in.
  *
+ * Takes the two paths rather than a whole {@link Session}, because the branch plays no part in
+ * this half of the decision — and because that is what lets {@link guardEdit} ask this question
+ * *before* paying for a branch lookup it usually turns out not to need.
+ *
  * @param filePath - The path the edit or write is aimed at.
- * @param session - Where the session is working.
+ * @param container - The repository container.
+ * @param checkout - Root of the checkout the session is working in.
  * @returns `null` whenever the existing rules already settle it — a relative path, one inside
  *   this checkout, or one outside the container entirely. Otherwise the container-level entry
  *   the target sits under, which is a sibling checkout only sometimes and may equally be
  *   `.bare`, a plain file, a directory that does not exist, or the container itself.
  */
-export function targetCheckout(filePath: string, session: Session): string | null {
+export function targetCheckout(
+  filePath: string,
+  container: string,
+  checkout: string,
+): string | null {
   if (!isAbsolute(filePath)) return null;
 
   const target = resolve(filePath);
-  if (isUnder(target, resolve(session.checkout))) return null;
+  if (isUnder(target, resolve(checkout))) return null;
 
-  const container = resolve(session.container);
-  if (!isUnder(target, container)) return null;
+  const root = resolve(container);
+  if (!isUnder(target, root)) return null;
 
-  const [entry] = relative(container, target).split(sep);
-  return entry === undefined || entry === "" ? container : join(container, entry);
+  const [entry] = relative(root, target).split(sep);
+  return entry === undefined || entry === "" ? root : join(root, entry);
 }
 
 /**
@@ -155,7 +164,7 @@ export function targetCheckout(filePath: string, session: Session): string | nul
  * @returns Allowed, or blocked with the message the wiring should surface.
  */
 export function verdict(filePath: string, session: Session, targetBranch: string): Verdict {
-  const target = targetCheckout(filePath, session);
+  const target = targetCheckout(filePath, session.container, session.checkout);
   if (target === null) return ALLOWED;
 
   const checkout = resolve(session.checkout);
@@ -202,9 +211,11 @@ async function resolveTarget(filePath: string, cwd: string): Promise<string> {
  * sees through a rebase in progress, so a worktree stopped on a conflict is still recognised as
  * one while the model edits it to resolve that conflict — and asks {@link verdict}.
  *
- * The target's branch is only looked up once {@link targetCheckout} has said a verdict is
- * needed, so the ordinary edit inside the session's own checkout costs the session lookup and
- * nothing more.
+ * **Neither branch is looked up until {@link targetCheckout} says a verdict is needed**, which is
+ * the whole reason it takes paths rather than a {@link Session}. The overwhelmingly common call —
+ * an edit inside the session's own checkout — is settled by two concurrent `rev-parse` probes and
+ * string comparison, with no branch lookup at all; only a path that actually crosses pays for the
+ * two, and it pays for them concurrently.
  *
  * **Every failure here answers allowed**, including one this module did not anticipate: it is
  * called before every file write, and blocking on its own bug would wedge a session with no way
@@ -222,20 +233,23 @@ export async function guardEdit(filePath: string, cwd?: string): Promise<Verdict
     const where = await locate(cwd);
     if (where.kind !== "checkout") return ALLOWED;
 
+    const target = await resolveTarget(filePath, where.root);
+    const sibling = targetCheckout(target, where.container, where.root);
+    if (sibling === null) return ALLOWED;
+
+    // Both caught here rather than by the outer handler, which answers allowed — and only the
+    // first of them should. The target's is the lookup whose failure must *keep* the block, and
+    // a target that is not a directory at all makes git fail to start, which is the ordinary way
+    // that arrives.
+    const [branch, targetBranch] = await Promise.all([
+      headBranch(where.root).catch(() => null),
+      headBranch(sibling).catch(() => null),
+    ]);
     const session: Session = {
       container: where.container,
       checkout: where.root,
-      branch: (await headBranch(where.root)) ?? "",
+      branch: branch ?? "",
     };
-
-    const target = await resolveTarget(filePath, where.root);
-    const sibling = targetCheckout(target, session);
-    if (sibling === null) return ALLOWED;
-
-    // Caught here rather than by the outer handler, which would answer allowed: this is the
-    // lookup whose failure must *keep* the block. A target that is not a directory at all makes
-    // git fail to even start, which is the ordinary way this arrives.
-    const targetBranch = await headBranch(sibling).catch(() => null);
 
     return verdict(target, session, targetBranch ?? "");
   } catch {
