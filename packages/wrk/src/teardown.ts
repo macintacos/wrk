@@ -10,8 +10,9 @@
  * process cannot move its parent shell, so the only sense in which `wrk` leaves a worktree is
  * that it never operates from inside the one it is deleting: every git command below runs from
  * the default-branch checkout, and a `cwd` inside the target is a {@link Refusal} naming where
- * to go instead. Git refuses the removal anyway, but its message is about a working tree in
- * use; what the caller needs to be told is that their shell is standing on the ground.
+ * to go instead. **Git does not refuse this** — `git worktree remove .` exits 0 and deletes the
+ * directory out from under the shell standing in it — so the refusal below is the only guard
+ * there is, not a friendlier rendering of git's.
  *
  * **The last step is the only branch deletion, and it is not optional.** `git worktree remove`
  * never removes the branch that was checked out — {@link removeWorktree} says so from the
@@ -117,20 +118,27 @@ export async function teardown(
   options: TeardownOptions = {},
 ): Promise<TornDown> {
   // First, and on its own: it settles repo-ness before `listWorktrees` — which throws rather
-  // than answering outside a repository — and it is the lock's directory, which has to be in
-  // hand before the removal rather than derived after it.
+  // than answering outside a repository — and it is what the two reads below are asked from.
   const container = await containerFor(cwd);
   if (container === null) {
     throw new Refusal("not a git repository; run this from inside the repository to remove from");
   }
 
-  // Concurrent: neither depends on the other and both are spawns. The one list serves both the
-  // target lookup and the checkout lookup, which is why `checkoutFor` is not used for the
-  // second — it answers with the *caller's* checkout when the caller is in one, which from a
-  // run worktree is the worktree about to be removed.
+  // **Asked of the container, not of `cwd`.** Refs are shared, so the *list* is the same either
+  // way — but `resolveDefaultBranch` falls through to whatever branch its cwd has checked out
+  // when `origin/HEAD` is absent or dangling and none of main/master/trunk exists, which
+  // `repo.ts` documents as ordinary rather than exotic. Asked from inside a run worktree that
+  // answers `EXC-2/b`, and the whole of the rest of this function then acts on that worktree:
+  // the real checkout is left unsynced and somebody else's is fetched into. The container has
+  // no branch of its own to be confused by — its HEAD is the repository's default.
+  //
+  // Concurrent because neither depends on the other and both are spawns. The one list serves
+  // the target lookup and the checkout lookup both, which is also why `checkoutFor` is not used
+  // for the second: it answers with the *caller's* checkout when the caller is in one, which
+  // from a run worktree is the worktree about to be removed.
   const [worktrees, defaultBranch] = await Promise.all([
-    listWorktrees(cwd),
-    resolveDefaultBranch(cwd),
+    listWorktrees(container),
+    resolveDefaultBranch(container),
   ]);
 
   const named = resolve(cwd, target);
@@ -144,17 +152,21 @@ export async function teardown(
     );
   }
 
+  if (defaultBranch === null) {
+    throw new Refusal(
+      "this repository has no default branch to sync to — no origin/HEAD, no main, master or trunk, and a detached HEAD",
+    );
+  }
+
   // Prunable records skipped, as `repo.ts`'s `checkoutFor` skips them and for its reason: a
   // path that does not exist is not a checkout, and nothing can be synced in it.
+  const ref = `${BRANCH_PREFIX}${defaultBranch}`;
   const checkout = worktrees.find(
-    (worktree) =>
-      defaultBranch !== null &&
-      worktree.branch === `${BRANCH_PREFIX}${defaultBranch}` &&
-      worktree.prunable === null,
+    (worktree) => worktree.branch === ref && worktree.prunable === null,
   );
-  if (defaultBranch === null || checkout === undefined) {
+  if (checkout === undefined) {
     throw new Refusal(
-      "no worktree holds this repository's default branch, so there is nowhere to remove from and nothing to resync",
+      `no worktree holds ${defaultBranch}, so there is nowhere to remove from and nothing to resync`,
     );
   }
 
@@ -164,9 +176,9 @@ export async function teardown(
     );
   }
 
-  // Compared against `${path}${sep}` rather than `path` alone, so a sibling whose name merely
-  // starts with the target's — `EXC-1+add-thing-2` beside `EXC-1+add-thing` — is not read as
-  // being inside it.
+  // Compared against `found.path` plus a separator rather than against `found.path` alone, so
+  // a sibling whose name merely starts with the target's — `EXC-1+add-thing-2` beside
+  // `EXC-1+add-thing` — is not read as being inside it.
   const here = await realpath(cwd).catch(() => resolve(cwd));
   if (here === found.path || here.startsWith(`${found.path}${sep}`)) {
     throw new Refusal(

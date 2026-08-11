@@ -104,8 +104,19 @@ export function cleanupFixtures(): void {
   }
 }
 
-/** Lands one commit carrying {@link TRACKED_FILE}. */
-function commit(repo: string, message: string): void {
+/**
+ * Lands one commit carrying {@link TRACKED_FILE}.
+ *
+ * Exported for the suite that needs a branch whose tip is *not* reachable from the default
+ * branch — the state a squash- or rebase-merge leaves behind, and the only one in which
+ * `git branch -d` and `git branch -D` behave differently. {@link addRunWorktree} branches at
+ * the container's HEAD and commits nothing, so without this every branch a fixture builds is
+ * already merged and a teardown's force-delete proves nothing.
+ *
+ * @param repo - The work tree to commit in.
+ * @param message - The commit message, and the file's new contents.
+ */
+export function commit(repo: string, message: string): void {
   writeFileSync(join(repo, TRACKED_FILE), `${message}\n`);
   fixtureGit(["add", "--", TRACKED_FILE], repo);
   fixtureGit([...IDENTITY, "commit", "-q", "-m", message], repo);

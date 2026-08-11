@@ -63,6 +63,19 @@ const PICKER_HELP = {
 };
 
 /**
+ * Commander's own help configuration, spelled out so a subcommand can take it back.
+ *
+ * {@link PICKER_HELP} is inherited by anything registered under a picker — commander copies the
+ * output configuration into each subcommand as it is created — and `wt rm` is the one command
+ * that is under a picker without being one. Restating the defaults is the whole mechanism:
+ * there is no "inherit nothing" to ask for.
+ */
+const HUMAN_HELP = {
+  writeOut: (text: string) => process.stdout.write(text),
+  getOutHelpWidth: () => process.stdout.columns ?? 80,
+};
+
+/**
  * Assembles the commander tree.
  *
  * `repo convert` **prints and never runs** the conversion recipe: its first step renames the
@@ -103,12 +116,20 @@ const PICKER_HELP = {
  * `Chosen | null` either way.
  *
  * `wt rm` hangs off `wt` and takes the *opposite* side of every one of those decisions, which
- * is why it reads nothing like its parent. It is the one command in the group whose stdout is
- * not a destination, so it consults {@link wantsJson} like `repo convert` — the human line on
- * stderr, the envelope only when asked. Commander runs a parent's action when no subcommand
- * matches, so bare `wrk wt` is still the picker. One inheritance is worth knowing rather than
- * overriding: {@link PICKER_HELP} reaches here through `copyInheritedSettings`, so
- * `wrk wt rm --help` renders on stderr with the rest of the group.
+ * is why it reads nothing like its parent. Its stdout is not a destination, so it consults
+ * {@link wantsJson} like `repo convert` — the human line on stderr, the envelope only when
+ * asked — and it hands its help back to stdout, undoing the {@link PICKER_HELP} that reaches
+ * it through commander's `copyInheritedSettings`. That is not tidiness: `output.ts`'s contract
+ * is that `--help` belongs on stdout with `wt` and `pr` the two named exceptions, and a third
+ * exception inherited by accident is the shape that makes a written contract stop being true.
+ * Commander runs a parent's action when no subcommand matches, so bare `wrk wt` is still the
+ * picker.
+ *
+ * It is also the one command here that does **not** go through `resolveRepo`. Orphan recovery
+ * answers with *some* container when the cwd is in none, and a destructive command must act on
+ * the repository the caller is standing in or on none at all — while the case that recovery
+ * exists for, a cwd whose directory is gone, is one this command refuses to create and one no
+ * runtime can start in anyway.
  *
  * `--branch` is a `requiredOption` rather than validated in the action, which puts its
  * absence on the route this module's own `main` documents as already correct: commander
@@ -170,15 +191,16 @@ export function buildProgram(): Command {
     .description("Remove a worktree, resync the default-branch checkout, and delete its branch")
     .argument("<worktree>", "The worktree to retire: a path, or the branch it holds")
     .option("--force", "Remove it even with uncommitted changes in it")
+    .configureOutput(HUMAN_HELP)
     .action(async (worktree: string, { force }, command) => {
       const torn = await teardown(process.cwd(), worktree, { force });
-      if (wantsJson(command)) emit(torn);
-      else
-        note(
-          `${PREFIX}removed ${torn.worktree_path}` +
-            `${torn.branch === null ? "" : ` and deleted ${torn.branch}`}; ` +
-            `${torn.checkout} is synced`,
-        );
+      if (wantsJson(command)) {
+        emit(torn);
+        return;
+      }
+
+      const deleted = torn.branch === null ? "" : ` and deleted ${torn.branch}`;
+      note(`${PREFIX}removed ${torn.worktree_path}${deleted}; ${torn.checkout} is synced`);
     });
 
   program

@@ -126,7 +126,12 @@ const CONVERSION_REFERENCE = "repo-setup";
  * so the directory can never surface as an untracked file in some checkout's `git status`.
  *
  * Exported for [`./teardown`](./teardown), the sync's second caller: two callers naming
- * different locks would serialise nothing.
+ * different locks would serialise nothing. That caller does **not** establish the predicate
+ * the paragraph above rests on — `wt rm` removes a worktree rather than placing a sibling, so
+ * it has no reason to require the layout — and outside a container this therefore lands in a
+ * work tree root. The residue is nil rather than merely small: `withLock` creates an empty
+ * directory and removes it in a `finally`, and git does not track empty directories, so it
+ * cannot surface in a `git status` even while it is held.
  */
 export const SYNC_LOCK = ".wrk-sync.lock";
 

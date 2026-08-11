@@ -26,6 +26,7 @@ import {
   addRunWorktree,
   childEnv,
   cleanupFixtures,
+  commit,
   dirty,
   fixtureGit,
   makeContainer,
@@ -71,6 +72,35 @@ describe("teardown", () => {
 
     expect((await teardown(checkout, "../EXC-1+add-thing")).worktree_path).toBe(worktree);
     expect(existsSync(worktree)).toBe(false);
+  });
+
+  test("deletes a branch whose commits the default branch does not have", async () => {
+    // The state a squash- or rebase-merge leaves behind, and the only one that tells `-D` from
+    // `-d`. Every other case here works on a branch that never moved off the default's tip, so
+    // without this the force-delete the module argues for at length is unpinned.
+    const { container, checkout } = makeContainer();
+    const worktree = addRunWorktree(container, "EXC-1/add-thing");
+    commit(worktree, "landed upstream under another sha");
+
+    await teardown(checkout, worktree);
+
+    expect(branches(checkout)).not.toContain("EXC-1/add-thing");
+  });
+
+  test("syncs the default-branch checkout, not the one the caller happens to be in", async () => {
+    // `resolveDefaultBranch` falls back to the cwd's own branch when `origin/HEAD` is absent
+    // and the default is none of main/master/trunk — which a `clone --bare` container plus a
+    // non-conventional default branch is exactly. Asked from a run worktree it then answers
+    // that worktree's branch, and every step after it acts on the wrong checkout.
+    const { container, checkout } = makeContainer("develop");
+    const target = addRunWorktree(container, "EXC-1/add-thing");
+    const elsewhere = addRunWorktree(container, "EXC-2/other-work");
+
+    const torn = await teardown(elsewhere, target);
+
+    expect(torn.checkout).toBe(checkout);
+    expect(existsSync(elsewhere)).toBe(true);
+    expect(branches(checkout)).toEqual(["EXC-2/other-work", "develop"]);
   });
 
   test("deletes that branch and no other", async () => {

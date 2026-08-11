@@ -114,6 +114,10 @@ The shell function is the whole of the caller's side. In fish:
 
 ```fish
 function wt --description "Pick a worktree and cd into it"
+    if test "$argv[1]" = rm
+        wrk wt $argv
+        return $status
+    end
     set -l target (wrk wt --print-path $argv)
     or return $status
     test -n "$target"; or return 1
@@ -125,6 +129,7 @@ In bash or zsh:
 
 ```bash
 wt() {
+  if [ "$1" = rm ]; then wrk wt "$@"; return $?; fi
   local target
   target=$(wrk wt --print-path "$@") || return $?
   [ -n "$target" ] || return 1
@@ -132,14 +137,21 @@ wt() {
 }
 ```
 
-Both guards earn their line. **Forwarding the status** is what keeps a cancelled pick
-distinguishable at the call site: fish propagates a command substitution's status through
-`set`, so `or return $status` really does carry the `130` out, and bash's declaration is
-split from its assignment on purpose, because `local target=$(…)` reports `local`'s own
-status — always `0` — and would silently discard the very distinction this protocol exists
-to draw. **Checking for emptiness** then catches the one case a status cannot: a run that
-exited `0` having printed nothing. Without it fish expands `cd -- $target` to a bare `cd`
-and sends you to your home directory.
+**The `rm` arm is not optional.** `wrk wt` has a subcommand
+([Retiring a worktree](#retiring-a-worktree)) and it is not a destination, so without that
+line `wt rm <worktree>` becomes `wrk wt --print-path rm <worktree>`: the teardown runs to
+completion, prints nothing on stdout, and the emptiness guard below then reports the
+successful destructive run as a failure. Forwarding `rm` untouched is the whole fix, and
+it costs the picker nothing — `rm` is not a worktree anyone can `cd` to.
+
+Both of the remaining guards earn their line. **Forwarding the status** is what keeps a
+cancelled pick distinguishable at the call site: fish propagates a command substitution's
+status through `set`, so `or return $status` really does carry the `130` out, and bash's
+declaration is split from its assignment on purpose, because `local target=$(…)` reports
+`local`'s own status — always `0` — and would silently discard the very distinction this
+protocol exists to draw. **Checking for emptiness** then catches the one case a status
+cannot: a run that exited `0` having printed nothing. Without it fish expands
+`cd -- $target` to a bare `cd` and sends you to your home directory.
 
 **A picker's own `--help` renders on stderr**, which is the one place `wrk` departs from
 the rule above it. Commander writes help to stdout, and for every other command that is
@@ -227,9 +239,15 @@ the shell that launched it, so the command cannot take you out of a directory it
 to delete — it refuses instead, and names the checkout to `cd` to. Standing anywhere else
 in the repository is fine, including in another worktree.
 
-Two other refusals, each exiting `1` with a `wrk:` line and an untouched repository: the
-default-branch checkout is not something this removes, and a `<worktree>` matching neither
-a path nor a branch is not guessed at.
+The other refusals each exit `1` with a `wrk:` line and an untouched repository. The
+default-branch checkout is not something this removes; a `<worktree>` matching neither a
+path nor a branch is not guessed at; and if the repository has no default branch, or has
+one that no worktree currently holds, there is nowhere to run steps 3 and 4 from and the
+command stops before step 2 rather than half-way through.
+
+If you use the `wt` shell function from [The cd protocol](#the-cd-protocol), make sure it
+carries the `rm` arm — without it the function swallows this command's arguments and then
+misreports it.
 
 **The branch delete is the only one, and it is a `-D`.** Removing a worktree never removes
 the branch that was checked out in it, so without this step the branch would outlive it
@@ -237,8 +255,9 @@ for good; and exactly that branch goes, never the rest of an `EXC-123/*` family,
 worktrees may still be live. Force-delete rather than `-d` because the state this command
 exists for is a merged pull request, whose local tip is routinely unreachable from the
 default branch after a squash or rebase merge — which `-d` would refuse.
-**Commits that exist only on that branch are gone with it.** A detached worktree held no
-branch, so nothing is deleted for one.
+**Commits that exist only on that branch stop being reachable by name**, and the tip
+survives only in the reflog until it expires, so treat this as the destructive step it is.
+A detached worktree held no branch, so nothing is deleted for one.
 
 `--force` governs the *removal* alone and never the branch. Without it a worktree holding
 uncommitted changes stops the run, git's own complaint and all, so you can look at the
