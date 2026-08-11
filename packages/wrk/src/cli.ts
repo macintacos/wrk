@@ -31,6 +31,7 @@ import { Command } from "@commander-js/extra-typings";
 
 import { renderConversion, resolveConversion } from "./convert";
 import { resolveRepo } from "./discover";
+import { doctor, renderDoctor } from "./doctor";
 import { Cancelled, Refusal } from "./errors";
 import { emit, emitLine, note, PREFIX, reportFailure } from "./output";
 import { preflight } from "./preflight";
@@ -189,6 +190,20 @@ export function buildProgram(): Command {
       // own insertion order, and `Conversion` is built as one literal, so this preserves it.
       if (wantsJson(command)) emit({ ...conversion, recipe });
       else note(recipe);
+    });
+
+  program
+    .command("doctor")
+    .description("Report whether the tools wrk shells out to are present and new enough")
+    .action(async (_options, command) => {
+      const report = await doctor();
+      if (wantsJson(command)) emit(report);
+      else note(renderDoctor(report));
+
+      // The one command whose exit status is a finding rather than a failure — see
+      // [`./doctor`](./doctor)'s header for why that is a fifth exit rule and why it does not
+      // endanger the fourth. Assigned rather than exited, per [`./output`](./output).
+      if (!report.ok) process.exitCode = 1;
     });
 
   // Bound rather than chained, for the reason `agent` below is: `.command()` answers the
