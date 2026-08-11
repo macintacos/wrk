@@ -17,7 +17,7 @@
  */
 
 import { afterAll, afterEach, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -30,9 +30,9 @@ const CLI_ENTRY = join(import.meta.dir, "../src/cli.ts");
 /** Temp roots to delete once the suite finishes. */
 const roots: string[] = [];
 
-/** A fresh temp directory, resolved through `realpathSync` as `provision.test.ts` resolves its own. */
+/** A fresh temp directory, deleted once the suite finishes. */
 function tempDir(): string {
-  const dir = realpathSync(mkdtempSync(join(tmpdir(), "wrk-doctor-")));
+  const dir = mkdtempSync(join(tmpdir(), "wrk-doctor-"));
   roots.push(dir);
   return dir;
 }
@@ -102,9 +102,9 @@ afterAll(() => {
 
 describe("doctor", () => {
   test("reports every tool, its version and the floor it is held to", async () => {
-    // Whole-report equality rather than field probes: the envelope's key set and key order are
-    // what callers read, so a case that checked `.ok` alone would not notice either changing.
-    // `gh`'s banner is two lines with a version in each, which pins that the *first* is taken.
+    // Whole-report equality rather than field probes: a case that checked `.ok` alone would not
+    // notice the key set changing. `gh`'s banner is two lines with a version in each, which pins
+    // that the *first* is taken.
     process.env.PATH = makeBin(HEALTHY);
 
     expect(await doctor()).toEqual({
@@ -114,6 +114,24 @@ describe("doctor", () => {
         { name: "gh", present: true, version: "2.63.2", minimum: null, ok: true },
       ],
     });
+  });
+
+  test("emits its keys in the order the report type declares them", async () => {
+    // Asserted separately because `toEqual` above is indifferent to insertion order, and the
+    // envelope's order is a contract `doctor.ts` states — `conformance.test.ts` learned the same
+    // lesson for the preflight report. Insertion order is what `JSON.stringify` walks.
+    process.env.PATH = makeBin(HEALTHY);
+
+    const report = await doctor();
+
+    expect(Object.keys(report)).toEqual(["ok", "tools"]);
+    expect(Object.keys(report.tools[0] ?? {})).toEqual([
+      "name",
+      "present",
+      "version",
+      "minimum",
+      "ok",
+    ]);
   });
 
   test("fails a git below the floor, while still reporting it as present", async () => {

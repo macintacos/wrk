@@ -7,13 +7,15 @@
  * from a command that went wrong somewhere else.
  *
  * **The git floor is the reason this is more than a `which`.** `doc/ADVANCED.md` records that
- * `wrk` needs **git 2.36 or newer**, and that an older one fails *silently*: `rev-parse`
- * hand-rolls its option parsing and echoes an unrecognised `--path-format` back to stdout
- * while exiting `0`, so below 2.31 the repository resolves to a container named
- * `--path-format=absolute`. That answer is stable and wrong, and no error surfaces anywhere.
- * The README's advice for it is "run `git --version` before anything else"; this command is
- * that advice, mechanised. A present-but-old `git` is therefore reported as **present and not
- * ok**, never as missing — they are different problems with different fixes.
+ * `wrk` needs **git 2.36 or newer**: `worktree list --porcelain -z` arrived in 2.36 and
+ * `rev-parse --path-format` in 2.31, and the floor is the higher of the two. The lower one is
+ * why an old git is *silently* wrong rather than loudly so — `rev-parse` hand-rolls its option
+ * parsing and echoes an unrecognised `--path-format` back to stdout while exiting `0`, so
+ * below 2.31 the repository resolves to a container named `--path-format=absolute`. That
+ * answer is stable and wrong, and no error surfaces anywhere. The README's advice for it is
+ * "run `git --version` before anything else"; this command is that advice, mechanised. A
+ * present-but-old `git` is therefore reported as **present and not ok**, never as missing —
+ * they are different problems with different fixes.
  *
  * **Both tools are required, so nothing here says so.** `git` is required outright, and `gh`
  * is what `wrk pr` and the stack annotations in `wrk wt` are built on. There is no second
@@ -28,6 +30,15 @@
  * one, and [`./gh`](./gh) deliberately exports no escape hatch. One code path over both tools
  * is smaller than two special cases, and neither tool is being asked anything that needs a
  * wrapper's knowledge.
+ *
+ * The gate here is deliberately **wider** than those two, and the difference is worth knowing:
+ * they re-raise anything that is not an `ENOENT`, while {@link banner} reads *every* failed
+ * spawn as "not installed". That is what makes {@link doctor} total, which the command it
+ * backs has to be — a health check that threw would be the one command whose failure a user
+ * cannot diagnose. The cost is a wrong word in a rare case: a `git` that exists but cannot be
+ * executed (`EACCES`, a stripped executable bit) is reported `missing` rather than as the
+ * permissions problem it is. Splitting the two would buy a better sentence for a case that
+ * effectively does not happen, at the price of a third state in every report.
  *
  * **A version is compared by hand rather than by dependency.** `Bun.semver` is Bun-only and
  * this package targets Node — `proc.ts`'s reason for `node:child_process`, applied again —
@@ -48,30 +59,6 @@
  */
 
 import { run } from "./proc";
-
-/** A tool `wrk` needs, and the oldest release of it this package will vouch for. */
-interface Required {
-  /** The executable's name, as it is spelled on `PATH` and reported back. */
-  readonly name: string;
-
-  /** The version floor, or `null` for a tool held to none. */
-  readonly minimum: string | null;
-}
-
-/**
- * The tools checked, in the order they are reported.
- *
- * `git`'s floor is `doc/ADVANCED.md`'s, and it is stated as two segments because that is what
- * the documentation promises — {@link atLeast} compares only the segments the floor names, so
- * every 2.36.x satisfies it.
- *
- * `gh` is held to no floor. `wrk` uses `gh pr list --json` and `gh pr view`, both long
- * settled, and a floor invented here would fail machines that work.
- */
-const REQUIRED: readonly Required[] = [
-  { name: "git", minimum: "2.36" },
-  { name: "gh", minimum: null },
-];
 
 /**
  * The first dotted number in a `--version` banner.
@@ -119,11 +106,36 @@ export interface DoctorReport {
 }
 
 /**
+ * A tool `wrk` needs, and the oldest release of it this package will vouch for.
+ *
+ * Derived from {@link ToolReport} rather than declared beside it, so the two shapes cannot
+ * drift and the fields are documented once. `Tool` rather than the more descriptive
+ * `Required`, which would shadow TypeScript's own `Required<T>` for the whole module.
+ */
+type Tool = Pick<ToolReport, "name" | "minimum">;
+
+/**
+ * The tools checked, in the order they are reported.
+ *
+ * `git`'s floor is `doc/ADVANCED.md`'s, and it is stated as two segments because that is what
+ * the documentation promises — {@link atLeast} compares only the segments the floor names, so
+ * every 2.36.x satisfies it.
+ *
+ * `gh` is held to no floor. `wrk` uses `gh pr list --json` and `gh pr view`, both long
+ * settled, and a floor invented here would fail machines that work.
+ */
+const REQUIRED: readonly Tool[] = [
+  { name: "git", minimum: "2.36" },
+  { name: "gh", minimum: null },
+];
+
+/**
  * Whether `version` is at or above `minimum`, comparing only the segments `minimum` names.
  *
  * A floor of `"2.36"` is therefore met by `2.36.0` and by `2.36` alike, which is what lets the
- * floor be written the way the documentation states it. A segment that is not a number
- * compares as below, so an unreadable version is never mistaken for a sufficient one.
+ * floor be written the way the documentation states it. Both arguments are digits and dots by
+ * construction — the version comes from {@link VERSION_PATTERN} and the floor from
+ * {@link REQUIRED} — so there is no non-numeric segment to defend against here.
  *
  * @param version - The version found in a tool's banner, e.g. `2.51.0`.
  * @param minimum - The floor, e.g. `2.36`.
@@ -143,17 +155,20 @@ function atLeast(version: string, minimum: string): boolean {
  * What `name --version` printed, or `null` if it could not be run or refused.
  *
  * The rejection `run` raises for a child that never started is the presence gate — see this
- * module's header. A nonzero exit joins it: a binary on `PATH` that cannot answer is no more
- * usable than one that is not there, and `wrk` has nothing different to say about it.
+ * module's header, including why this catch is wider than `gh.ts`'s. A nonzero exit joins it:
+ * a binary on `PATH` that cannot answer is no more usable than one that is not there, and
+ * `wrk` has nothing different to say about it.
  */
 async function banner(name: string): Promise<string | null> {
+  // ponytail: no timeout, so a wedged `git` or `gh` hangs the check with no output. `gh.ts`
+  // carries the same omission and the same marker; give both one deadline if it ever bites.
   const result = await run(name, ["--version"]).catch(() => null);
 
   return result === null || result.code !== 0 ? null : result.stdout;
 }
 
 /** Asks one tool about itself and grades the answer. */
-async function probe(tool: Required): Promise<ToolReport> {
+async function probe(tool: Tool): Promise<ToolReport> {
   const said = await banner(tool.name);
   const version = said === null ? null : (VERSION_PATTERN.exec(said)?.[0] ?? null);
 
@@ -171,8 +186,8 @@ async function probe(tool: Required): Promise<ToolReport> {
 /**
  * Checks every tool `wrk` depends on and reports what it found.
  *
- * The probes run concurrently: they are independent spawns, and a machine missing both should
- * not wait for two timeouts in series.
+ * The probes run concurrently: two independent spawns sharing nothing, so there is no reason
+ * for the second to wait on the first.
  *
  * @returns The report — see {@link DoctorReport}. Never throws: a tool that cannot be run is
  *   the answer this function exists to give, not a failure to give one.
@@ -197,7 +212,7 @@ export async function doctor(): Promise<DoctorReport> {
  * takes the same route — and `--json` is what puts the same answer on the machine channel.
  *
  * @param report - What {@link doctor} found.
- * @returns The block, without a trailing newline; {@link note} adds it.
+ * @returns The block, without a trailing newline; [`./output`](./output)'s `note` adds it.
  */
 export function renderDoctor(report: DoctorReport): string {
   const width = Math.max(...report.tools.map((tool) => tool.name.length));

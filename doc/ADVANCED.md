@@ -87,7 +87,7 @@ The envelope **never omits a key**. A value the run did not reach is `null`, not
 key, so `.reason` can be read unconditionally rather than guarded. Keys come out in the
 order the result type declares them, so two runs of the same command diff cleanly.
 
-Four exit rules, and the first is the one to know:
+Four exit rules and one exception, and the first is the one to know:
 
 | Outcome                                   | Exit        | Shape                                      |
 | ----------------------------------------- | ----------- | ------------------------------------------ |
@@ -95,6 +95,7 @@ Four exit rules, and the first is the one to know:
 | A refusal                                 | `1`         | One `wrk: …` line on stderr. Nothing else. |
 | A command `wrk` ran failed                | the child's | Its argv, status and stderr, on stderr.    |
 | A picker the user dismissed               | `130`       | Nothing on stdout, and no `wrk: …` line.   |
+| A `wrk doctor` finding                    | `1`         | The whole envelope, on stdout.             |
 
 A well-formed "blocked" answer is a **successful run**: callers branch on the payload's
 verdict field, never on the exit status. An exit status that is not `0` means `wrk` has no
