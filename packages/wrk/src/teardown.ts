@@ -127,10 +127,12 @@ export async function teardown(
   // **Asked of the container, not of `cwd`.** Refs are shared, so the *list* is the same either
   // way — but `resolveDefaultBranch` falls through to whatever branch its cwd has checked out
   // when `origin/HEAD` is absent or dangling and none of main/master/trunk exists, which
-  // `repo.ts` documents as ordinary rather than exotic. Asked from inside a run worktree that
+  // `repo.ts` documents as ordinary rather than exotic. Asked from inside a run worktree it
   // answers `EXC-2/b`, and the whole of the rest of this function then acts on that worktree:
-  // the real checkout is left unsynced and somebody else's is fetched into. The container has
-  // no branch of its own to be confused by — its HEAD is the repository's default.
+  // the real checkout is left unsynced and somebody else's is fetched into. The container is
+  // the one place with no run branch to be confused by — in the bare-repo layout its HEAD is
+  // the repository's default, and in an unconverted repository it is the main work tree, whose
+  // branch is the same answer `checkoutFor` degrades to.
   //
   // Concurrent because neither depends on the other and both are spawns. The one list serves
   // the target lookup and the checkout lookup both, which is also why `checkoutFor` is not used
